@@ -1,0 +1,22 @@
+Package: zlib1g
+Source: zlib
+Version: 1:1.2.13.dfsg-1
+Architecture: amd64
+Maintainer: Mark Brown <broonie@debian.org>
+Installed-Size: 100
+Depends: libc6 (>= 2.14)
+Filename: pool/main/z/zlib/zlib1g_1.2.13.dfsg-1_amd64.deb
+Size: 60000
+MD5sum: d41d8cd98f00b204e9800998ecf8427e
+SHA256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+
+Package: bash
+Version: 5.2.15-2+b2
+Architecture: amd64
+Maintainer: Matthias Klose <doko@debian.org>
+Installed-Size: 6000
+Depends: base-files (>= 2.1.12), debianutils (>= 2.15)
+Filename: pool/main/b/bash/bash_5.2.15-2+b2_amd64.deb
+Size: 1500000
+MD5sum: 9e107d9d372bb6826bd81d3542a419d6
+SHA256: 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824

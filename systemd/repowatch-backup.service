@@ -1,0 +1,9 @@
+[Unit]
+Description=repowatch - backup state.sqlite3 (used with repowatch-backup.timer)
+After=network.target
+
+[Service]
+Type=oneshot
+User=repowatch
+Group=repowatch
+ExecStart=/opt/repowatch/src/scripts/backup-state.sh

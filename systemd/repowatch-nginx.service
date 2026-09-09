@@ -1,0 +1,13 @@
+[Unit]
+Description=Validate and reconcile repowatch nginx configuration
+After=nginx.service
+ConditionPathExists=/etc/nginx/repowatch/policy.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/repowatch -c /etc/repowatch/config.yaml nginx-apply --policy /etc/nginx/repowatch/policy.json
+UMask=0022
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+TimeoutStartSec=150

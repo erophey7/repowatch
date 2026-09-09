@@ -1,0 +1,14 @@
+[Unit]
+Description=repowatch - status HTTP API only (pair with repowatch-check.timer)
+After=network-online.target
+
+[Service]
+Type=simple
+User=repowatch
+Group=repowatch
+ExecStart=/usr/local/bin/repowatch -c /etc/repowatch/config.yaml serve-status
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

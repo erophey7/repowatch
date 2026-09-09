@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Login — repowatch</title>
+<style>
+body{font:16px system-ui;background:#10151d;color:#e6edf3;display:grid;place-items:center;min-height:90vh;margin:0}
+form{background:#19222d;padding:32px;border-radius:12px;width:min(320px,80vw)}
+h1{margin:0 0 24px}label{display:block}input,button{box-sizing:border-box;width:100%;font:inherit;padding:10px;margin-top:12px;border-radius:6px;border:1px solid #445064}
+button{background:#3986ed;color:white;cursor:pointer}#message{font-size:14px;min-height:40px}
+</style></head><body><form id="login"><h1>repowatch</h1>
+<label for="password">Administrator password</label><input id="password" type="password" autocomplete="current-password" required maxlength="1024" autofocus>
+<button id="submit">Log in</button><p id="message" role="status"></p></form>
+<script>
+try { sessionStorage.removeItem('repowatch_admin_password'); } catch (_) {}
+document.getElementById('login').addEventListener('submit', async event => {
+  event.preventDefault();
+  const button = document.getElementById('submit'), input = document.getElementById('password'), message = document.getElementById('message');
+  button.disabled = true;
+  try {
+    const response = await fetch('/api/auth/login', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({password:input.value})});
+    input.value = '';
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Login failed');
+    location.replace('/');
+  } catch(error) { message.textContent = error.message; }
+  finally { button.disabled = false; }
+});
+</script></body></html>

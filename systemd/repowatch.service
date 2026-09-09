@@ -1,0 +1,26 @@
+[Unit]
+Description=repowatch - active watcher and cache warmer for package repos
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=repowatch
+Group=repowatch
+ExecStart=/usr/local/bin/repowatch -c /etc/repowatch/config.yaml run
+Restart=on-failure
+RestartSec=5
+
+# baseline hardening — can be tightened further later
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+# /etc/repowatch needs to be writable because of POST /api/repos (the
+# dashboard writes config.yaml directly, see api.py.add_repo_payload) —
+# without this path in ReadWritePaths, the write would fail under
+# ProtectSystem=strict even if file permissions allow it.
+ReadWritePaths=/var/lib/repowatch /etc/repowatch
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

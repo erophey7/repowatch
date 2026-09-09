@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodic repowatch check (alternative to long-running "repowatch run")
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

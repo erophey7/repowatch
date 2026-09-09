@@ -1,0 +1,55 @@
+# repowatch example configuration.
+#
+# A minimal, working starting point — one repository per major index format
+# (pacman, apt, dnf). apk and apt-rpm follow the same shape; see
+# docs/configuration.md for the full field reference.
+#
+# Copy this file and edit it for your own mirrors:
+#
+#   cp config/config.example.yaml config/config.yaml
+#
+# The repo ids/paths below line up with the hand-written cache layer in
+# nginx/repo-cache.conf, so the two work together out of the box.
+
+# SQLite file for snapshots, history, and warmed-package state.
+# Must be on local disk, not NFS.
+state_db: /var/lib/repowatch/state.sqlite3
+
+# Where repowatch itself sends warm-up requests — the address of your nginx
+# cache (see nginx/repo-cache.conf), from repowatch's own point of view.
+cache_base_url: http://127.0.0.1:8080
+
+# How often each repository's index is checked, unless overridden per-repo
+# (repos[].check_interval).
+check_interval: 300
+
+status_server:
+  bind: 0.0.0.0
+  port: 8085
+  # The dashboard and administrative API stay closed until admin_password_hash
+  # is set below (generate it with `repowatch hash-password`) — see
+  # docs/access.md.
+
+repos:
+  # Arch Linux (pacman) — the [core] repository, official geo-balanced mirror.
+  - id: arch-core-x86_64
+    type: pacman
+    upstream: https://geo.mirror.pkgbuild.com/core/os/x86_64
+    repo_name: core
+    arch: x86_64
+
+  # Debian (apt) — bookworm main, official round-robin mirror.
+  - id: debian-bookworm-main
+    type: apt
+    upstream: https://deb.debian.org/debian
+    distribution: bookworm
+    component: main
+    arch: amd64
+
+  # Rocky Linux (dnf / RPM-MD) — 9 BaseOS, x86_64.
+  - id: rocky-9-baseos-x86_64
+    type: dnf
+    upstream: https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os
+    arch: x86_64
+
+# admin_password_hash: <paste the output of `repowatch hash-password` here>

@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily backup of repowatch state.sqlite3
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<metadata xmlns="http://linux.duke.edu/metadata/common" xmlns:rpm="http://linux.duke.edu/metadata/rpm" packages="5">
+  <package type="rpm">
+    <name>demo</name><arch>x86_64</arch><version epoch="2" ver="1.4" rel="3.el9"/>
+    <checksum type="sha256" pkgid="YES">abc</checksum>
+    <summary>Test package</summary><description>Authored fixture, no upstream payload.</description>
+    <location href="Packages/d/demo-1.4-3.el9.x86_64.rpm"/>
+    <format><rpm:license>MIT</rpm:license><rpm:requires><rpm:entry name="libc.so.6"/></rpm:requires></format>
+  </package>
+  <package type="rpm">
+    <name>demo</name><arch>noarch</arch><version epoch="2" ver="1.4" rel="3.el9"/>
+    <location href="Packages/d/demo-1.4-3.el9.noarch.rpm"/>
+  </package>
+  <package type="rpm">
+    <name>docs</name><arch>noarch</arch><version epoch="0" ver="3.0" rel="1"/>
+    <location href="./Packages/d/docs-3.0-1.noarch.rpm"/>
+  </package>
+  <package type="rpm">
+    <name>demo</name><arch>aarch64</arch><version epoch="2" ver="1.4" rel="3.el9"/>
+    <location href="Packages/d/demo-1.4-3.el9.aarch64.rpm"/>
+  </package>
+  <package type="rpm">
+    <name>demo</name><arch>src</arch><version epoch="2" ver="1.4" rel="3.el9"/>
+    <location href="Packages/d/demo-1.4-3.el9.src.rpm"/>
+  </package>
+</metadata>

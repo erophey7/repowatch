@@ -1,0 +1,191 @@
+# Access control
+
+repowatch's HTTP server (`repowatch run` / `serve-status`) exposes three
+different kinds of access, each with its own credential:
+
+1. **The dashboard and its administrative API** — a single admin password.
+2. **`status.json` and the read-only history/packages API**, meant for
+   automated clients (hosts polling before `pacman -Syu`/`apt update`/`apk
+   update`) — per-host bearer tokens.
+3. **An optional, fully anonymous read-only mode** — for internal networks
+   where even a shared token is more friction than you want.
+
+There's no framework underneath this — it's `http.server` plus a small
+amount of hand-written session/token/CSRF logic (`auth.py`, `access.py`).
+This document describes the resulting behavior; see those two files for the
+implementation.
+
+- [Admin login](#admin-login)
+- [Host tokens (`status.json` clients)](#host-tokens-statusjson-clients)
+- [Guest read-only mode](#guest-read-only-mode)
+- [TLS and `allow_insecure_http`](#tls-and-allow_insecure_http)
+- [Reverse proxies and `trusted_proxies`](#reverse-proxies-and-trusted_proxies)
+- [`/metrics` and `/healthz`](#metrics-and-healthz)
+- [What's deliberately not there](#whats-deliberately-not-there)
+
+## Admin login
+
+There is exactly one administrator password, hashed with PBKDF2-HMAC-SHA256
+(260,000 iterations — the current OWASP baseline) and stored as
+`admin_password_hash` in `config.yaml`. The plaintext password itself is
+never stored anywhere. Set it with:
+
+```bash
+repowatch hash-password      # prints a hash to paste into config.yaml
+repowatch set-password       # changes it in place, also revokes existing sessions
+```
+
+Until `admin_password_hash` is set, the dashboard and every administrative
+route are closed (there's no "no password configured = wide open" mode).
+
+**Sessions.** `POST /api/auth/login` with the password creates a 12-hour
+session, stored in `state_db`, identified by an `HttpOnly` cookie
+(`repowatch_session`; `Secure` is set whenever the connection is HTTPS —
+see [TLS](#tls-and-allow_insecure_http)). The cookie carries an opaque
+random secret, not the password or a JWT — the server looks it up in SQLite
+on every request and checks it against the current password's fingerprint,
+so changing the password (or running `set-password`) invalidates every
+existing session immediately, without needing to enumerate or delete them.
+
+**CSRF.** Every state-changing (`POST`) admin request must also include an
+`X-CSRF-Token` header matching a per-session token, obtained from
+`GET /api/auth/session`. The cookie alone isn't enough to make a change —
+this is what stops a malicious page the admin happens to have open in
+another tab from silently POSTing to the dashboard using the ambient
+session cookie. `POST` requests are additionally checked for same-origin
+(`Origin`/`Sec-Fetch-Site`) as a second, independent layer.
+
+**Login itself requires HTTPS** (or `allow_insecure_http`, see below) —
+credentials and CSRF tokens aren't meaningfully protected on plain HTTP
+regardless of what happens after.
+
+## Host tokens (`status.json` clients)
+
+The machines that actually poll `status.json` before running their package
+manager don't get the admin password — they get a separate, revocable
+**host token**, issued from the dashboard (`POST /api/tokens`, admin-only)
+or its API:
+
+- The token itself (`rw_...`, a random secret) is shown **once**, at issue
+  time — only its SHA-256 hash is stored in `state_db`. If you lose it,
+  revoke it and issue a new one.
+- Tokens can optionally expire (`expires_at`) and can be named freely, so
+  you can tell "the token on `db-primary`" apart from "the token on
+  `web-03`" in the token list.
+- Revocation (`POST /api/tokens/<id>/revoke`) is checked on every request
+  against SQLite — never cached in a running process — so a revoked token
+  stops working immediately, not "after the next restart".
+- A client authenticates with a standard `Authorization: Bearer <token>`
+  header against `status.json` and the per-repository history endpoint.
+
+**Scoping tokens to specific repositories.** By default a token can read
+status for every repository. If you want a host to only be able to see
+repositories it's actually supposed to use, turn on
+`status_server.token_repo_restrictions: true` in `config.yaml`, then issue
+new tokens with an explicit `repo_ids` list. This is opt-in and
+non-retroactive: tokens issued before you turn the setting on (or issued
+without a `repo_ids` list afterward) keep unrestricted access — turning the
+setting on doesn't quietly narrow anything that already exists. A scoped
+token gets a `403` for a repository outside its list, and its
+`GET /status.json` response is filtered down to only the repositories it's
+allowed to see, rather than erroring.
+
+Note what host tokens *don't* grant: they're read-only against the status
+API specifically. They cannot log into the dashboard, trigger a warm-up, add
+a repository, or change any config — those all require the admin session
+and CSRF token above.
+
+## Guest read-only mode
+
+`status_server.guest_read_only: true` (default `false`) opens the dashboard
+and a fixed, explicit set of read routes — status, per-repo history,
+packages, warmed-package lists, ban lists, request statistics, the safe
+config fields — to anyone, with no login and no token at all. It's meant for
+trusted internal networks where even distributing a token is unnecessary
+friction, not for exposing repowatch to the open internet.
+
+What it does **not** do:
+
+- It's an *allowlist* of specific GET routes, not "every GET route" —
+  `/api/tokens` (the list of issued host tokens) stays admin-only regardless,
+  since that list is itself sensitive.
+- Nothing that changes state is affected — every `POST` route still requires
+  a real admin session and CSRF token. A guest can watch the dashboard
+  render but can't add a repository, trigger a warm-up, or edit anything;
+  the write buttons are hidden in the UI, and the server enforces the same
+  restriction independently if you bypass the UI and call the API directly.
+- `/metrics` has its own separate IP-based rule (see below) — guest mode
+  doesn't widen or narrow it.
+- Turning `guest_read_only` back off closes anonymous access on the very
+  next request; nothing is cached that would keep it open.
+
+If you enable this, treat `status.json` itself as public information for
+anyone who can reach the port — it's the explicit tradeoff you're making.
+
+## TLS and `allow_insecure_http`
+
+The built-in server can terminate TLS itself
+(`status_server.tls_cert_path`/`tls_key_path` in `config.yaml`, see
+[configuration.md](configuration.md)) or you can put a reverse proxy in
+front of it and leave those unset. Either way, by default, anything
+credentialed — admin login/session, CSRF, and Bearer-token status requests —
+**refuses to work over plain, unencrypted HTTP**: the server has no way to
+tell "this is HTTP because there's a TLS-terminating reverse proxy in front
+of me" from "this is HTTP because there's nothing protecting these
+credentials on the wire" without you telling it, so it defaults to refusing.
+
+`status_server.allow_insecure_http: true` is the explicit opt-out — set it
+if you deliberately want to run over plain HTTP (e.g. a loopback-only setup,
+or a network you already trust end-to-end). It's a conscious tradeoff you
+make, not something inferred from a `X-Forwarded-Proto` header sent by an
+unconfigured, arbitrary peer — see the next section for why that header
+alone isn't trusted.
+
+`GET /login`, `GET /healthz`, and the dashboard's static HTML shell are
+reachable over plain HTTP regardless (there's nothing secret in them);
+it's credential-bearing requests specifically that are gated.
+
+## Reverse proxies and `trusted_proxies`
+
+If you run repowatch behind a reverse proxy, the proxy's own address is what
+the server sees as the "client" by default — which matters for
+`metrics_allowed_networks` (below) and for what's logged as the requesting
+IP. List your proxy's address(es) in `status_server.trusted_proxies` (see
+[configuration.md](configuration.md)) to have `X-Forwarded-For` /
+`X-Forwarded-Proto` / `X-Forwarded-Host` from that peer honored instead.
+
+This is deliberately conservative: a peer that isn't in `trusted_proxies`
+can't just claim to be forwarding for someone else by sending those headers
+itself — they're only honored from peers you've explicitly named. An
+unconfigured, non-loopback peer sending forwarding headers is treated as
+suspicious input, not trusted data.
+
+## `/metrics` and `/healthz`
+
+- `GET /metrics` (Prometheus text format) is restricted by client network,
+  not by password or token — `status_server.metrics_allowed_networks`
+  (default: loopback only). Widen it to your monitoring subnet if
+  Prometheus scrapes from somewhere else. This is deliberately a different
+  mechanism from the admin/token/guest system above: a scraper is a
+  different kind of client than a browser or a package-manager host, and
+  tying it to the admin password or a host token would mean either sharing
+  admin credentials with your monitoring stack or teaching every scraped
+  target's token about metrics it has nothing to do with.
+- `GET /healthz` is completely open (a single `{"healthy": true/false}`,
+  200/503) — it's meant for load balancers and process supervisors, and
+  reveals nothing beyond "is this repowatch instance keeping up with its
+  check schedule".
+
+## What's deliberately not there
+
+- **No per-IP or per-token rate limiting on reads.** Read access (status API,
+  dashboard, packages/history) is not rate-limited by client IP. A single
+  address can legitimately represent an entire NAT'd network or reverse
+  proxy fronting many real clients, so an IP-based quota would punish
+  shared infrastructure, not abuse. If you need to defend against actual
+  abusive traffic, do it at the reverse proxy / firewall layer, which has
+  better visibility into real client identity than repowatch does.
+- **No OAuth/SSO/multi-user accounts.** There's one administrator password,
+  not a user database — this is a small self-hosted tool for a small
+  operations team, not a multi-tenant service. If you need per-person
+  audit trails for admin actions, that's out of scope today.

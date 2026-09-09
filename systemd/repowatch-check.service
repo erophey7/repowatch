@@ -1,0 +1,9 @@
+[Unit]
+Description=repowatch - one-shot check of all repos (used with repowatch-check.timer)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=repowatch
+Group=repowatch
+ExecStart=/usr/local/bin/repowatch -c /etc/repowatch/config.yaml check-once

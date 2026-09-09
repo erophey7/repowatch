@@ -1,0 +1,1296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>repowatch</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f7f7f8;
+    --surface: #ffffff;
+    --border: #e2e2e6;
+    --text: #1b1b1f;
+    --text-dim: #6b6b74;
+    --accent: #3457d5;
+    --ok: #1f8a4c;
+    --warn: #b3541e;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16161a;
+      --surface: #1f1f24;
+      --border: #303038;
+      --text: #eceef0;
+      --text-dim: #9a9aa2;
+      --accent: #7c93ff;
+      --ok: #4fce84;
+      --warn: #e0904a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: 24px;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .subtitle { color: var(--text-dim); margin: 0 0 20px; font-size: 13px; }
+  .table-wrap { overflow-x: auto; border-radius: 8px; }
+  table { width: 100%; border-collapse: collapse; background: var(--surface);
+          border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border);
+           font-size: 13px; white-space: nowrap; }
+  th { color: var(--text-dim); font-weight: 500; }
+
+  /* Hide less-important columns as the window narrows — the repository
+     table used to just squash into mush on narrow screens (10 columns).
+     Drop order goes from least important for a quick glance to most
+     important; hidden columns are still available in the row's expanded
+     detail on click. */
+  @media (max-width: 1200px) { .col-upstream { display: none; } }
+  @media (max-width: 1000px) { .col-changed { display: none; } }
+  @media (max-width: 850px)  { .col-interval { display: none; } }
+  @media (max-width: 700px)  { .col-type, .col-prefetch { display: none; } }
+  @media (max-width: 550px)  { .col-warmed { display: none; } }
+  tr.repo-row { cursor: pointer; }
+  tr.repo-row:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+  tr:last-child td { border-bottom: none; }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; }
+  .badge-changed { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
+  .badge-stale { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+  .mono { font-family: var(--mono); font-size: 12px; }
+  .detail-row td { background: var(--bg); padding: 0; }
+  .detail-panel { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; padding: 14px 16px; }
+  .detail-col h3 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase;
+                   letter-spacing: .04em; color: var(--text-dim); }
+  .scroll-list { max-height: 220px; overflow-y: auto; border: 1px solid var(--border);
+                 border-radius: 6px; background: var(--surface); }
+  .scroll-list div { padding: 4px 8px; font-family: var(--mono); font-size: 12px;
+                      border-bottom: 1px solid var(--border); }
+  .scroll-list div:last-child { border-bottom: none; }
+  .empty { color: var(--text-dim); font-style: italic; padding: 8px; }
+  [hidden] { display: none !important; }
+  #status { color: var(--text-dim); font-size: 12px; margin-top: 16px; }
+
+  .toolbar { margin: 16px 0; }
+  button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border);
+           background: var(--surface); color: var(--text); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:hover { filter: brightness(0.97); }
+  #add-form { margin-top: 12px; padding: 16px; background: var(--surface);
+              border: 1px solid var(--border); border-radius: 8px; max-width: 480px; }
+  #add-form h3 { margin: 0 0 12px; font-size: 13px; }
+  .field { margin-bottom: 10px; display: flex; flex-direction: column; gap: 4px; }
+  .field label { font-size: 12px; color: var(--text-dim); }
+  .field input[type=text], .field input[type=password], .field select {
+    font: inherit; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text);
+  }
+  .field.checkbox { flex-direction: row; align-items: center; }
+  .form-actions { display: flex; gap: 8px; margin-top: 14px; }
+  .form-msg { font-size: 12px; margin-top: 10px; }
+  .form-msg.error { color: var(--warn); }
+  .form-msg.ok { color: var(--ok); }
+  .section-title { font-size: 15px; margin: 28px 0 4px; }
+  .dim { color: var(--text-dim); }
+  .pkg-search { width: 100%; font: inherit; padding: 5px 8px; margin-bottom: 6px;
+                border-radius: 6px; border: 1px solid var(--border);
+                background: var(--bg); color: var(--text); }
+  .checklist { max-height: 160px; }
+  .pick-row { display: block; padding: 3px 8px; font-family: var(--mono); font-size: 12px;
+              cursor: pointer; }
+  .pick-row:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+  .pick-row input { margin-right: 6px; }
+  .warm-actions { display: flex; gap: 6px; margin-top: 8px; }
+  .warm-actions input { flex: 1; font: inherit; padding: 5px 8px; border-radius: 6px;
+                         border: 1px solid var(--border); background: var(--bg); color: var(--text); }
+  .browse-link { font-size: 12px; }
+  .row-with-action { display: flex; align-items: center; justify-content: space-between;
+                      gap: 6px; padding: 4px 8px; font-family: var(--mono); font-size: 12px;
+                      border-bottom: 1px solid var(--border); }
+  .row-with-action:last-child { border-bottom: none; }
+  .mini-remove { font-size: 11px; padding: 1px 7px; border-radius: 999px; line-height: 1.4;
+                 border: 1px solid var(--border); background: var(--surface); color: var(--warn);
+                 cursor: pointer; }
+  .ban-form { display: flex; gap: 6px; margin-top: 10px; }
+  .ban-form input { flex: 1; font: inherit; padding: 5px 8px; border-radius: 6px;
+                     border: 1px solid var(--border); background: var(--bg); color: var(--text); }
+  .subsection-title { font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+                       color: var(--text-dim); margin: 14px 0 6px; }
+  .row-actions { display: flex; gap: 4px; }
+  .row-actions button { font-size: 11px; padding: 2px 8px; }
+  .row-actions .danger { color: var(--warn); }
+  .field input:disabled { opacity: .6; }
+  .field-hint { font-size: 11px; color: var(--text-dim); }
+  @media (max-width: 900px) {
+    .detail-panel { grid-template-columns: 1fr; }
+  }
+  .requests-toolbar { display: flex; gap: 8px; margin: 10px 0; }
+  .requests-toolbar select { font: inherit; padding: 5px 8px; border-radius: 6px;
+                              border: 1px solid var(--border); background: var(--surface);
+                              color: var(--text); }
+  .charts-row { display: flex; gap: 12px; flex-wrap: wrap; margin: 12px 0 20px; }
+  .chart-panel { flex: 1 1 260px; min-width: 220px; background: var(--surface);
+                 border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+  .chart-panel h3 { margin: 0 0 8px; font-size: 11px; text-transform: uppercase;
+                     letter-spacing: .04em; color: var(--text-dim); }
+  .chart-svg-wrap svg { display: block; }
+  .chart-label { fill: var(--text-dim); font-size: 11px; font-family: var(--mono); }
+  .chart-bar { fill: var(--accent); }
+  .chart-count { fill: var(--text); font-size: 11px; }
+  code { font-family: var(--mono); background: var(--surface); padding: 1px 5px;
+         border-radius: 4px; border: 1px solid var(--border); }
+
+  /* Collapsible manual repository groups — native <details>/<summary>, no
+     JS libraries, the same approach already used for the request charts. */
+  .repo-group { margin-bottom: 12px; border-radius: 8px; background: var(--surface);
+                border: 1px solid var(--border); overflow: hidden; }
+  .repo-group > summary { cursor: pointer; padding: 8px 12px; font-size: 13px;
+                           font-weight: 500; list-style: none; display: flex;
+                           align-items: center; gap: 8px; user-select: none; }
+  .repo-group > summary::-webkit-details-marker { display: none; }
+  .repo-group > summary::before { content: '▸'; color: var(--text-dim); font-size: 11px;
+                                   display: inline-block; transition: transform .1s; }
+  .repo-group[open] > summary::before { transform: rotate(90deg); }
+  .repo-group .group-count { color: var(--text-dim); font-weight: 400; }
+  .repo-group .table-wrap { border-radius: 0; border-top: 1px solid var(--border); }
+  .repo-group table { border: none; border-radius: 0; }
+
+  .login-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 18px;
+               padding: 10px 14px; background: var(--surface); border: 1px solid var(--border);
+               border-radius: 8px; }
+  .login-bar input[type=password] { font: inherit; padding: 5px 8px; border-radius: 6px;
+                                     border: 1px solid var(--border); background: var(--bg);
+                                     color: var(--text); width: 220px; }
+  .login-bar .login-msg { font-size: 12px; }
+  .login-bar .login-msg.error { color: var(--warn); }
+  .login-bar .login-msg.ok { color: var(--ok); }
+  .login-bar .logged-in { display: flex; align-items: center; gap: 8px; }
+  .login-bar .logout-link { font-size: 12px; cursor: pointer; color: var(--accent);
+                             text-decoration: underline; background: none; border: none; padding: 0; }
+  body:not([data-role="admin"]) .row-actions,
+  body:not([data-role="admin"]) .mini-remove,
+  body:not([data-role="admin"]) .warm-actions,
+  body:not([data-role="admin"]) .ban-form,
+  body:not([data-role="admin"]) .pick-row input,
+  body:not([data-role="admin"]) #logout-btn { display: none; }
+</style>
+</head>
+<body>
+  <h1>repowatch</h1>
+  <p class="subtitle">Watched package repositories</p>
+
+  <div class="login-bar">
+    <span id="access-role">Checking access…</span>
+    <a id="admin-login" href="/login" hidden>Log in as administrator</a>
+    <button type="button" id="logout-btn">Log out</button>
+  </div>
+  <details id="tokens-panel" hidden>
+    <summary>Host tokens</summary>
+    <p>Grant status read access only. Restricting the repository list requires token_repo_restrictions in the config.</p>
+    <form id="token-form">
+      <label>Host name <input id="token-name" required maxlength="128"></label>
+      <label>Expires at (optional) <input id="token-expiry" type="datetime-local"></label>
+      <label>Allowed repo_ids, comma-separated (empty — all) <input id="token-repos"></label>
+      <button>Issue token</button>
+    </form>
+    <p id="token-message" role="status"></p>
+    <div id="token-secret-wrap" hidden>
+      <p>Save this token now: it cannot be shown again.</p>
+      <input id="token-secret" readonly aria-label="New token">
+      <button id="hide-token" type="button">Saved — hide</button>
+    </div>
+    <div id="tokens-list"></div>
+  </details>
+
+  <div id="repos-groups"></div>
+
+  <div id="status"></div>
+
+  <div class="toolbar">
+    <button id="toggle-add-form" hidden>+ Add repository</button>
+    <button id="toggle-settings-form" hidden>⚙ Settings</button>
+  </div>
+
+  <form id="add-form" hidden>
+    <h3 id="add-form-title">New repository</h3>
+
+    <div class="field">
+      <label for="f-id">id</label>
+      <input type="text" id="f-id" required placeholder="arch-community-x86_64">
+    </div>
+
+    <div class="field">
+      <label for="f-type">type</label>
+      <select id="f-type">
+        <option value="pacman">pacman</option>
+        <option value="apt">apt</option>
+        <option value="apk">apk</option>
+        <option value="apt-rpm">apt-rpm (ALT Linux)</option>
+        <option value="dnf">dnf / rpm</option>
+      </select>
+    </div>
+
+    <div class="field">
+      <label for="f-upstream">upstream</label>
+      <input type="text" id="f-upstream" required placeholder="https://...">
+    </div>
+
+    <div class="field">
+      <label for="f-arch">arch</label>
+      <input type="text" id="f-arch" required placeholder="x86_64">
+    </div>
+
+    <div class="field">
+      <label for="f-url-template">Local URL scheme (optional)</label>
+      <input type="text" id="f-url-template" placeholder="/archlinux/{repo_name}/os/{arch}/">
+      <span class="field-hint">Empty — the default scheme. Variables: id, type, repo_name, arch, distribution, component.</span>
+    </div>
+    <div class="field">
+      <label for="f-url-variables">Custom scheme variables (JSON, optional)</label>
+      <input type="text" id="f-url-variables" placeholder='{"distro":"custom","branch":"stable"}'>
+    </div>
+    <div class="field">
+      <label for="f-group">group (optional, dashboard only)</label>
+      <input type="text" id="f-group" list="group-list" placeholder="e.g.: arch, ubuntu-noble, staging">
+      <span class="field-hint">a manual label — you decide what goes in which group; empty — "Ungrouped"</span>
+    </div>
+    <datalist id="group-list"></datalist>
+
+    <div class="field" data-for="pacman">
+      <label for="f-repo-name">repo_name (pacman)</label>
+      <input type="text" id="f-repo-name" placeholder="core / extra / community">
+    </div>
+
+    <div class="field" data-for="apt" hidden>
+      <label for="f-distribution">distribution (apt)</label>
+      <input type="text" id="f-distribution" placeholder="bookworm">
+    </div>
+
+    <div class="field" data-for="apt apt-rpm" hidden>
+      <label for="f-component">component (apt / apt-rpm)</label>
+      <input type="text" id="f-component" placeholder="main">
+    </div>
+
+    <div class="field checkbox">
+      <input type="checkbox" id="f-prefetch" checked>
+      <label for="f-prefetch">warm the cache (prefetch)</label>
+    </div>
+
+    <div class="field checkbox" id="f-verify-signature-field">
+      <input type="checkbox" id="f-verify-signature">
+      <label for="f-verify-signature">verify index signature (verify_signature)</label>
+    </div>
+
+    <label data-for="apk">APK trusted keys directory <input id="f-apk-keys"></label>
+    <label data-for="apk">APK verification <select id="f-apk-backend"><option value="openssl">OpenSSL</option><option value="apk-tools">apk-tools ≥ 3.0</option></select></label>
+    <div class="field" id="f-keyring-path-field" hidden>
+      <label for="f-keyring-path">keyring_path</label>
+      <input type="text" id="f-keyring-path" placeholder="/usr/share/keyrings/....gpg">
+      <span class="field-hint">a binary keyring, not .asc — see the README</span>
+    </div>
+
+    <div class="field">
+      <label for="f-check-interval">check_interval (sec, optional)</label>
+      <input type="text" id="f-check-interval" placeholder="default — the global check_interval">
+    </div>
+
+    <div class="field">
+      <label for="f-prefetch-bandwidth-limit">prefetch_bandwidth_limit (bytes/sec, optional)</label>
+      <input type="text" id="f-prefetch-bandwidth-limit" placeholder="default — the global value (or no limit)">
+    </div>
+
+    <div class="form-actions">
+      <button type="submit" class="primary" id="add-form-submit">Add</button>
+      <button type="button" id="cancel-add-form">Cancel</button>
+    </div>
+
+    <div id="form-msg" class="form-msg"></div>
+  </form>
+
+  <form id="settings-form" hidden>
+    <h3>Global settings</h3>
+    <p class="field-hint">
+      Only the "safe" fields — nothing secret, and nothing that requires a
+      process restart to take effect (state_db, the status API port, etc.
+      are edited only by hand in config.yaml).
+    </p>
+
+    <div class="field">
+      <label for="s-check-interval">check_interval (sec)</label>
+      <input type="text" id="s-check-interval">
+    </div>
+    <div class="field">
+      <label for="s-event-retention">event_retention_days</label>
+      <input type="text" id="s-event-retention">
+    </div>
+    <div class="field">
+      <label for="s-request-retention">request_retention_days</label>
+      <input type="text" id="s-request-retention">
+    </div>
+    <div class="field">
+      <label for="s-warmed-retention">warmed_retention_days</label>
+      <input type="text" id="s-warmed-retention">
+    </div>
+    <div class="field">
+      <label for="s-event-max-rows">event_max_rows_per_repo (empty — no limit)</label>
+      <input type="text" id="s-event-max-rows">
+    </div>
+    <div class="field">
+      <label for="s-request-max-rows">request_max_rows (global, empty — no limit)</label>
+      <input type="text" id="s-request-max-rows">
+    </div>
+    <div class="field">
+      <label for="s-prefetch-concurrency">prefetch_concurrency</label>
+      <input type="text" id="s-prefetch-concurrency">
+    </div>
+    <div class="field">
+      <label for="s-check-concurrency">check_concurrency</label>
+      <input type="text" id="s-check-concurrency">
+    </div>
+    <div class="field">
+      <label for="s-prefetch-bandwidth-limit">prefetch_bandwidth_limit (bytes/sec, empty — no limit)</label>
+      <input type="text" id="s-prefetch-bandwidth-limit">
+    </div>
+    <div class="field">
+      <label for="s-cache-base-url">cache_base_url</label>
+      <input type="text" id="s-cache-base-url">
+    </div>
+    <div class="field">
+      <label for="s-public-cache-url">public_cache_url (empty — same as cache_base_url)</label>
+      <input type="text" id="s-public-cache-url">
+    </div>
+    <div class="field">
+      <label for="s-notify-after-failures">notify_after_failures (threshold for webhook notifications)</label>
+      <input type="text" id="s-notify-after-failures">
+      <span class="field-hint">
+        the webhook itself (notify_webhook_url) is a secret, set only by hand in config.yaml
+      </span>
+    </div>
+
+    <div class="form-actions">
+      <button type="submit" class="primary">Save</button>
+      <button type="button" id="cancel-settings-form">Cancel</button>
+    </div>
+
+    <div id="settings-msg" class="form-msg"></div>
+  </form>
+
+  <h2 class="section-title">Recent client requests</h2>
+  <p class="subtitle">
+    Requires <code>syslog_listener.enabled</code> in config.yaml — without it, the list and charts stay empty.
+  </p>
+  <div class="requests-toolbar">
+    <select id="req-repo-filter"><option value="">all repositories</option></select>
+    <button id="req-refresh">Refresh</button>
+  </div>
+
+  <div class="charts-row">
+    <div class="chart-panel">
+      <h3>Top IPs</h3>
+      <div class="chart-svg-wrap" data-chart="by_client_ip">Loading…</div>
+    </div>
+    <div class="chart-panel">
+      <h3>Top paths</h3>
+      <div class="chart-svg-wrap" data-chart="by_path">Loading…</div>
+    </div>
+    <div class="chart-panel">
+      <h3>Requests by repository</h3>
+      <div class="chart-svg-wrap" data-chart="by_repo">Loading…</div>
+    </div>
+  </div>
+  <div class="table-wrap">
+  <table id="requests-table">
+    <thead>
+      <tr><th>time</th><th>IP</th><th>repo</th><th>method</th><th>path</th><th>status</th><th>cache</th></tr>
+    </thead>
+    <tbody id="requests-body"></tbody>
+  </table>
+  </div>
+
+<script>
+const $status = document.getElementById('status');
+
+// The server allows either an administrator or explicitly enabled guest reads.
+// Cookies are HttpOnly; neither the password nor the session secret is kept in JS.
+let csrfToken = null;
+let isLoggedIn = false;
+const $toggleAddFormBtn = document.getElementById('toggle-add-form');
+const $toggleSettingsFormBtn = document.getElementById('toggle-settings-form');
+
+try { sessionStorage.removeItem('repowatch_admin_password'); } catch (_) {}
+const nativeFetch = window.fetch.bind(window);
+const sessionReady = nativeFetch('/api/auth/session').then(async response => {
+  if (!response.ok) { location.replace('/login'); throw new Error('Session expired'); }
+  const session = await response.json();
+  isLoggedIn = session.role === 'admin';
+  csrfToken = session.csrf_token || null;
+  document.body.dataset.role = isLoggedIn ? 'admin' : 'guest';
+  document.getElementById('access-role').textContent = isLoggedIn ? 'Administrator' : 'Guest · read-only';
+  document.getElementById('admin-login').hidden = isLoggedIn;
+  document.getElementById('logout-btn').hidden = !isLoggedIn;
+  document.getElementById('tokens-panel').hidden = !isLoggedIn;
+  $toggleAddFormBtn.hidden = !isLoggedIn;
+  $toggleSettingsFormBtn.hidden = false;
+  $toggleSettingsFormBtn.textContent = isLoggedIn ? '⚙ Settings' : '⚙ View settings';
+  document.querySelectorAll('#settings-form input').forEach(input => { input.readOnly = !isLoggedIn; });
+  document.querySelector('#settings-form button[type="submit"]').hidden = !isLoggedIn;
+  document.getElementById('cancel-settings-form').textContent = isLoggedIn ? 'Cancel' : 'Close';
+});
+const fetch = async function(url, options = {}) {
+  await sessionReady;
+  const headers = {...options.headers};
+  if (options.method && options.method !== 'GET') {
+    if (!isLoggedIn) throw new Error('Administrator login required');
+    headers['X-CSRF-Token'] = csrfToken;
+  }
+  const response = await nativeFetch(url, {...options, headers});
+  if (response.status === 401) { location.replace('/login'); throw new Error('Session expired'); }
+  return response;
+}
+document.getElementById('logout-btn').addEventListener('click', async () => {
+  try {
+    const response = await fetch('/api/auth/logout', {method:'POST'});
+    if (response.ok) location.replace('/login');
+    else alert('Failed to end the session');
+  } catch (error) { alert(error.message); }
+});
+async function loadTokens() {
+  const response = await fetch('/api/tokens');
+  if (!response.ok) throw new Error('Failed to load tokens');
+  const tokens = await response.json();
+  const list = document.getElementById('tokens-list');
+  list.innerHTML = tokens.length ? tokens.map(token => {
+    const date = value => value ? new Date(value * 1000).toLocaleString() : '—';
+    const status = token.revoked_at ? 'Revoked' : token.expires_at && token.expires_at * 1000 <= Date.now() ? 'Expired' : 'Active';
+    return `<p><strong>${esc(token.name)}</strong> — ${status}; repositories: ${token.repo_ids == null ? 'all' : esc(token.repo_ids.join(', ') || 'none')}; created: ${date(token.created_at)}; until: ${date(token.expires_at)}; last used: ${date(token.last_used_at)}
+      ${!token.revoked_at ? `<button type="button" data-revoke="${esc(token.id)}">Revoke</button>` : ''}</p>`;
+  }).join('') : '<p>No tokens issued yet.</p>';
+  list.querySelectorAll('[data-revoke]').forEach(button => button.addEventListener('click', async () => {
+    if (!confirm('Revoke this host\'s access?')) return;
+    const response = await fetch(`/api/tokens/${encodeURIComponent(button.dataset.revoke)}/revoke`, {method:'POST'});
+    if (!response.ok) { document.getElementById('token-message').textContent = 'Failed to revoke the token'; return; }
+    await loadTokens();
+  }));
+}
+document.getElementById('tokens-panel').addEventListener('toggle', () => {
+  if (document.getElementById('tokens-panel').open) loadTokens().catch(error => {
+    document.getElementById('token-message').textContent = error.message;
+  });
+});
+document.getElementById('token-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const expiry = document.getElementById('token-expiry').value;
+  const button = event.target.querySelector('button');
+  button.disabled = true;
+  try {
+    const response = await fetch('/api/tokens', {method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:document.getElementById('token-name').value, expires_at:expiry ? new Date(expiry).getTime()/1000 : null, repo_ids:document.getElementById('token-repos').value.trim() ? document.getElementById('token-repos').value.split(',').map(s => s.trim()).filter(Boolean) : null})});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Failed to issue token');
+    document.getElementById('token-secret').value = data.token;
+    document.getElementById('token-secret-wrap').hidden = false;
+    document.getElementById('token-message').textContent = 'Token issued';
+    await loadTokens();
+  } catch(error) { document.getElementById('token-message').textContent = error.message; }
+  finally { button.disabled = false; }
+});
+document.getElementById('hide-token').addEventListener('click', () => {
+  document.getElementById('token-secret').value = '';
+  document.getElementById('token-secret-wrap').hidden = true;
+});
+
+function fmtTs(ts) {
+  return ts ? ts.replace('T', ' ').replace(/\+00:00$/, ' UTC') : '—';
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+let lastRepos = [];
+
+async function loadRepos() {
+  $status.textContent = 'Loading…';
+  try {
+    const res = await fetch('/api/repos');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const repos = await res.json();
+    lastRepos = repos;
+    render(repos);
+    populateRepoFilter(repos);
+    populateGroupList(repos);
+    $status.textContent = `Updated: ${new Date().toLocaleTimeString()} · repositories: ${repos.length}`;
+  } catch (err) {
+    $status.textContent = `Load error: ${err.message}`;
+  }
+}
+
+function populateRepoFilter(repos) {
+  const select = document.getElementById('req-repo-filter');
+  const current = select.value;
+  select.innerHTML = '<option value="">all repositories</option>' +
+    repos.map(r => `<option value="${esc(r.id)}">${esc(r.id)}</option>`).join('');
+  select.value = current;
+}
+
+// Suggestions for the "group" field in the add/edit form — names already
+// in use, so typos don't create accidental duplicates (the group itself is
+// a free-text label, there's no separate entity/CRUD for it).
+function populateGroupList(repos) {
+  const names = [...new Set(
+    repos.map(r => (r.config && r.config.group) || '').filter(Boolean)
+  )].sort((a, b) => a.localeCompare(b));
+  document.getElementById('group-list').innerHTML =
+    names.map(n => `<option value="${esc(n)}">`).join('');
+}
+
+const UNGROUPED_LABEL = 'Ungrouped';
+
+// Manual groups (RepoConfig.group) — not automatic grouping by type, but a
+// label the operator assigns through the edit form. Each group is a
+// collapsible <details>, no third-party libraries.
+function groupRepos(repos) {
+  const byName = new Map();
+  for (const repo of repos) {
+    const name = (repo.config && repo.config.group) || UNGROUPED_LABEL;
+    if (!byName.has(name)) byName.set(name, []);
+    byName.get(name).push(repo);
+  }
+  const names = [...byName.keys()].filter(n => n !== UNGROUPED_LABEL).sort((a, b) => a.localeCompare(b));
+  if (byName.has(UNGROUPED_LABEL)) names.push(UNGROUPED_LABEL);
+  return names.map(name => ({ name, repos: byName.get(name) }));
+}
+
+const REPOS_THEAD_HTML = `
+  <tr>
+    <th>id</th><th class="col-type">type</th><th class="col-upstream">upstream</th>
+    <th class="col-prefetch">prefetch</th><th class="col-interval">interval</th>
+    <th>packages</th><th class="col-warmed">warmed</th><th>last check</th>
+    <th class="col-changed">changed at</th><th>files</th><th>actions</th>
+  </tr>
+`;
+
+// Group open/closed state survives auto-refresh (loadRepos redraws
+// everything from scratch every 30s) — it's kept by group name, separately
+// from the DOM. By default (the first time a group is seen), only groups
+// with at least one changed repository are expanded.
+const groupOpenState = new Map();
+
+function createRepoRow(repo) {
+  const tr = document.createElement('tr');
+  tr.className = 'repo-row';
+  tr.dataset.repoId = repo.id;
+  const changedBadge = repo.changed_at
+    ? `<span class="badge badge-changed">has changes</span>`
+    : `<span class="badge badge-stale">unchanged</span>`;
+  tr.innerHTML = `
+    <td class="mono">${esc(repo.id)}</td>
+    <td class="col-type">${esc(repo.type)}</td>
+    <td class="mono col-upstream">${esc(repo.upstream)}</td>
+    <td class="col-prefetch">${repo.prefetch ? 'yes' : 'no'}</td>
+    <td class="col-interval">${repo.check_interval ? `${repo.check_interval}s` : '—'}</td>
+    <td>${repo.package_count ?? '—'}</td>
+    <td class="col-warmed">${repo.warmed_count ?? '—'}</td>
+    <td class="mono">${fmtTs(repo.last_check)}</td>
+    <td class="col-changed">${changedBadge} <span class="mono">${fmtTs(repo.changed_at)}</span></td>
+    <td class="browse-link">${repo.browse_url
+      ? `<a href="${esc(repo.browse_url)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">browse →</a>`
+      : '—'}</td>
+    <td>${isLoggedIn ? `
+      <div class="row-actions">
+        <button type="button" data-action="edit-repo">✎</button>
+        <button type="button" class="danger" data-action="delete-repo">✕</button>
+      </div>` : '—'}</td>
+  `;
+  tr.querySelector('[data-action="edit-repo"]')?.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    openEditForm(repo);
+  });
+  tr.querySelector('[data-action="delete-repo"]')?.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    deleteRepo(repo.id);
+  });
+  tr.addEventListener('click', () => toggleDetail(tr, repo.id));
+  return tr;
+}
+
+function render(repos) {
+  const $groups = document.getElementById('repos-groups');
+  const openPanel = $groups.querySelector('.detail-row');
+  $groups.innerHTML = '';
+  for (const { name, repos: groupItems } of groupRepos(repos)) {
+    const details = document.createElement('details');
+    details.className = 'repo-group';
+    if (!groupOpenState.has(name)) {
+      groupOpenState.set(name, groupItems.some(r => r.changed_at));
+    }
+    details.open = groupOpenState.get(name);
+    details.addEventListener('toggle', () => groupOpenState.set(name, details.open));
+
+    const summary = document.createElement('summary');
+    summary.innerHTML = `${esc(name)} <span class="group-count">(${groupItems.length})</span>`;
+    details.appendChild(summary);
+
+    const wrap = document.createElement('div');
+    wrap.className = 'table-wrap';
+    const table = document.createElement('table');
+    table.innerHTML = `<thead>${REPOS_THEAD_HTML}</thead>`;
+    const tbody = document.createElement('tbody');
+    for (const repo of groupItems) {
+      tbody.appendChild(createRepoRow(repo));
+      if (openPanel?.dataset.repoId === repo.id && openPanel.dataset.auth === String(isLoggedIn)) {
+        tbody.appendChild(openPanel);
+      }
+    }
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+    details.appendChild(wrap);
+    $groups.appendChild(details);
+  }
+}
+
+function renderWarmedList(items) {
+  return items.length
+    ? items.map(w => `
+        <div class="row-with-action">
+          <span>${w.status === 'ok' ? '✓' : '✗'} ${esc(w.package_key)} <span class="dim">· ${fmtTs(w.warmed_at)}</span></span>
+          <button class="mini-remove" data-action="remove-warmed" data-key="${esc(w.package_key)}">✕</button>
+        </div>`).join('')
+    : '<div class="empty">nothing warmed yet</div>';
+}
+
+// One bounded page at a time. Generation counters discard stale search responses.
+function pageLoader(container, url, render, afterRender = () => {}) {
+  let generation = 0, items = [], cursor = null, query = '', busy = false;
+  const more = document.createElement('button');
+  more.textContent = 'Show more';
+  more.hidden = true;
+  container.after(more);
+  async function load(reset = true, q = query) {
+    if (!reset && busy) return;
+    if (reset) { generation++; query = q; cursor = null; items = []; }
+    const current = generation;
+    busy = true; more.disabled = true;
+    const params = new URLSearchParams({limit: '100', q: query});
+    if (cursor) params.set('cursor', cursor);
+    try {
+      const res = await fetch(`${url}?${params}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const page = await res.json();
+      if (current !== generation) return;
+      items.push(...page.items);
+      cursor = page.next_cursor;
+      container.innerHTML = render(items);
+      afterRender();
+      more.hidden = !cursor;
+    } catch (err) {
+      if (current === generation) {
+        container.textContent = `Load error: ${err.message}`;
+        more.hidden = false; // allows retry
+      }
+    } finally {
+      if (current === generation) { busy = false; more.disabled = false; }
+    }
+  }
+  more.onclick = () => load(false);
+  return load;
+}
+
+function renderBannedList(names) {
+  return names.length
+    ? names.map(n => `
+        <div class="row-with-action">
+          <span class="mono">${esc(n)}</span>
+          <button class="mini-remove" data-action="unban" data-name="${esc(n)}">✕</button>
+        </div>`).join('')
+    : '<div class="empty">no bans</div>';
+}
+
+function renderPicker(container, keys, filterText) {
+  const q = filterText.trim().toLowerCase();
+  const filtered = q ? keys.filter(k => k.toLowerCase().includes(q)) : keys;
+  const LIMIT = 200;
+  const shown = filtered.slice(0, LIMIT);
+  container.innerHTML = shown.length
+    ? shown.map(k => `<label class="pick-row"><input type="checkbox" value="${esc(k)}"> ${esc(k)}</label>`).join('')
+      + (filtered.length > LIMIT ? `<div class="empty">showing the first ${LIMIT} of ${filtered.length}</div>` : '')
+    : '<div class="empty">nothing found</div>';
+}
+
+async function toggleDetail(tr, repoId) {
+  const existing = tr.nextElementSibling;
+  if (existing && existing.classList.contains('detail-row')) {
+    existing.remove();
+    return;
+  }
+  document.querySelectorAll('.detail-row').forEach(el => el.remove());
+
+  const detailRow = document.createElement('tr');
+  detailRow.className = 'detail-row';
+  detailRow.dataset.repoId = repoId;
+  detailRow.dataset.auth = String(isLoggedIn);
+  const td = document.createElement('td');
+  td.colSpan = tr.closest('table').querySelectorAll('thead th').length;
+  td.innerHTML = `<div class="detail-panel">
+    <div class="detail-col">
+      <h3>Warmed packages</h3>
+      <div class="scroll-list" data-slot="warmed">Loading…</div>
+    </div>
+    <div class="detail-col">
+      <h3>${isLoggedIn ? 'Add to warm queue' : 'Packages'}</h3>
+      <input type="text" class="pkg-search" data-slot="search" placeholder="filter by package name…">
+      <div class="scroll-list checklist" data-slot="picker">Loading…</div>
+      <div class="warm-actions">
+        <button data-slot="warm-btn">Warm</button>
+      </div>
+      <div class="form-msg" data-slot="warm-msg"></div>
+
+      <div class="subsection-title">Banned from auto-warm (by package name)</div>
+      <div class="scroll-list" data-slot="bans">Loading…</div>
+      <div class="ban-form">
+        <input type="text" data-slot="ban-name" placeholder="package name, e.g. linux-headers">
+        <button data-slot="ban-btn">Ban</button>
+      </div>
+      <div class="form-msg" data-slot="ban-msg"></div>
+    </div>
+    <div class="detail-col">
+      <h3>Change history</h3>
+      <div class="scroll-list" data-slot="history">Loading…</div>
+    </div>
+  </div>`;
+  detailRow.appendChild(td);
+  tr.after(detailRow);
+
+  const warmedSlot = td.querySelector('[data-slot="warmed"]');
+  const pickerSlot = td.querySelector('[data-slot="picker"]');
+  const searchInput = td.querySelector('[data-slot="search"]');
+  const histSlot = td.querySelector('[data-slot="history"]');
+  const warmBtn = td.querySelector('[data-slot="warm-btn"]');
+  const warmMsg = td.querySelector('[data-slot="warm-msg"]');
+  const bansSlot = td.querySelector('[data-slot="bans"]');
+  const banNameInput = td.querySelector('[data-slot="ban-name"]');
+  const banBtn = td.querySelector('[data-slot="ban-btn"]');
+  const banMsg = td.querySelector('[data-slot="ban-msg"]');
+
+  const loadWarmed = pageLoader(warmedSlot,
+    `/api/repos/${encodeURIComponent(repoId)}/warmed`, renderWarmedList);
+  const selectedKeys = new Set();
+  pickerSlot.addEventListener('change', ev => {
+    if (ev.target.type !== 'checkbox') return;
+    if (ev.target.checked) selectedKeys.add(ev.target.value);
+    else selectedKeys.delete(ev.target.value);
+  });
+  const loadPackages = pageLoader(pickerSlot,
+    `/api/repos/${encodeURIComponent(repoId)}/packages`,
+    items => items.length ? items.map(p =>
+      `<label class="pick-row"><input type="checkbox" value="${esc(p.package_key)}"> ${esc(p.package_key)}</label>`).join('')
+      : '<div class="empty">nothing found</div>',
+    () => pickerSlot.querySelectorAll('input').forEach(cb => { cb.checked = selectedKeys.has(cb.value); }));
+  let searchTimer;
+  searchInput.addEventListener('input', () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => loadPackages(true, searchInput.value.trim()), 250);
+  });
+  void loadWarmed();
+  void loadPackages();
+  const [histRes, bansRes] = await Promise.all([
+    fetch(`/status/${encodeURIComponent(repoId)}/history?limit=15`),
+    fetch(`/api/repos/${encodeURIComponent(repoId)}/bans`),
+  ]);
+
+  bansSlot.innerHTML = bansRes.ok
+    ? renderBannedList(await bansRes.json())
+    : '<div class="empty">failed to load</div>';
+
+  if (histRes.ok) {
+    const events = await histRes.json();
+    histSlot.innerHTML = events.length
+      ? events.map(e => `<div>${fmtTs(e.ts)} · +${e.new_packages.length} / -${e.removed_packages.length}</div>`).join('')
+      : '<div class="empty">no changes yet</div>';
+  } else {
+    histSlot.innerHTML = '<div class="empty">failed to load</div>';
+  }
+
+  warmBtn.addEventListener('click', async () => {
+    const selected = [...selectedKeys];
+    if (!selected.length) {
+      warmMsg.textContent = 'Nothing selected';
+      warmMsg.className = 'form-msg error';
+      return;
+    }
+    warmMsg.textContent = 'Warming…';
+    warmMsg.className = 'form-msg';
+    try {
+      const res = await fetch(`/api/repos/${encodeURIComponent(repoId)}/warm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ package_keys: selected }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        warmMsg.textContent = data.error || `HTTP ${res.status}`;
+        warmMsg.className = 'form-msg error';
+        return;
+      }
+      warmMsg.textContent = `Warmed: ${data.warmed.length}` +
+        (data.not_found.length ? `, not found: ${data.not_found.length}` : '');
+      warmMsg.className = 'form-msg ok';
+      await loadWarmed();
+    } catch (err) {
+      warmMsg.textContent = `Network error: ${err.message}`;
+      warmMsg.className = 'form-msg error';
+    }
+  });
+
+  // "remove from warmed" — click on ✕ in the warmed packages list
+  warmedSlot.addEventListener('click', async (ev) => {
+    const btn = ev.target.closest('[data-action="remove-warmed"]');
+    if (!btn) return;
+    try {
+      const res = await fetch(`/api/repos/${encodeURIComponent(repoId)}/warmed/remove`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ package_key: btn.dataset.key }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        warmMsg.textContent = data.error || `HTTP ${res.status}`;
+        warmMsg.className = 'form-msg error';
+        return;
+      }
+      await loadWarmed();
+    } catch (err) {
+      warmMsg.textContent = `Network error: ${err.message}`;
+      warmMsg.className = 'form-msg error';
+    }
+  });
+
+  // "unban" — click on ✕ in the ban list
+  bansSlot.addEventListener('click', async (ev) => {
+    const btn = ev.target.closest('[data-action="unban"]');
+    if (!btn) return;
+    try {
+      const res = await fetch(`/api/repos/${encodeURIComponent(repoId)}/bans/remove`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ package_name: btn.dataset.name }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        banMsg.textContent = data.error || `HTTP ${res.status}`;
+        banMsg.className = 'form-msg error';
+        return;
+      }
+      bansSlot.innerHTML = renderBannedList(data.banned);
+    } catch (err) {
+      banMsg.textContent = `Network error: ${err.message}`;
+      banMsg.className = 'form-msg error';
+    }
+  });
+
+  banBtn.addEventListener('click', async () => {
+    const name = banNameInput.value.trim();
+    if (!name) {
+      banMsg.textContent = 'Enter a package name';
+      banMsg.className = 'form-msg error';
+      return;
+    }
+    banMsg.textContent = '';
+    try {
+      const res = await fetch(`/api/repos/${encodeURIComponent(repoId)}/bans`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ package_name: name }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        banMsg.textContent = data.error || `HTTP ${res.status}`;
+        banMsg.className = 'form-msg error';
+        return;
+      }
+      banNameInput.value = '';
+      bansSlot.innerHTML = renderBannedList(data.banned);
+    } catch (err) {
+      banMsg.textContent = `Network error: ${err.message}`;
+      banMsg.className = 'form-msg error';
+    }
+  });
+}
+
+loadRepos();
+
+setInterval(loadRepos, 30000);
+
+// --- add/edit repository form (shared — switched by the editingRepoId
+// field: null means "adding", otherwise the id of the repository currently
+// being edited, and the form posts to /api/repos/<id> instead of
+// /api/repos) ---
+const $addForm = document.getElementById('add-form');
+const $addFormTitle = document.getElementById('add-form-title');
+const $addFormSubmit = document.getElementById('add-form-submit');
+const $toggleBtn = document.getElementById('toggle-add-form');
+const $cancelBtn = document.getElementById('cancel-add-form');
+const $typeSelect = document.getElementById('f-type');
+const $idInput = document.getElementById('f-id');
+const $verifySignature = document.getElementById('f-verify-signature');
+const $formMsg = document.getElementById('form-msg');
+let editingRepoId = null;
+
+function resetAddFormMode() {
+  editingRepoId = null;
+  $idInput.disabled = false;
+  $addFormTitle.textContent = 'New repository';
+  $addFormSubmit.textContent = 'Add';
+}
+
+$toggleBtn.addEventListener('click', () => {
+  resetAddFormMode();
+  $addForm.reset();
+  updateConditionalFields();
+  $addForm.hidden = !$addForm.hidden;
+});
+$cancelBtn.addEventListener('click', () => {
+  $addForm.hidden = true;
+  $addForm.reset();
+  resetAddFormMode();
+  $formMsg.textContent = '';
+});
+
+function openEditForm(repo) {
+  const cfg = repo.config || {};
+  resetAddFormMode();
+  editingRepoId = repo.id;
+  $addFormTitle.textContent = `Edit repository: ${repo.id}`;
+  $addFormSubmit.textContent = 'Save';
+
+  $idInput.value = cfg.id ?? repo.id;
+  $idInput.disabled = true; // id can't be changed via edit, see api.update_repo_payload
+  $typeSelect.value = cfg.type ?? repo.type;
+  document.getElementById('f-upstream').value = cfg.upstream ?? repo.upstream;
+  document.getElementById('f-arch').value = cfg.arch ?? '';
+  document.getElementById('f-group').value = cfg.group ?? '';
+  document.getElementById('f-url-template').value = cfg.url_template ?? '';
+  document.getElementById('f-url-variables').value = Object.keys(cfg.url_variables || {}).length ? JSON.stringify(cfg.url_variables) : '';
+  document.getElementById('f-repo-name').value = cfg.repo_name ?? '';
+  document.getElementById('f-distribution').value = cfg.distribution ?? '';
+  document.getElementById('f-component').value = cfg.component ?? '';
+  document.getElementById('f-prefetch').checked = cfg.prefetch ?? repo.prefetch;
+  $verifySignature.checked = cfg.verify_signature ?? false;
+  document.getElementById('f-keyring-path').value = cfg.keyring_path ?? '';
+  document.getElementById('f-apk-keys').value = cfg.apk_keys_dir ?? '';
+  document.getElementById('f-apk-backend').value = cfg.apk_signature_backend ?? 'openssl';
+  document.getElementById('f-check-interval').value = cfg.check_interval ?? '';
+  document.getElementById('f-prefetch-bandwidth-limit').value = cfg.prefetch_bandwidth_limit ?? '';
+
+  updateConditionalFields();
+  $formMsg.textContent = '';
+  $addForm.hidden = false;
+  $addForm.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+async function deleteRepo(repoId) {
+  if (!confirm(`Delete repository "${repoId}" from config.yaml? Its stored history in sqlite is not removed.`)) {
+    return;
+  }
+  try {
+    const res = await fetch(`/api/repos/${encodeURIComponent(repoId)}/delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      alert(data.error || `HTTP ${res.status}`);
+      return;
+    }
+    if (editingRepoId === repoId) {
+      $addForm.hidden = true;
+      resetAddFormMode();
+    }
+    loadRepos();
+  } catch (err) {
+    alert(`Network error: ${err.message}`);
+  }
+}
+
+function updateConditionalFields() {
+  const type = $typeSelect.value;
+  document.querySelectorAll('#add-form [data-for]').forEach(el => {
+    el.hidden = !el.dataset.for.split(' ').includes(type);
+  });
+  const verifyField = document.getElementById('f-verify-signature-field');
+  const keyringField = document.getElementById('f-keyring-path-field');
+  verifyField.hidden = false;
+  keyringField.hidden = type === 'apk' || !$verifySignature.checked;
+}
+$typeSelect.addEventListener('change', updateConditionalFields);
+$verifySignature.addEventListener('change', updateConditionalFields);
+updateConditionalFields();
+
+$addForm.addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  $formMsg.textContent = '';
+  $formMsg.className = 'form-msg';
+
+  const type = $typeSelect.value;
+  const body = {
+    id: $idInput.value.trim(),
+    type,
+    upstream: document.getElementById('f-upstream').value.trim(),
+    url_template: document.getElementById('f-url-template').value.trim() || null,
+    arch: document.getElementById('f-arch').value.trim(),
+    prefetch: document.getElementById('f-prefetch').checked,
+  };
+  if (type === 'pacman') {
+    body.repo_name = document.getElementById('f-repo-name').value.trim();
+  } else if (type === 'apt') {
+    body.distribution = document.getElementById('f-distribution').value.trim();
+    body.component = document.getElementById('f-component').value.trim();
+  }
+
+  if (type === 'apt-rpm') body.component = document.getElementById('f-component').value.trim();
+
+  const checkInterval = document.getElementById('f-check-interval').value.trim();
+  if (checkInterval) body.check_interval = Number(checkInterval);
+
+  const bandwidthLimit = document.getElementById('f-prefetch-bandwidth-limit').value.trim();
+  if (bandwidthLimit) body.prefetch_bandwidth_limit = Number(bandwidthLimit);
+
+  const group = document.getElementById('f-group').value.trim();
+  if (group) body.group = group;
+
+  if ($verifySignature.checked) {
+    body.verify_signature = true;
+    if (type === 'apk') {
+      body.apk_keys_dir = document.getElementById('f-apk-keys').value.trim();
+      body.apk_signature_backend = document.getElementById('f-apk-backend').value;
+    } else body.keyring_path = document.getElementById('f-keyring-path').value.trim();
+  }
+
+  const url = editingRepoId ? `/api/repos/${encodeURIComponent(editingRepoId)}` : '/api/repos';
+  try {
+    body.url_variables = JSON.parse(document.getElementById('f-url-variables').value.trim() || '{}');
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      $formMsg.textContent = data.error || `HTTP ${res.status}`;
+      $formMsg.className = 'form-msg error';
+      return;
+    }
+    $formMsg.textContent = editingRepoId ? `Saved: ${data.id}` : `Added: ${data.id}`;
+    $formMsg.className = 'form-msg ok';
+    $addForm.reset();
+    resetAddFormMode();
+    updateConditionalFields();
+    loadRepos();
+  } catch (err) {
+    $formMsg.textContent = `Network error: ${err.message}`;
+    $formMsg.className = 'form-msg error';
+  }
+});
+
+// --- global settings form (safe fields, see api.SAFE_CONFIG_FIELDS) ---
+const $settingsForm = document.getElementById('settings-form');
+const $cancelSettingsBtn = document.getElementById('cancel-settings-form');
+const $settingsMsg = document.getElementById('settings-msg');
+
+const SETTINGS_FIELDS = {
+  'check_interval': 's-check-interval',
+  'event_retention_days': 's-event-retention',
+  'request_retention_days': 's-request-retention',
+  'warmed_retention_days': 's-warmed-retention',
+  'event_max_rows_per_repo': 's-event-max-rows',
+  'request_max_rows': 's-request-max-rows',
+  'prefetch_concurrency': 's-prefetch-concurrency',
+  'check_concurrency': 's-check-concurrency',
+  'prefetch_bandwidth_limit': 's-prefetch-bandwidth-limit',
+  'cache_base_url': 's-cache-base-url',
+  'public_cache_url': 's-public-cache-url',
+  'notify_after_failures': 's-notify-after-failures',
+};
+
+async function openSettingsForm() {
+  $settingsMsg.textContent = 'Loading…';
+  $settingsMsg.className = 'form-msg';
+  $settingsForm.hidden = false;
+  try {
+    const res = await fetch('/api/config');
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    for (const [field, elId] of Object.entries(SETTINGS_FIELDS)) {
+      document.getElementById(elId).value = data[field] ?? '';
+    }
+    $settingsMsg.textContent = '';
+  } catch (err) {
+    $settingsMsg.textContent = `Load error: ${err.message}`;
+    $settingsMsg.className = 'form-msg error';
+  }
+}
+
+$toggleSettingsFormBtn.addEventListener('click', () => {
+  if ($settingsForm.hidden) openSettingsForm(); else $settingsForm.hidden = true;
+});
+$cancelSettingsBtn.addEventListener('click', () => {
+  $settingsForm.hidden = true;
+  $settingsMsg.textContent = '';
+});
+
+$settingsForm.addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  $settingsMsg.textContent = '';
+  $settingsMsg.className = 'form-msg';
+
+  const body = {};
+  for (const [field, elId] of Object.entries(SETTINGS_FIELDS)) {
+    body[field] = document.getElementById(elId).value.trim();
+  }
+
+  try {
+    const res = await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      $settingsMsg.textContent = data.error || `HTTP ${res.status}`;
+      $settingsMsg.className = 'form-msg error';
+      return;
+    }
+    $settingsMsg.textContent = 'Saved';
+    $settingsMsg.className = 'form-msg ok';
+    for (const [field, elId] of Object.entries(SETTINGS_FIELDS)) {
+      document.getElementById(elId).value = data[field] ?? '';
+    }
+    loadRepos(); // check_interval may have changed — refresh the "interval" column
+  } catch (err) {
+    $settingsMsg.textContent = `Network error: ${err.message}`;
+    $settingsMsg.className = 'form-msg error';
+  }
+});
+
+// --- recent client requests (syslog_listener) ---
+const $reqBody = document.getElementById('requests-body');
+const $reqFilter = document.getElementById('req-repo-filter');
+const $reqRefresh = document.getElementById('req-refresh');
+
+let requestCursor = null, requestRows = [], requestGeneration = 0, requestsBusy = false;
+const requestMore = document.createElement('button');
+requestMore.textContent = 'Show more';
+requestMore.hidden = true;
+$reqBody.closest('table').after(requestMore);
+requestMore.onclick = () => loadRequests(true);
+async function loadRequests(append = false) {
+  if (append && requestsBusy) return;
+  if (!append) { requestGeneration++; requestCursor = null; requestRows = []; }
+  const generation = requestGeneration;
+  requestsBusy = true; requestMore.disabled = true;
+  const repoId = $reqFilter.value;
+  const qs = new URLSearchParams({ limit: '50' });
+  if (repoId) qs.set('repo_id', repoId);
+  if (requestCursor) qs.set('cursor', requestCursor);
+
+  try {
+    const res = await fetch(`/api/requests?${qs}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const page = await res.json();
+    if (generation !== requestGeneration) return;
+    requestRows.push(...page.items);
+    requestCursor = page.next_cursor;
+    requestMore.hidden = !requestCursor;
+    const rows = requestRows;
+    $reqBody.innerHTML = rows.length
+      ? rows.map(r => `
+          <tr>
+            <td class="mono">${fmtTs(r.ts)}</td>
+            <td class="mono">${esc(r.client_ip ?? '—')}</td>
+            <td class="mono">${esc(r.repo_id ?? '—')}</td>
+            <td>${esc(r.method)}</td>
+            <td class="mono">${esc(r.path)}</td>
+            <td>${esc(r.status ?? '—')}</td>
+            <td>${esc(r.cache_status ?? '—')}</td>
+          </tr>`).join('')
+      : `<tr><td colspan="7" class="empty">no data — enable syslog_listener in config.yaml</td></tr>`;
+  } catch (err) {
+    if (generation !== requestGeneration) return;
+    $reqBody.innerHTML = `<tr><td colspan="7" class="empty">Load error: ${esc(err.message)}</td></tr>`;
+  } finally {
+    if (generation === requestGeneration) { requestsBusy = false; requestMore.disabled = false; }
+  }
+}
+
+// --- request charts (our own SVG bars, no third-party libraries) ---
+function truncateLabel(s, maxLen = 26) {
+  return s.length <= maxLen ? s : '…' + s.slice(-(maxLen - 1));
+}
+
+function renderBarChart(container, rows) {
+  if (!rows.length) {
+    container.innerHTML = '<div class="empty">no data</div>';
+    return;
+  }
+  const maxCount = Math.max(...rows.map(r => r.count));
+  const barHeight = 16;
+  const gap = 6;
+  const labelWidth = 120;
+  const barAreaWidth = 140;
+  const width = labelWidth + barAreaWidth + 36;
+  const height = rows.length * (barHeight + gap);
+
+  const bars = rows.map((r, i) => {
+    const y = i * (barHeight + gap);
+    const w = Math.max(2, (r.count / maxCount) * barAreaWidth);
+    const label = truncateLabel(r.key === null || r.key === undefined ? '(unmatched)' : String(r.key));
+    return `
+      <text x="${labelWidth - 6}" y="${y + barHeight - 4}" text-anchor="end" class="chart-label">${esc(label)}</text>
+      <rect x="${labelWidth}" y="${y}" width="${w}" height="${barHeight - 2}" class="chart-bar" rx="2"></rect>
+      <text x="${labelWidth + w + 6}" y="${y + barHeight - 4}" class="chart-count">${r.count}</text>
+    `;
+  }).join('');
+
+  container.innerHTML = `<svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}">${bars}</svg>`;
+}
+
+async function loadRequestsSummary() {
+  const repoId = $reqFilter.value;
+  const qs = new URLSearchParams();
+  if (repoId) qs.set('repo_id', repoId);
+
+  const panels = {
+    by_client_ip: document.querySelector('[data-chart="by_client_ip"]'),
+    by_path: document.querySelector('[data-chart="by_path"]'),
+    by_repo: document.querySelector('[data-chart="by_repo"]'),
+  };
+
+  try {
+    const res = await fetch(`/api/requests/summary?${qs}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    renderBarChart(panels.by_client_ip, data.by_client_ip);
+    renderBarChart(panels.by_path, data.by_path);
+    renderBarChart(panels.by_repo, data.by_repo);
+  } catch (err) {
+    for (const panel of Object.values(panels)) {
+      panel.innerHTML = `<div class="empty">Load error: ${esc(err.message)}</div>`;
+    }
+  }
+}
+
+$reqRefresh.addEventListener('click', () => { loadRequests(); loadRequestsSummary(); });
+$reqFilter.addEventListener('change', () => { loadRequests(); loadRequestsSummary(); });
+loadRequests();
+loadRequestsSummary();
+setInterval(() => { if (requestRows.length <= 50 && !requestsBusy) loadRequests(); loadRequestsSummary(); }, 30000);
+</script>
+</body>
+</html>
