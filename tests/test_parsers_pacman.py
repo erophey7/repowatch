@@ -54,10 +54,13 @@ def test_pacman_parser_parses_fixture(monkeypatch):
     zlib = next(p for p in packages if p.name == "zlib")
     assert zlib.version == "1.3-1"
     assert zlib.filename == "zlib-1.3-1-x86_64.pkg.tar.zst"
+    # docs_dev/ROADMAP.md item 29 — %SHA256SUM%, same shape as apt's SHA256:.
+    assert zlib.content_hash == "b" * 63 + "2"
 
     bash = next(p for p in packages if p.name == "bash")
     assert bash.version == "5.2.026-1"
     assert bash.filename == "bash-5.2.026-1-x86_64.pkg.tar.zst"
+    assert bash.content_hash == "a" * 63 + "1"
 
 
 def test_pacman_index_url_matches_repo_layout():

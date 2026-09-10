@@ -18,11 +18,25 @@ Endpoints:
                                          format as .../packages (query ?limit=&cursor=)
     POST /api/repos/<repo_id>/warm    — warm specific packages manually, without waiting for
                                          either the auto-diff or real client requests
-    POST /api/repos/<repo_id>/warmed/remove — drop a package from the "warmed" tracking (does
-                                         not touch the actual file in the nginx cache)
+    GET /api/repos/<repo_id>/purge-candidates — manual cache purge, step 1: warmed_packages
+                                         entries whose package no longer exists in the current
+                                         index (see StateStore.find_stale_warmed) — no nginx/
+                                         network call yet, response also includes whether
+                                         nginx.enable_purge is even on
+    POST /api/repos/<repo_id>/purge   — manual cache purge, step 2: attempt to purge the
+                                         operator-selected subset — body {"package_keys": [...]},
+                                         response {"results": {key: "purged"|"not_cached"|
+                                         "error (...)"}, "not_found": [...]} (see
+                                         prefetch.purge_selected); 400 if enable_purge is off
+    POST /api/repos/<repo_id>/warmed/remove — drop package(s) from the "warmed" tracking (does
+                                         not touch the actual file in the nginx cache) —
+                                         body {"package_keys": [...]}, also the dashboard's
+                                         "remove selected" bulk action
     GET /api/repos/<repo_id>/bans     — which package names are banned from auto-warming
-    POST /api/repos/<repo_id>/bans    — ban a package name from auto-warming
-    POST /api/repos/<repo_id>/bans/remove — lift the ban
+    POST /api/repos/<repo_id>/bans    — ban package name(s) from auto-warming — body
+                                         {"package_names": [...]}, also "ban selected"
+    POST /api/repos/<repo_id>/bans/remove — lift the ban(s) — body {"package_names": [...]},
+                                         also "unban selected"
     POST /api/repos                   — add a repository (see add_repo_payload)
     POST /api/repos/<repo_id>         — edit a repository: full object replacement
                                          (same as adding — the dashboard form is pre-filled
@@ -52,6 +66,12 @@ Endpoints:
                                          3×check_interval (see healthz_payload), otherwise 503
     GET /metrics                      — Prometheus text format (see metrics_payload) —
                                          per-repo gauges + repowatch_healthy
+    GET /api/stats                    — state_db size + row counts (always cheap); add
+                                         ?cache_dir=1 to also walk the nginx package cache
+                                         directory (only if NginxConfig.cache_dir is set —
+                                         see docs_dev/ROADMAP.md item 27) — this can be slow
+                                         for a large cache, so it's opt-in per request, not
+                                         included by default
 
 The config for /api/repos* is re-read from disk on every request (see
 config.load_config) — config.yaml stays the single source of truth, with no
@@ -65,6 +85,7 @@ import json
 import hmac
 from http.cookies import SimpleCookie, CookieError
 import logging
+import os
 import ssl
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -80,7 +101,7 @@ from repowatch.access import (AccessStore, AdminSession, COOKIE_NAME, SESSION_SE
                               client_context, digest, in_networks)
 from repowatch.config_edit import atomic_config, locked_config
 from repowatch.config import Config, ConfigError, RepoConfig, load_config
-from repowatch.prefetch import _repo_url_prefix, warm_cache
+from repowatch.prefetch import _repo_url_prefix, purge_selected, warm_cache
 from repowatch.state import StateStore
 
 logger = logging.getLogger(__name__)
@@ -372,6 +393,88 @@ def warm_packages_payload(
     return 200, {"warmed": sorted(to_warm), "not_found": not_found}
 
 
+def purge_candidates_payload(
+    config_path: str | Path, store: StateStore, repo_id: str
+) -> tuple[int, dict]:
+    """Manual cache purge, step 1 (dashboard "Scan for stale entries",
+    docs_dev/ROADMAP.md): candidates computed from repowatch's own records
+    (see StateStore.find_stale_warmed) — no nginx/network call yet. Reports
+    whether nginx.enable_purge is even on, so the dashboard can show a clear
+    "enable it first" message instead of a confusing empty list — read-only,
+    so no admin_session check here (matches banned_packages_payload's own
+    reasoning), though the route itself is still admin-only (not in
+    api.py's do_GET guest_route allowlist)."""
+    try:
+        current = load_config(config_path)
+    except ConfigError:
+        logger.exception("failed to reload config.yaml for API request")
+        return 500, {"error": "config.yaml is currently invalid"}
+
+    if current.repo_by_id(repo_id) is None:
+        return 404, {"error": f"unknown repo_id: {repo_id}"}
+
+    return 200, {
+        "enable_purge": current.nginx.enable_purge,
+        "candidates": store.find_stale_warmed(repo_id),
+    }
+
+
+def purge_selected_payload(
+    config_path: str | Path,
+    store: StateStore,
+    repo_id: str,
+    admin_session: AdminSession | None,
+    body: dict,
+) -> tuple[int, dict]:
+    """Manual cache purge, step 2 (dashboard "Purge selected"): the operator
+    has reviewed the candidates from purge_candidates_payload and picked a
+    subset. body: {"package_keys": [...]}. Filenames are re-derived from
+    warmed_packages here, server-side — never trusted from the request body,
+    since that would let a client purge an arbitrary path under this repo's
+    prefix by supplying a made-up filename.
+
+    On success, also drops the warmed_packages bookkeeping row for every key
+    prefetch.purge_selected confirmed is no longer (or never was) actually
+    cached ("purged"/"not_cached") — that record was only ever useful as a
+    "possibly still cached" signal, and nginx has now given a definitive
+    answer either way. Keys reported as "error (...)" are left alone so a
+    retry later still finds them as candidates.
+    """
+    try:
+        current = load_config(config_path)
+    except ConfigError:
+        logger.exception("failed to reload config.yaml for API request")
+        return 500, {"error": "config.yaml is currently invalid"}
+
+    password_error = _check_admin_session(current, admin_session)
+    if password_error is not None:
+        return password_error
+
+    repo = current.repo_by_id(repo_id)
+    if repo is None:
+        return 404, {"error": f"unknown repo_id: {repo_id}"}
+
+    if not current.nginx.enable_purge:
+        return 400, {"error": "nginx.enable_purge is not enabled in config.yaml — nothing to purge"}
+
+    if not isinstance(body, dict) or not isinstance(body.get("package_keys"), list) or not body["package_keys"]:
+        return 400, {"error": 'request body must be {"package_keys": ["name-version", ...]}'}
+
+    requested_keys = [str(k) for k in body["package_keys"]]
+    filenames = store.get_warmed_filenames(repo_id, requested_keys)
+    not_found = [k for k in requested_keys if k not in filenames]
+
+    # purge_selected is async (see prefetch.py) — bridge sync->async the
+    # same way warm_packages_payload does, for the same reason (this
+    # handler runs in a plain ThreadingHTTPServer thread).
+    results = asyncio.run(purge_selected(current, repo, filenames)) if filenames else {}
+    resolved = [key for key, outcome in results.items() if outcome in ("purged", "not_cached")]
+    if resolved:
+        store.remove_warmed_packages(repo_id, resolved)
+
+    return 200, {"results": results, "not_found": not_found}
+
+
 def remove_warmed_package_payload(
     config_path: str | Path,
     store: StateStore,
@@ -379,10 +482,11 @@ def remove_warmed_package_payload(
     admin_session: AdminSession | None,
     body: dict,
 ) -> tuple[int, dict]:
-    """"Remove from warmed" (dashboard) — only deletes the warmed_packages
-    tracking entry (repowatch's own bookkeeping); the actual file in the
-    nginx cache is left untouched (see StateStore.remove_warmed_package).
-    body: {"package_key": "name-version"}."""
+    """"Remove from warmed" (dashboard, including "remove selected" bulk
+    action) — only deletes the warmed_packages tracking entry (repowatch's
+    own bookkeeping); the actual file in the nginx cache is left untouched
+    (see StateStore.remove_warmed_packages).
+    body: {"package_keys": ["name-version", ...]}."""
     try:
         current = load_config(config_path)
     except ConfigError:
@@ -396,11 +500,11 @@ def remove_warmed_package_payload(
     if current.repo_by_id(repo_id) is None:
         return 404, {"error": f"unknown repo_id: {repo_id}"}
 
-    package_key = body.get("package_key") if isinstance(body, dict) else None
-    if not package_key:
-        return 400, {"error": 'request body must be {"package_key": "name-version"}'}
+    if not isinstance(body, dict) or not isinstance(body.get("package_keys"), list) or not body["package_keys"]:
+        return 400, {"error": 'request body must be {"package_keys": ["name-version", ...]}'}
 
-    removed = store.remove_warmed_package(repo_id, str(package_key))
+    package_keys = [str(k) for k in body["package_keys"]]
+    removed = store.remove_warmed_packages(repo_id, package_keys)
     return 200, {"removed": removed}
 
 
@@ -428,10 +532,12 @@ def ban_package_payload(
     admin_session: AdminSession | None,
     body: dict,
 ) -> tuple[int, dict]:
-    """Ban a specific package name from auto-warming (applies to both future
-    versions and manual warming — see prefetch.warm_cache). Does not touch
-    anything already in the nginx cache or already marked warmed — it only
-    stops repowatch from attempting to warm it going forward."""
+    """Ban package name(s) from auto-warming (applies to both future
+    versions and manual warming — see prefetch.warm_cache), including the
+    dashboard's "ban selected" bulk action from the warm-queue picker. Does
+    not touch anything already in the nginx cache or already marked warmed
+    — it only stops repowatch from attempting to warm it going forward.
+    body: {"package_names": ["package-name", ...]}."""
     try:
         current = load_config(config_path)
     except ConfigError:
@@ -445,11 +551,10 @@ def ban_package_payload(
     if current.repo_by_id(repo_id) is None:
         return 404, {"error": f"unknown repo_id: {repo_id}"}
 
-    package_name = body.get("package_name") if isinstance(body, dict) else None
-    if not package_name:
-        return 400, {"error": 'request body must be {"package_name": "package-name"}'}
+    if not isinstance(body, dict) or not isinstance(body.get("package_names"), list) or not body["package_names"]:
+        return 400, {"error": 'request body must be {"package_names": ["package-name", ...]}'}
 
-    store.ban_package(repo_id, str(package_name))
+    store.ban_packages(repo_id, [str(n) for n in body["package_names"]])
     return 200, {"banned": store.get_banned_packages(repo_id)}
 
 
@@ -460,6 +565,8 @@ def unban_package_payload(
     admin_session: AdminSession | None,
     body: dict,
 ) -> tuple[int, dict]:
+    """body: {"package_names": ["package-name", ...]} — including the
+    dashboard's "unban selected" bulk action."""
     try:
         current = load_config(config_path)
     except ConfigError:
@@ -473,12 +580,84 @@ def unban_package_payload(
     if current.repo_by_id(repo_id) is None:
         return 404, {"error": f"unknown repo_id: {repo_id}"}
 
-    package_name = body.get("package_name") if isinstance(body, dict) else None
-    if not package_name:
-        return 400, {"error": 'request body must be {"package_name": "package-name"}'}
+    if not isinstance(body, dict) or not isinstance(body.get("package_names"), list) or not body["package_names"]:
+        return 400, {"error": 'request body must be {"package_names": ["package-name", ...]}'}
 
-    store.unban_package(repo_id, str(package_name))
+    store.unban_packages(repo_id, [str(n) for n in body["package_names"]])
     return 200, {"banned": store.get_banned_packages(repo_id)}
+
+
+def cache_dir_stats(cache_dir: str) -> dict:
+    """docs_dev/ROADMAP.md item 27 — a full filesystem walk (proxy_cache_path's
+    levels=1:2 tree can be hundreds of thousands of small files), so this is
+    deliberately NOT part of the always-on stats_payload below: it's only
+    run when explicitly requested (dashboard "Calculate cache size" button /
+    `repowatch stats --cache-dir`), never on a poll interval. No background
+    scheduler/cache of the result — a real periodic recompute would need its
+    own interval setting and a place to store the last value, which isn't
+    justified for an action an operator triggers occasionally by hand.
+    """
+    if not os.path.isdir(cache_dir):
+        # os.walk() silently yields nothing for a missing/unreadable top
+        # directory (its default onerror is a no-op) — without this check,
+        # a real misconfiguration (wrong path, permission denied) would be
+        # indistinguishable from "cache is genuinely empty".
+        raise OSError(f"not a directory or not accessible: {cache_dir}")
+    total_bytes, file_count, inaccessible = 0, 0, 0
+
+    def _on_error(exc: OSError) -> None:
+        # Real, observed case (2026-09-10 production check): nginx's own
+        # proxy_cache_path levels=1:2 subdirectories are created 0700,
+        # owned by the nginx worker user (e.g. www-data) — regardless of
+        # the top-level cache_dir's own permissions. repowatch usually runs
+        # as a DIFFERENT, unprivileged service user (privilege separation
+        # from nginx is deliberate, see CLAUDE.md), so it typically cannot
+        # descend into any of them at all. os.walk()'s default onerror is a
+        # silent no-op, which would make a permission-blocked cache look
+        # EXACTLY like a genuinely empty one (0 bytes) — actively
+        # misleading, worse than an error. Count these instead of raising:
+        # a top-level directory that's at least listable should still
+        # report what it can, with the gap made visible.
+        nonlocal inaccessible
+        inaccessible += 1
+
+    for root, _dirs, files in os.walk(cache_dir, onerror=_on_error):
+        for name in files:
+            try:
+                total_bytes += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                continue
+            file_count += 1
+    result = {"path": cache_dir, "size_bytes": total_bytes, "file_count": file_count}
+    if inaccessible:
+        result["inaccessible_directories"] = inaccessible
+    return result
+
+
+def stats_payload(
+    config_path: str | Path, store: StateStore, *, include_cache_dir: bool = False
+) -> tuple[int, dict]:
+    """GET /api/stats — state_db size/row counts are always cheap and
+    included; the nginx package cache directory's size is only walked when
+    include_cache_dir is set (see cache_dir_stats) and only reported when
+    the operator has opted into NginxConfig.cache_dir being visible to
+    repowatch at all (see docs_dev/ROADMAP.md item 12) — otherwise there is
+    no path to walk, and that's a normal, expected configuration, not an
+    error."""
+    payload = store.get_storage_stats()
+    if include_cache_dir:
+        try:
+            current = load_config(config_path)
+        except ConfigError:
+            return 500, {"error": "config.yaml is currently invalid"}
+        if not current.nginx.cache_dir:
+            payload["cache_dir"] = None
+        else:
+            try:
+                payload["cache_dir"] = cache_dir_stats(current.nginx.cache_dir)
+            except OSError as exc:
+                payload["cache_dir"] = {"error": str(exc)}
+    return 200, payload
 
 
 def _cast_int(value: Any) -> int:
@@ -945,8 +1124,20 @@ def make_handler(
                 self._json(payload, status=status)
                 return
 
+            if len(parts) == 4 and parts[0] == "api" and parts[1] == "repos" and parts[3] == "purge-candidates":
+                status, payload = purge_candidates_payload(config_path, store, parts[2])
+                self._json(payload, status=status)
+                return
+
             if parsed.path == "/api/config":
                 status, payload = safe_config_payload(config_path)
+                self._json(payload, status=status)
+                return
+
+            if parsed.path == "/api/stats":
+                qs = parse_qs(parsed.query)
+                status, payload = stats_payload(
+                    config_path, store, include_cache_dir=qs.get("cache_dir", ["0"])[0] == "1")
                 self._json(payload, status=status)
                 return
 
@@ -1074,6 +1265,11 @@ def make_handler(
 
             if len(parts) == 4 and parts[0] == "api" and parts[1] == "repos" and parts[3] == "warm":
                 status, payload = warm_packages_payload(config_path, store, parts[2], password, body)
+                self._json(payload, status=status)
+                return
+
+            if len(parts) == 4 and parts[0] == "api" and parts[1] == "repos" and parts[3] == "purge":
+                status, payload = purge_selected_payload(config_path, store, parts[2], password, body)
                 self._json(payload, status=status)
                 return
 

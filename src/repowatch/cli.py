@@ -35,6 +35,16 @@ def main(argv: list[str] | None = None) -> int:
         "check-config",
         help="validate config.yaml and exit without doing anything else (does not touch state_db)",
     )
+    stats_parser = sub.add_parser(
+        "stats",
+        help="print state_db size and per-table row counts (docs_dev/ROADMAP.md item 27)",
+    )
+    stats_parser.add_argument(
+        "--cache-dir", action="store_true",
+        help="also walk nginx.cache_dir (if set in config.yaml) and report its total size — "
+             "can be slow for a large cache, so it's opt-in, not part of the default output",
+    )
+
     sub.add_parser(
         "hash-password",
         help="generate an admin_password_hash for config.yaml (prompts for a password interactively)",
@@ -132,6 +142,34 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  - {repo.id} ({repo.type}) upstream={repo.upstream}")
         return 0
 
+    if args.command == "stats":
+        from repowatch.api import cache_dir_stats
+
+        store = StateStore(config.state_db)
+        stats = store.get_storage_stats()
+        print(f"state_db: {config.state_db} ({stats['state_db_bytes']:,} bytes)")
+        for table, count in stats["tables"].items():
+            print(f"  {table}: {count:,} row(s)")
+        if args.cache_dir:
+            if not config.nginx.cache_dir:
+                print("cache_dir: not set in config.yaml (nginx.cache_dir) — nothing to walk")
+            else:
+                try:
+                    cache = cache_dir_stats(config.nginx.cache_dir)
+                    print(f"cache_dir: {cache['path']} — {cache['size_bytes']:,} bytes, "
+                          f"{cache['file_count']:,} file(s)")
+                    if cache.get("inaccessible_directories"):
+                        print(f"  WARNING: {cache['inaccessible_directories']:,} subdirector"
+                              "y/ies could not be read (permission denied) — the numbers above "
+                              "are an UNDERCOUNT. nginx creates proxy_cache_path's levels=1:2 "
+                              "subdirectories 0700, owned by the nginx worker user; the "
+                              "repowatch service user typically can't read them at all.",
+                              file=sys.stderr)
+                except OSError as exc:
+                    print(f"cache_dir: {config.nginx.cache_dir} — error: {exc}", file=sys.stderr)
+                    return 1
+        return 0
+
     if args.command == "set-password":
         import getpass
         from repowatch.auth import hash_password
@@ -150,16 +188,42 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command in ("nginx-render", "nginx-apply"):
-        from repowatch.nginx import render, apply
+        from repowatch.nginx import render, render_purge, render_dedup, apply
         try:
             if args.command == "nginx-render":
                 paths = {}
+                purge_conf = None
+                dedup_conf = None
                 if args.policy:
                     import json
                     from pathlib import Path
-                    policy = json.loads(Path(args.policy).read_text())
+                    policy_path = Path(args.policy)
+                    policy = json.loads(policy_path.read_text())
                     paths = {key: policy[key] for key in ("cache_dir", "access_log")}
+                    purge_conf = str(policy_path.parent / "purge.conf")
+                    dedup_conf = str(policy_path.parent / "dedup.map")
+                    paths["purge_conf"] = purge_conf
+                    paths["dedup_conf"] = dedup_conf
                 print(render(config, **paths), end="")
+                if config.nginx.enable_purge:
+                    # Purge locations are `include`d from a separate file
+                    # (see nginx.render_purge) rather than being printed
+                    # inline here — surface both parts so a manual/no-policy
+                    # setup knows where to save the second one.
+                    destination = purge_conf or "<same directory as active.conf>/purge.conf"
+                    print(f"\n# --- save the following as {destination} ---\n")
+                    print(render_purge(config), end="")
+                if config.nginx.enable_dedup:
+                    # Real (duplicate -> canonical) pairs come from a
+                    # StateStore query (see nginx-apply/nginx.apply) — this
+                    # preview command deliberately never opens the database
+                    # (see check-config's same rule), so it always shows an
+                    # empty map here; only the include line/map{} block in
+                    # the printed config above is meaningful for a preview.
+                    destination = dedup_conf or "<same directory as active.conf>/dedup.map"
+                    print(f"\n# --- save the following as {destination} "
+                          f"(actual pairs are computed by nginx-apply from state_db, not shown here) ---\n")
+                    print(render_dedup(config, []), end="")
             else:
                 import os
                 if os.geteuid() != 0:

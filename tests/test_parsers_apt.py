@@ -45,9 +45,13 @@ def test_apt_parser_parses_fixture(monkeypatch):
     zlib = next(p for p in packages if p.name == "zlib1g")
     assert zlib.version == "1:1.2.13.dfsg-1"
     assert zlib.filename == "pool/main/z/zlib/zlib1g_1.2.13.dfsg-1_amd64.deb"
+    # docs_dev/ROADMAP.md item 29 — per-stanza SHA256:, not the by-hash SHA256
+    # of the whole Packages.gz checked above via InRelease.
+    assert zlib.content_hash == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
     bash = next(p for p in packages if p.name == "bash")
     assert bash.version == "5.2.15-2+b2"
+    assert bash.content_hash == "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
     assert bash.filename == "pool/main/b/bash/bash_5.2.15-2+b2_amd64.deb"
 
 

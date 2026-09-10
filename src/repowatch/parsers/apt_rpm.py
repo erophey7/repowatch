@@ -102,6 +102,10 @@ def _relative(value: str) -> str:
     return value
 
 
+# docs_dev/ROADMAP.md item 29 (cross-repo dedup): PackageRef.content_hash is
+# left unset for apt-rpm — the RPM header tags read here (_STRINGS/_INTS)
+# are identity/metadata only, no verified whole-file SHA256 tag is currently
+# parsed, and guessing one would risk a false-positive dedup match.
 def parse_pkglist(raw: bytes, compression: str, arch: str, component: str,
                   expected: tuple[str, str, int] | None = None) -> list[PackageRef]:
     source = io.BytesIO(raw)

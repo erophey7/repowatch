@@ -21,7 +21,7 @@ from repowatch.gpgverify import SignatureError
 from repowatch.notifications import record_failure_and_maybe_notify, record_success_and_maybe_notify
 from repowatch.parsers import PARSERS
 from repowatch.parsers.base import IndexHeadResult
-from repowatch.prefetch import warm_cache
+from repowatch.prefetch import purge_removed, warm_cache
 from repowatch.state import StateStore
 
 logger = logging.getLogger(__name__)
@@ -109,6 +109,12 @@ async def check_repo(config: Config, repo: RepoConfig, store: StateStore) -> Non
     if diff.new_packages:
         new_packages = {key: snapshot.packages[key] for key in diff.new_packages}
         await warm_cache(config, repo, store, new_packages)
+
+    if diff.removed_packages:
+        # Active proxy_cache eviction (docs_dev/ROADMAP.md item 24) — a
+        # no-op unless nginx.enable_purge is set (see purge_removed), so
+        # this doesn't change behavior for any config that hasn't opted in.
+        await purge_removed(config, repo, diff.removed_filenames)
 
 
 def _is_due(config: Config, repo: RepoConfig, store: StateStore) -> bool:

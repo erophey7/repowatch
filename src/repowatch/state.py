@@ -8,6 +8,7 @@ import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from itertools import groupby
 from pathlib import Path
 from typing import Iterator
 
@@ -43,6 +44,7 @@ CREATE TABLE IF NOT EXISTS repo_packages (
     package_key  TEXT NOT NULL,
     package_name TEXT,
     filename     TEXT NOT NULL,
+    content_hash TEXT,
     PRIMARY KEY (repo_id, package_key)
 );
 
@@ -141,6 +143,10 @@ class RepoSnapshot:
     # unambiguously (both name and version may contain hyphens). Used for
     # bans by package name.
     names: dict[str, str] = field(default_factory=dict)
+    # the same key -> SHA256 hex digest, only for keys where PackageRef.content_hash
+    # was known from the index (docs_dev/ROADMAP.md item 29) — missing keys
+    # simply aren't candidates for dedup, not an error.
+    content_hashes: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -149,6 +155,12 @@ class DiffResult:
     changed: bool
     new_packages: list[str]
     removed_packages: list[str]
+    # {package_key: filename} for exactly the packages in removed_packages —
+    # captured from the previous snapshot before its rows are deleted below.
+    # Needed by watcher.check_repo/prefetch.purge_removed (docs_dev/ROADMAP.md
+    # item 24) to know which file to purge from nginx's cache — the key
+    # alone isn't a filename.
+    removed_filenames: dict[str, str]
 
 
 class StateStore:
@@ -197,9 +209,9 @@ class StateStore:
                 "SELECT changed_at FROM repo_state WHERE repo_id = ?",
                 (snapshot.repo_id,),
             ).fetchone()
-            prev_packages = {r[0] for r in conn.execute(
-                "SELECT package_key FROM repo_packages WHERE repo_id = ?", (snapshot.repo_id,)
-            )}
+            prev_packages = dict(conn.execute(
+                "SELECT package_key, filename FROM repo_packages WHERE repo_id = ?", (snapshot.repo_id,)
+            ))
 
             new_keys = set(snapshot.packages) - set(prev_packages)
             removed_keys = set(prev_packages) - set(snapshot.packages)
@@ -238,15 +250,17 @@ class StateStore:
                 )
             conn.executemany(
                 """
-                INSERT INTO repo_packages (repo_id, package_key, package_name, filename)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO repo_packages (repo_id, package_key, package_name, filename, content_hash)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(repo_id, package_key) DO UPDATE SET
                     package_name = excluded.package_name,
-                    filename = excluded.filename
+                    filename = excluded.filename,
+                    content_hash = excluded.content_hash
                 WHERE package_name IS NOT excluded.package_name OR filename IS NOT excluded.filename
+                    OR content_hash IS NOT excluded.content_hash
                 """,
                 (
-                    (snapshot.repo_id, key, snapshot.names.get(key), filename)
+                    (snapshot.repo_id, key, snapshot.names.get(key), filename, snapshot.content_hashes.get(key))
                     for key, filename in snapshot.packages.items()
                 ),
             )
@@ -270,6 +284,7 @@ class StateStore:
                 changed=changed,
                 new_packages=sorted(new_keys),
                 removed_packages=sorted(removed_keys),
+                removed_filenames={key: prev_packages[key] for key in removed_keys},
             )
 
     def get_index_meta(self, repo_id: str) -> tuple[str | None, str | None]:
@@ -310,6 +325,25 @@ class StateStore:
             for repo_id in result.keys() | warmed.keys():
                 result.setdefault(repo_id, {})["warmed_count"] = warmed.get(repo_id, 0)
         return result
+
+    def get_storage_stats(self) -> dict:
+        """docs_dev/ROADMAP.md item 27 — cheap, always-safe numbers about
+        state_db itself: file size (a single stat(), not a walk) and a row
+        count per table. Deliberately does NOT touch the nginx package cache
+        directory — that's a potentially large filesystem walk, a different
+        cost class, and repowatch may not even know the real path (see
+        NginxConfig.cache_dir); see api.cache_dir_stats_payload for that,
+        computed on demand, not on every poll of this one.
+        """
+        with self._connect() as conn:
+            tables = {
+                name: conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
+                for name in ("repo_packages", "repo_events", "request_events", "warmed_packages", "prefetch_bans")
+            }
+        return {
+            "state_db_bytes": self.db_path.stat().st_size,
+            "tables": tables,
+        }
 
     def get_status(self, repo_id: str) -> dict | None:
         with self._connect() as conn:
@@ -404,6 +438,38 @@ class StateStore:
             ).fetchall()
             return dict(rows)
 
+    def find_duplicate_files(self) -> list[tuple[str, str, str]]:
+        """Byte-identical files across DIFFERENT repositories (docs_dev/
+        ROADMAP.md item 29), identified by (filename, content_hash) — not
+        by package_key, since the same file can be named differently or
+        carry a different key format between distros/formats.
+
+        Returns (duplicate_repo_id, canonical_repo_id, filename) — one row
+        per repository that's NOT the canonical copy for a given
+        (filename, content_hash) group. "Canonical" is just the
+        alphabetically-first repo_id sharing that pair — deterministic and
+        stable as long as the same set of repos keeps carrying the file, no
+        extra bookkeeping needed. Caller (nginx.py) resolves repo ids to
+        actual local cache URIs — this module stays URL-agnostic.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT filename, content_hash, repo_id FROM repo_packages
+                WHERE content_hash IS NOT NULL
+                GROUP BY filename, content_hash, repo_id
+                ORDER BY filename, content_hash, repo_id
+                """
+            ).fetchall()
+        duplicates: list[tuple[str, str, str]] = []
+        for _, group in groupby(rows, key=lambda row: (row[0], row[1])):
+            members = list(group)
+            if len(members) < 2:
+                continue
+            filename, _, canonical_repo_id = members[0]
+            duplicates.extend((repo_id, canonical_repo_id, filename) for _, _, repo_id in members[1:])
+        return duplicates
+
     def ban_package(self, repo_id: str, package_name: str) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -420,6 +486,33 @@ class StateStore:
             conn.execute(
                 "DELETE FROM prefetch_bans WHERE repo_id = ? AND package_name = ?",
                 (repo_id, package_name),
+            )
+
+    def ban_packages(self, repo_id: str, package_names: list[str]) -> None:
+        """Bulk form of ban_package (dashboard "ban selected") — one
+        connection/transaction via executemany instead of one per name, so
+        selecting hundreds of packages to ban doesn't cost hundreds of
+        separate SQLite commits."""
+        if not package_names:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO prefetch_bans (repo_id, package_name, banned_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(repo_id, package_name) DO NOTHING
+                """,
+                ((repo_id, name, _utcnow()) for name in package_names),
+            )
+
+    def unban_packages(self, repo_id: str, package_names: list[str]) -> None:
+        """Bulk form of unban_package — see ban_packages."""
+        if not package_names:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                "DELETE FROM prefetch_bans WHERE repo_id = ? AND package_name = ?",
+                ((repo_id, name) for name in package_names),
             )
 
     def get_banned_packages(self, repo_id: str) -> list[str]:
@@ -440,6 +533,68 @@ class StateStore:
                 (repo_id, package_key),
             )
             return cur.rowcount > 0
+
+    def remove_warmed_packages(self, repo_id: str, package_keys: list[str]) -> int:
+        """Bulk form of remove_warmed_package (dashboard "remove selected")
+        — one connection/transaction via executemany. Returns how many rows
+        actually existed and were removed (executemany's own cursor.rowcount
+        is not reliable per-statement, so count with a preceding SELECT)."""
+        if not package_keys:
+            return 0
+        with self._connect() as conn:
+            existing = conn.execute(
+                f"SELECT COUNT(*) FROM warmed_packages WHERE repo_id = ? "
+                f"AND package_key IN ({','.join('?' for _ in package_keys)})",
+                (repo_id, *package_keys),
+            ).fetchone()[0]
+            conn.executemany(
+                "DELETE FROM warmed_packages WHERE repo_id = ? AND package_key = ?",
+                ((repo_id, key) for key in package_keys),
+            )
+            return existing
+
+    def find_stale_warmed(self, repo_id: str) -> list[dict]:
+        """Manual cache purge (dashboard "Scan for stale entries",
+        docs_dev/ROADMAP.md) — candidates for garbage: warmed_packages rows
+        (repowatch believes/believed this file was fetched and cached at
+        some point) whose package_key no longer exists in the CURRENT
+        repo_packages snapshot for this repo (the package has since been
+        removed from the upstream index). The combination of "known to have
+        been cached" + "no longer a real package" is the best-supported
+        "probably safe to purge" signal available without touching nginx's
+        cache files directly (see CLAUDE.md's "Ключевые решения" #3) or
+        risking a false read from a live HTTP probe (see prefetch.py).
+        Does not confirm the file is STILL in nginx's cache right now —
+        only an actual purge attempt (see prefetch.purge_selected) can tell
+        that for certain; this is the candidate list shown to the operator
+        before they decide what to actually purge.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT w.package_key, w.filename FROM warmed_packages w
+                LEFT JOIN repo_packages p ON p.repo_id = w.repo_id AND p.package_key = w.package_key
+                WHERE w.repo_id = ? AND p.package_key IS NULL
+                ORDER BY w.package_key
+                """,
+                (repo_id,),
+            ).fetchall()
+        return [{"package_key": key, "filename": filename} for key, filename in rows]
+
+    def get_warmed_filenames(self, repo_id: str, package_keys: list[str]) -> dict[str, str]:
+        """{package_key: filename} for exactly the given keys — used to
+        re-derive filenames server-side for a purge request instead of
+        trusting whatever the client echoes back (see
+        api.purge_selected_payload)."""
+        if not package_keys:
+            return {}
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT package_key, filename FROM warmed_packages WHERE repo_id = ? "
+                f"AND package_key IN ({','.join('?' for _ in package_keys)})",
+                (repo_id, *package_keys),
+            ).fetchall()
+        return dict(rows)
 
     def get_packages(self, repo_id: str) -> dict[str, str] | None:
         """Full current package snapshot for a repository
@@ -513,6 +668,12 @@ class StateStore:
         if repo_id is not None:
             where.append("repo_id = ?")
             args.append(repo_id)
+        if kind == "warmed" and q:
+            # No FTS here — warmed_packages is bounded by the count of
+            # packages ever actually warmed/downloaded, not the whole
+            # upstream index, so a plain substring scan stays cheap.
+            where.append("(instr(lower(package_key), lower(?)) > 0 OR instr(lower(filename), lower(?)) > 0)")
+            args.extend([q, q])
         if kind == "packages" and q:
             if self.search_index and len(q) >= 3 and '\x00' not in q:
                 # FTS narrows candidates; the original predicate below remains
@@ -854,6 +1015,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if 'repo_ids' not in {r[1] for r in conn.execute('PRAGMA table_info(host_tokens)')}:
         conn.execute('ALTER TABLE host_tokens ADD COLUMN repo_ids TEXT')
 
+    if 'content_hash' not in {r[1] for r in conn.execute('PRAGMA table_info(repo_packages)')}:
+        conn.execute('ALTER TABLE repo_packages ADD COLUMN content_hash TEXT')
+    # Created here, not in SCHEMA, so it always runs after the column above
+    # is guaranteed to exist — SCHEMA's own CREATE TABLE IF NOT EXISTS is a
+    # no-op against a pre-existing table and would otherwise leave this
+    # index creation racing an as-yet-missing column on upgrade.
+    conn.execute(
+        'CREATE INDEX IF NOT EXISTS idx_repo_packages_hash '
+        'ON repo_packages(filename, content_hash) WHERE content_hash IS NOT NULL'
+    )
+
     existing = {row[1] for row in conn.execute("PRAGMA table_info(repo_state)")}
     for column in ("index_etag", "index_last_modified"):
         if column not in existing:
@@ -880,7 +1052,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 raise ValueError(f"Invalid legacy package filenames: {repo_id}")
             conn.execute("DELETE FROM repo_packages WHERE repo_id = ?", (repo_id,))
             conn.executemany(
-                "INSERT INTO repo_packages VALUES (?, ?, ?, ?)",
+                "INSERT INTO repo_packages (repo_id, package_key, package_name, filename) VALUES (?, ?, ?, ?)",
                 ((repo_id, k, names.get(k), v) for k, v in packages.items()),
             )
             conn.execute("UPDATE repo_state SET package_count = ? WHERE repo_id = ?",

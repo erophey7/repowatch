@@ -41,6 +41,13 @@ def _parse_apkindex_tar_gz(raw: bytes, url: str) -> list[PackageRef]:
 
         text = extracted.read().decode("utf-8", errors="replace")
 
+    # docs_dev/ROADMAP.md item 29 (cross-repo dedup): APKINDEX's "C:" field
+    # is not read into PackageRef.content_hash on purpose — it's a different
+    # digest (SHA1, base64, "Q1"-prefixed) from the SHA256 hex the other
+    # formats publish, so it could never match a real cross-format duplicate,
+    # and its exact bytes-hashed semantics (full file vs. control section)
+    # aren't verified enough here to risk treating it as a general content
+    # hash. apk packages simply never participate in dedup for now.
     packages: list[PackageRef] = []
     name: str | None = None
     version: str | None = None

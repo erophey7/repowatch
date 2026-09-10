@@ -46,6 +46,21 @@ def test_missing_optional_fields_are_none():
     assert parsed.cache_status is None
 
 
+def test_is_prefetch_field_parsed_when_present():
+    raw = b"<134>Sep  5 12:00:00 myhost repowatch: 127.0.0.1 GET /debian/dists/bookworm/InRelease 200 MISS 1"
+    parsed = parse_syslog_line(raw)
+
+    assert parsed is not None
+    assert parsed.is_prefetch is True
+
+
+def test_is_prefetch_defaults_to_false_when_field_absent_or_zero():
+    older_format = b"<134>Sep  5 12:00:00 myhost repowatch: 203.0.113.7 GET /debian/pool/main/z/zlib.deb 200 HIT"
+    assert parse_syslog_line(older_format).is_prefetch is False
+    explicit_zero = b"<134>Sep  5 12:00:00 myhost repowatch: 203.0.113.7 GET /debian/pool/main/z/zlib.deb 200 HIT 0"
+    assert parse_syslog_line(explicit_zero).is_prefetch is False
+
+
 def test_garbage_input_returns_none_not_exception():
     assert parse_syslog_line(b"") is None
     assert parse_syslog_line(b"complete garbage, no tag here") is None
@@ -281,6 +296,64 @@ repos:
     assert len(warmed) == 1
     assert warmed[0]["package_key"] == "linux-6.11.2-1"
     assert warmed[0]["status"] == "ok"
+
+
+def test_run_listener_ignores_repowatch_own_prefetch_traffic(tmp_path):
+    """docs_dev/ROADMAP.md — repowatch's own index checks/prefetch (marked
+    via nginx.py's $repowatch_is_prefetch map) must not show up in "Recent
+    client requests" (request_events), and must not produce a redundant
+    warmed_packages write either (warm_cache already records that directly)."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        f"""
+state_db: {tmp_path / "state.sqlite3"}
+cache_base_url: http://127.0.0.1:8080
+syslog_listener:
+  enabled: true
+  bind: 127.0.0.1
+  port: 0
+repos:
+  - id: arch-core
+    type: pacman
+    upstream: https://example.org/core/os/x86_64
+    arch: x86_64
+    repo_name: core
+"""
+    )
+    from repowatch.config import load_config
+
+    config = load_config(config_path)
+    store = StateStore(config.state_db)
+    store.record_snapshot(
+        RepoSnapshot(
+            repo_id="arch-core",
+            packages={"linux-6.11.2-1": "linux-6.11.2-1-x86_64.pkg.tar.zst"},
+            names={"linux-6.11.2-1": "linux"},
+        )
+    )
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+
+    from dataclasses import replace
+
+    config = replace(config, syslog_listener=replace(config.syslog_listener, port=port))
+
+    t = threading.Thread(target=run_listener, args=(str(config_path), config, store), daemon=True)
+    t.start()
+    time.sleep(0.2)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # Own prefetch traffic — trailing "1" marks it, same as nginx's map would.
+    msg = b"<134>Sep  6 12:00:00 myhost repowatch: 127.0.0.1 GET /arch/core/os/x86_64/linux-6.11.2-1-x86_64.pkg.tar.zst 200 MISS 1"
+    sock.sendto(msg, ("127.0.0.1", port))
+    time.sleep(0.3)
+
+    assert store.get_warmed_packages("arch-core") == []
+    with store._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM request_events").fetchone()[0] == 0
 
 
 def test_run_listener_records_warmed_for_all_sibling_repos_sharing_pool(tmp_path):

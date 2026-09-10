@@ -512,3 +512,236 @@ def test_dnf_prefix_uses_repo_id_and_preserves_relative_package_path():
     assert _repo_url_prefix(repo) == '/rpm/rocky-9-baseos-x86_64'
     assert _build_warm_url(_config(), repo, 'Packages/b/bash-1.x86_64.rpm') == _config().cache_base_url + path
     assert match_repo_id(path, [repo]) == repo.id
+
+
+# --- active cache purge on package removal (docs_dev/ROADMAP.md item 24) ---
+
+def _purge_config(**overrides):
+    from repowatch.config import NginxConfig
+    return Config(
+        state_db="/tmp/unused.sqlite3", check_interval=300,
+        cache_base_url="http://127.0.0.1:8080", status_server=StatusServerConfig(),
+        nginx=NginxConfig(enable_purge=True),
+        **overrides,
+    )
+
+
+def test_purge_url_mirrors_build_warm_url_under_a_purge_prefix():
+    from repowatch.prefetch import _build_warm_url, _purge_url
+    repo = RepoConfig(id='r', type='pacman', upstream='https://mirror.test/core/os/x86_64',
+                       arch='x86_64', repo_name='core')
+    config = _purge_config()
+    warm = _build_warm_url(config, repo, 'acl-1-1-x86_64.pkg.tar.zst')
+    purge = _purge_url(config, repo, 'acl-1-1-x86_64.pkg.tar.zst')
+    assert purge == warm.replace(config.cache_base_url, config.cache_base_url + '/purge', 1)
+    assert purge == 'http://127.0.0.1:8080/purge/arch/core/os/x86_64/acl-1-1-x86_64.pkg.tar.zst'
+
+
+def test_purge_removed_is_a_noop_when_disabled():
+    from repowatch.prefetch import purge_removed
+    repo = RepoConfig(id='r', type='pacman', upstream='https://mirror.test/core/os/x86_64',
+                       arch='x86_64', repo_name='core')
+    config = Config(state_db="/tmp/unused.sqlite3", check_interval=300,
+                    cache_base_url="http://127.0.0.1:8080", status_server=StatusServerConfig())
+    assert config.nginx.enable_purge is False
+
+    def boom(**kwargs):
+        raise AssertionError("must not even construct an httpx.AsyncClient when disabled")
+
+    with patch("repowatch.prefetch.httpx.AsyncClient", boom):
+        asyncio.run(purge_removed(config, repo, {"acl-1-1": "acl-1-1-x86_64.pkg.tar.zst"}))
+
+
+def test_purge_removed_is_a_noop_for_an_empty_batch():
+    from repowatch.prefetch import purge_removed
+    repo = RepoConfig(id='r', type='pacman', upstream='https://mirror.test/core/os/x86_64',
+                       arch='x86_64', repo_name='core')
+    # enable_purge=True but nothing removed — must not even try to build a client/URL.
+    asyncio.run(purge_removed(_purge_config(), repo, {}))
+
+
+def test_purge_removed_requests_the_purge_url_for_each_removed_file():
+    from repowatch.prefetch import purge_removed
+    repo = RepoConfig(id='r', type='pacman', upstream='https://mirror.test/core/os/x86_64',
+                       arch='x86_64', repo_name='core')
+    requested = []
+    def handler(request):
+        requested.append(str(request.url))
+        return httpx.Response(200)
+
+    real_async_client = httpx.AsyncClient
+    async def run():
+        with patch("repowatch.prefetch.httpx.AsyncClient",
+                    lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
+            await purge_removed(_purge_config(), repo, {
+                    "acl-1-1": "acl-1-1-x86_64.pkg.tar.zst",
+                    "zlib-1-1": "zlib-1-1-x86_64.pkg.tar.zst",
+                })
+    asyncio.run(run())
+    assert sorted(requested) == sorted([
+        "http://127.0.0.1:8080/purge/arch/core/os/x86_64/acl-1-1-x86_64.pkg.tar.zst",
+        "http://127.0.0.1:8080/purge/arch/core/os/x86_64/zlib-1-1-x86_64.pkg.tar.zst",
+    ])
+
+
+def test_purge_removed_sends_the_repowatch_user_agent():
+    """Real production bug (2026-09-10): purge_removed's own GET requests
+    didn't set User-Agent at all, so nginx's $repowatch_is_prefetch map
+    (keyed on this exact header, see nginx.py) classified them as real
+    client traffic — every automatic purge polluted "Recent client
+    requests" with its own /purge/... URL. _warm_one already set this
+    correctly; purge_removed/purge_selected did not."""
+    from repowatch.parsers.base import USER_AGENT
+    from repowatch.prefetch import purge_removed
+    repo = RepoConfig(id='r', type='pacman', upstream='https://mirror.test/core/os/x86_64',
+                       arch='x86_64', repo_name='core')
+    seen_user_agents = []
+    def handler(request):
+        seen_user_agents.append(request.headers.get("user-agent"))
+        return httpx.Response(200)
+
+    real_async_client = httpx.AsyncClient
+    async def run():
+        with patch("repowatch.prefetch.httpx.AsyncClient",
+                    lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
+            await purge_removed(_purge_config(), repo, {"acl-1-1": "acl-1-1-x86_64.pkg.tar.zst"})
+    asyncio.run(run())
+    assert seen_user_agents == [USER_AGENT]
+
+
+def test_purge_removed_one_failure_does_not_abort_the_rest():
+    from repowatch.prefetch import purge_removed
+    repo = RepoConfig(id='r', type='pacman', upstream='https://mirror.test/core/os/x86_64',
+                       arch='x86_64', repo_name='core')
+    requested = []
+    def handler(request):
+        requested.append(str(request.url))
+        if "acl" in str(request.url):
+            return httpx.Response(500)
+        return httpx.Response(200)
+
+    real_async_client = httpx.AsyncClient
+    async def run():
+        with patch("repowatch.prefetch.httpx.AsyncClient",
+                    lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
+            await purge_removed(_purge_config(), repo, {
+                    "acl-1-1": "acl-1-1-x86_64.pkg.tar.zst",
+                    "zlib-1-1": "zlib-1-1-x86_64.pkg.tar.zst",
+                })
+    asyncio.run(run())
+    assert len(requested) == 2  # both attempted despite the first failing
+
+
+def test_purge_removed_survives_a_connection_error():
+    from repowatch.prefetch import purge_removed
+    repo = RepoConfig(id='r', type='pacman', upstream='https://mirror.test/core/os/x86_64',
+                       arch='x86_64', repo_name='core')
+    def handler(request):
+        raise httpx.ConnectError("refused", request=request)
+
+    real_async_client = httpx.AsyncClient
+    async def run():
+        with patch("repowatch.prefetch.httpx.AsyncClient",
+                    lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
+            await purge_removed(_purge_config(), repo, {"acl-1-1": "acl-1-1-x86_64.pkg.tar.zst"})
+    asyncio.run(run())  # must not raise
+
+
+def test_purge_selected_is_a_noop_for_an_empty_batch():
+    from repowatch.prefetch import purge_selected
+    repo = RepoConfig(id='r', type='pacman', upstream='https://mirror.test/core/os/x86_64',
+                       arch='x86_64', repo_name='core')
+
+    def boom(**kwargs):
+        raise AssertionError("must not even construct an httpx.AsyncClient for an empty batch")
+
+    with patch("repowatch.prefetch.httpx.AsyncClient", boom):
+        result = asyncio.run(purge_selected(_purge_config(), repo, {}))
+    assert result == {}
+
+
+def test_purge_selected_does_not_check_enable_purge_itself():
+    """Unlike purge_removed, purge_selected trusts the caller (the API
+    payload function) to have already refused the request when
+    enable_purge is off — it always attempts the HTTP call it's given."""
+    from repowatch.prefetch import purge_selected
+    repo = RepoConfig(id='r', type='pacman', upstream='https://mirror.test/core/os/x86_64',
+                       arch='x86_64', repo_name='core')
+    config = Config(state_db="/tmp/unused.sqlite3", check_interval=300,
+                    cache_base_url="http://127.0.0.1:8080", status_server=StatusServerConfig())
+    assert config.nginx.enable_purge is False
+
+    real_async_client = httpx.AsyncClient
+    def handler(request):
+        return httpx.Response(200)
+    async def run():
+        with patch("repowatch.prefetch.httpx.AsyncClient",
+                    lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
+            return await purge_selected(config, repo, {"acl-1-1": "acl-1-1-x86_64.pkg.tar.zst"})
+    assert asyncio.run(run()) == {"acl-1-1": "purged"}
+
+
+def test_purge_selected_reports_purged_not_cached_and_error_per_item():
+    from repowatch.prefetch import purge_selected
+    repo = RepoConfig(id='r', type='pacman', upstream='https://mirror.test/core/os/x86_64',
+                       arch='x86_64', repo_name='core')
+
+    def handler(request):
+        if "purged-me" in str(request.url):
+            return httpx.Response(200)
+        if "already-gone" in str(request.url):
+            return httpx.Response(404)
+        return httpx.Response(500)
+
+    real_async_client = httpx.AsyncClient
+    async def run():
+        with patch("repowatch.prefetch.httpx.AsyncClient",
+                    lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
+            return await purge_selected(_purge_config(), repo, {
+                "a": "purged-me-1-x86_64.pkg.tar.zst",
+                "b": "already-gone-1-x86_64.pkg.tar.zst",
+                "c": "server-error-1-x86_64.pkg.tar.zst",
+            })
+    results = asyncio.run(run())
+    assert results["a"] == "purged"
+    assert results["b"] == "not_cached"
+    assert results["c"] == "error (HTTP 500)"
+
+
+def test_purge_selected_sends_the_repowatch_user_agent():
+    """Same real bug as purge_removed (see
+    test_purge_removed_sends_the_repowatch_user_agent) — the manual
+    "Purge selected" button's own requests must also be marked, or every
+    click pollutes "Recent client requests" with /purge/... calls."""
+    from repowatch.parsers.base import USER_AGENT
+    from repowatch.prefetch import purge_selected
+    repo = RepoConfig(id='r', type='pacman', upstream='https://mirror.test/core/os/x86_64',
+                       arch='x86_64', repo_name='core')
+    seen_user_agents = []
+    def handler(request):
+        seen_user_agents.append(request.headers.get("user-agent"))
+        return httpx.Response(200)
+
+    real_async_client = httpx.AsyncClient
+    async def run():
+        with patch("repowatch.prefetch.httpx.AsyncClient",
+                    lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
+            return await purge_selected(_purge_config(), repo, {"acl-1-1": "acl-1-1-x86_64.pkg.tar.zst"})
+    asyncio.run(run())
+    assert seen_user_agents == [USER_AGENT]
+
+
+def test_purge_selected_reports_error_for_a_connection_failure():
+    from repowatch.prefetch import purge_selected
+    repo = RepoConfig(id='r', type='pacman', upstream='https://mirror.test/core/os/x86_64',
+                       arch='x86_64', repo_name='core')
+    def handler(request):
+        raise httpx.ConnectError("refused", request=request)
+
+    real_async_client = httpx.AsyncClient
+    async def run():
+        with patch("repowatch.prefetch.httpx.AsyncClient",
+                    lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
+            return await purge_selected(_purge_config(), repo, {"acl-1-1": "acl-1-1-x86_64.pkg.tar.zst"})
+    results = asyncio.run(run())
+    assert results["acl-1-1"].startswith("error (")

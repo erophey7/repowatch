@@ -31,6 +31,22 @@ def test_packages_search_and_cursor_cover_large_snapshot(tmp_path):
     assert not store.get_page("packages", "r", q="%")["items"]
 
 
+def test_warmed_search_matches_package_key_or_filename(tmp_path):
+    store = StateStore(tmp_path / "state")
+    store.record_warmed_package("r", "linux-6.11.2-1", "linux-6.11.2-1-x86_64.pkg.tar.zst", True, 200)
+    store.record_warmed_package("r", "bash-5.2-1", "bash-5.2-1-x86_64.pkg.tar.zst", True, 200)
+    store.record_warmed_package("r", "renamed-1", "totally-different-name.pkg.tar.zst", True, 200)
+
+    by_key = store.get_page("warmed", "r", q="linux")["items"]
+    assert [p["package_key"] for p in by_key] == ["linux-6.11.2-1"]
+
+    by_filename = store.get_page("warmed", "r", q="totally-different")["items"]
+    assert [p["package_key"] for p in by_filename] == ["renamed-1"]
+
+    assert not store.get_page("warmed", "r", q="nothing-matches-this")["items"]
+    assert len(store.get_page("warmed", "r", q="")["items"]) == 3
+
+
 @pytest.mark.parametrize("kind", ["requests", "warmed"])
 def test_tied_timestamps_and_insert_between_pages(tmp_path, kind):
     store = StateStore(tmp_path / "state")

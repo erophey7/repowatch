@@ -197,7 +197,17 @@ def _parse_primary(raw: bytes | BinaryIO | _CheckedReader, arch: str) -> list[Pa
             # arch is part of NEVRA: identical N-E-V-R for noarch and x86_64
             # must not overwrite each other in RepoSnapshot.packages.
             evr = (f'{int(epoch)}:' if int(epoch) else '') + f'{ver}-{release}.{package_arch}'
-            package = PackageRef(name=name, version=evr, filename=filename)
+            # docs_dev/ROADMAP.md item 29 (cross-repo dedup): per-package
+            # <checksum type="sha256">, same shape as apt's SHA256: and
+            # pacman's SHA256SUM — only sha256 is trusted here (a repo could
+            # in principle publish a different algorithm; guessing it's
+            # comparable to another format's hash would risk a false match).
+            checksum = element.find(_COMMON + 'checksum')
+            content_hash = None
+            if checksum is not None and checksum.get('type') == 'sha256' and checksum.text:
+                if re.fullmatch(r'[0-9a-fA-F]{64}', checksum.text):
+                    content_hash = checksum.text
+            package = PackageRef(name=name, version=evr, filename=filename, content_hash=content_hash)
             if package.key in identities:
                 raise ValueError(f'dnf: duplicate NEVRA {package.key!r}')
             identities.add(package.key)

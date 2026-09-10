@@ -31,13 +31,20 @@ class ParsedRequest:
     path: str
     status: str | None
     cache_status: str | None
+    # True for repowatch's own traffic (index checks + prefetch/warm_cache —
+    # see nginx.py's $repowatch_is_prefetch map, keyed off parsers.base.USER_AGENT),
+    # False for everything else, including when the field is absent entirely
+    # (an older/hand-written access_log that doesn't emit it — see run_listener).
+    is_prefetch: bool = False
 
 
 def parse_syslog_line(raw: bytes, tag: str = "repowatch") -> ParsedRequest | None:
     """Strip the syslog envelope (nginx sends RFC3164-style: "<PRI>timestamp
     host tag[pid]: message") and parse the message as
-    "$remote_addr $request_method $request_uri $status $upstream_cache_status"
-    (see the repowatch_requests log_format in nginx.py's render()).
+    "$remote_addr $request_method $request_uri $status $upstream_cache_status
+    $repowatch_is_prefetch" (see the repowatch_requests log_format in
+    nginx.py's render()) — the last field is optional, for compatibility
+    with a hand-written access_log that predates it.
 
     Returns None for any unrecognized input — the caller simply skips such a
     packet instead of crashing.
@@ -61,8 +68,10 @@ def parse_syslog_line(raw: bytes, tag: str = "repowatch") -> ParsedRequest | Non
     client_ip, method, path = fields[0], fields[1], fields[2]
     status = fields[3] if len(fields) > 3 else None
     cache_status = fields[4] if len(fields) > 4 else None
+    is_prefetch = len(fields) > 5 and fields[5] == "1"
     return ParsedRequest(
-        client_ip=client_ip, method=method, path=path, status=status, cache_status=cache_status
+        client_ip=client_ip, method=method, path=path, status=status, cache_status=cache_status,
+        is_prefetch=is_prefetch,
     )
 
 
@@ -211,6 +220,16 @@ def run_listener(config_path: str, initial_config: Config, store: StateStore) ->
         parsed = parse_syslog_line(data)
         if parsed is None:
             logger.debug("failed to parse syslog datagram: %r", data[:200])
+            continue
+        if parsed.is_prefetch:
+            # repowatch's own index checks/prefetch, not a real client —
+            # "Recent client requests" should show what clients actually
+            # asked for, not our own background activity. Skip
+            # warmed_packages too, not just request_events: warm_cache()
+            # already records that directly (see prefetch.py) when it's
+            # actually repowatch doing the warming, so redoing it here from
+            # the syslog line would just be a redundant write, not new
+            # information.
             continue
 
         repo_id = match_repo_id(parsed.path, repos)

@@ -331,7 +331,9 @@ def check(layout: Layout, for_install: bool = True) -> Report:
                  layout.libexec / 'backup-state.sh', layout.libexec / 'backup-config.py',
                  layout.libexec / 'install.py']
     if layout.with_nginx:
-        artifacts.extend([layout.nginx_policy, layout.nginx_policy.parent / 'active.conf'])
+        artifacts.extend([layout.nginx_policy, layout.nginx_policy.parent / 'active.conf',
+                           layout.nginx_policy.parent / 'purge.conf',
+                           layout.nginx_policy.parent / 'dedup.map'])
     if layout.with_systemd:
         names = ('repowatch.service', 'repowatch-status.service', 'repowatch-check.service',
                  'repowatch-check.timer', 'repowatch-backup.service', 'repowatch-backup.timer',
@@ -535,11 +537,37 @@ def activate(layout: Layout) -> None:
             'nginx_binary': shutil.which('nginx'),
             'site_link': str(Path(installed.nginx_enabled_dir) / 'repowatch.conf'),
         }, indent=2) + '\n', preserve=True)
-        candidate = run([python, '-B', '-c',
-            'import sys; from repowatch.config import load_config; from repowatch.nginx import render; '
-            'print(render(load_config(sys.argv[1]), cache_dir=sys.argv[2], access_log=sys.argv[3]), end="")',
+        purge_path = policy.parent / 'purge.conf'
+        dedup_path = policy.parent / 'dedup.map'
+        # Purge locations (nginx.render_purge) and the dedup map
+        # (nginx.render_dedup) are `include`d from their own files rather
+        # than inlined into active.conf — this bootstrap has to produce all
+        # three, same as apply() does on every later run, or the very first
+        # `include` in active.conf would point at a file that doesn't exist
+        # yet. find_duplicate_files() only runs when enable_dedup is set —
+        # same reasoning as apply(): skip the repo_packages query entirely
+        # when the feature is off.
+        output = run([python, '-B', '-c',
+            'import sys; from repowatch.config import load_config; '
+            'from repowatch.nginx import render, render_purge, render_dedup, resolve_dedup_pairs; '
+            'from repowatch.state import StateStore; '
+            'c = load_config(sys.argv[1]); '
+            'rows = StateStore(c.state_db).find_duplicate_files() if c.nginx.enable_dedup else []; '
+            'sys.stdout.write(render(c, cache_dir=sys.argv[2], access_log=sys.argv[3], '
+            'purge_conf=sys.argv[4], dedup_conf=sys.argv[5])); '
+            'sys.stdout.write("\\0"); '
+            'sys.stdout.write(render_purge(c)); '
+            'sys.stdout.write("\\0"); '
+            'sys.stdout.write(render_dedup(c, resolve_dedup_pairs(c, rows)))',
             str(installed.config), installed.cache_dir,
-            installed.localstatedir + '/log/nginx/repo-cache.access.log'], capture_output=True, text=True).stdout
+            installed.localstatedir + '/log/nginx/repo-cache.access.log',
+            str(purge_path), str(dedup_path)], capture_output=True, text=True).stdout
+        candidate, _, rest = output.partition('\0')
+        purge_candidate, _, dedup_candidate = rest.partition('\0')
+        had_purge = purge_path.exists()
+        write(purge_path, purge_candidate, preserve=True)
+        had_dedup = dedup_path.exists()
+        write(dedup_path, dedup_candidate, preserve=True)
         active = policy.parent / 'active.conf'
         had_active = active.exists()
         write(active, candidate, preserve=True)
@@ -555,6 +583,10 @@ def activate(layout: Layout) -> None:
                 link.unlink()
             if not had_active:
                 active.unlink()
+            if not had_purge:
+                purge_path.unlink()
+            if not had_dedup:
+                dedup_path.unlink()
             raise
     if installed.with_systemd:
         units = Path(installed.systemd_unit_dir)

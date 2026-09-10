@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import re
 import tarfile
 
 import httpx
@@ -65,8 +66,13 @@ def _parse_db_tar_gz(raw: bytes) -> list[PackageRef]:
             name = fields.get("NAME")
             version = fields.get("VERSION")
             filename = fields.get("FILENAME")
+            # docs_dev/ROADMAP.md item 29 (cross-repo dedup): SHA256SUM is a
+            # standard desc field, same algorithm/hex-digest shape as apt's
+            # per-stanza SHA256: and dnf's <checksum type="sha256">.
+            sha256sum = fields.get("SHA256SUM")
+            content_hash = sha256sum if sha256sum and re.fullmatch(r"[0-9a-fA-F]{64}", sha256sum) else None
             if name and version:
-                packages.append(PackageRef(name=name, version=version, filename=filename))
+                packages.append(PackageRef(name=name, version=version, filename=filename, content_hash=content_hash))
 
     return packages
 

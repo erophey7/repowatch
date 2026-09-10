@@ -162,6 +162,13 @@ repowatch's own warm-up requests) — feeding `warmed_packages` and the
 request-history charts. Off by default: repowatch doesn't open an extra
 network port unless you've actually pointed nginx at it.
 
+Repowatch's own traffic (index checks and prefetch/warm requests, both of
+which already send a fixed `User-Agent: repowatch/...`) is filtered out
+before it ever reaches `request_events` or the "Recent client requests"
+view — the generated nginx config maps that `User-Agent` to a single digit
+in the access log line specifically so the listener can tell the two apart
+without parsing arbitrary, space-containing client user-agent strings.
+
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `enabled` | bool | `false` | Turn the listener on. Also required for `GET /api/requests` and `/api/requests/summary` to return data. |
@@ -189,7 +196,43 @@ config actually serves them.
 | `cache_key_version` | string | `""` | Bump this (any short string) to invalidate all cached objects by changing the cache key prefix, without clearing the disk cache by hand. |
 | `index_ttl` | int (seconds) | `300` | `proxy_cache_valid` for mutable index/metadata files (the whole point of active watching is that these go stale quickly). |
 | `package_ttl` | int (seconds) | `15552000` (180 days) | `proxy_cache_valid` for immutable package files, addressed by exact version/checksum. |
-| `cache_dir` | path or `null` | `null` | **Read-only/informational** — the actual cache directory nginx writes to is set once, at install time, in the root-owned `policy.json` (see `CACHE_DIR` in [deployment.md](deployment.md)), not here. Setting this makes the path visible in `config.yaml` instead of hidden inside a file the service user can't read; `nginx-apply` cross-checks it against `policy.json` and refuses to apply on a mismatch, so it can't silently go stale. To actually change the cache directory: `CACHE_DIR=... make install && sudo make activate`. |
+| `cache_dir` | path or `null` | `null` | **Read-only/informational** — the actual cache directory nginx writes to is set once, at install time, in the root-owned `policy.json` (see `CACHE_DIR` in [deployment.md](deployment.md)), not here. Setting this makes the path visible in `config.yaml` instead of hidden inside a file the service user can't read; `nginx-apply` cross-checks it against `policy.json` and refuses to apply on a mismatch, so it can't silently go stale. To actually change the cache directory: `CACHE_DIR=... make install && sudo make activate`. Setting it also unlocks the cache directory's size in `repowatch stats --cache-dir` and the dashboard's Storage panel ("Calculate cache directory size") — without it there is no path to walk, so that number is simply omitted rather than guessed at or defaulted to zero. **A real permissions caveat, found on a live deployment**: nginx creates `proxy_cache_path`'s `levels=1:2` subdirectories `0700`, owned by the nginx worker user (e.g. `www-data`) — regardless of the top-level `cache_dir`'s own mode. The repowatch service user is a deliberately different, unprivileged account (see "Ключевые решения" in CLAUDE.md), so on most real installs it can list the top-level directory but cannot descend into any of the hashed subdirectories at all. When that happens the reported size is a real undercount, but it is never silently wrong: the result includes `inaccessible_directories` (CLI prints a `WARNING`, the dashboard shows it in red) whenever this happens, so a permission wall doesn't read as "the cache is empty". There is no supported way to make this fully accurate without either running the walk as `root`/the nginx user (against the privilege-separation this project deliberately keeps) or granting broader read access to the cache tree yourself. |
+| `enable_purge` | bool | `false` | Actively evict a package's cache entry the moment it disappears from the upstream index, instead of waiting for `inactive`/`max_size` to notice on their own. Requires the third-party `ngx_cache_purge` nginx module (Debian/Ubuntu: `libnginx-mod-http-cache-purge`; Arch: `nginx-mod-cache_purge`) — **not** the nginx-plus `proxy_cache_purge on` API, and not a real `PURGE` HTTP method (nginx core rejects unknown methods outright); the generator instead adds a dedicated, loopback-only `GET /purge<prefix>/...` location per repository. You must separately add `load_module ".../ngx_http_cache_purge_module.so";` to your own main `nginx.conf` — that's a main-context directive the generated file (which lives inside `http{}`/`sites-enabled`) can't emit itself. Without the module loaded, `nginx -t` fails clearly during `nginx-apply` and the usual atomic rollback applies — it doesn't silently do nothing. When it's on, the dashboard's per-repository panel also gets a "Cache purge (stale warmed entries)" section: "Scan for stale entries" computes candidates from repowatch's own records only (no nginx/network call), then "Purge selected" is the only point that actually asks nginx — its 200/404 response IS the "was this cached" answer, so there's no separate non-destructive pre-check (a live HEAD/GET probe against the same cache key real traffic uses has a real correctness cost/risk — see `docs_dev/ROADMAP.md` item 32 for the full reasoning). |
+| `enable_dedup` | bool | `false` | When two DIFFERENT repositories publish the byte-identical file (e.g. the same binary package shipped by both Debian and Ubuntu), serve and cache it once instead of twice. Detected from a per-package SHA256 that apt/pacman/dnf indexes already publish — apk and apt-rpm packages never participate (see below). No extra download or storage of file content is needed; only the already-parsed index metadata is compared. |
+
+**Purge locations live in a separate included file.** When `enable_purge` is
+on, the generated `active.conf` doesn't inline the purge locations among the
+per-repository routing — it adds a single `include .../purge.conf;` line
+inside the `server {}` block, and `nginx-apply`/`make activate` write that
+second file (`purge.conf`, next to `active.conf` in the same root-owned
+directory) alongside it, atomically, in the same transaction (both are
+validated by one `nginx -t` and rolled back together on failure). This keeps
+the routing config that does the actual proxying free of purge/admin-only
+clutter regardless of how many optional features like this one exist. If
+you're generating the config manually with `nginx-render` (no `--policy`,
+no root), the purge locations print as a separate labeled block after the
+main config — save it to the path nginx will `include`.
+
+**How dedup works, and its one real limitation.** Only apt, pacman, and dnf
+packages carry a per-package SHA256 in their index today (apt's `SHA256:`
+field, pacman's `%SHA256SUM%`, dnf's `<checksum type="sha256">`) — apk's
+`APKINDEX` `C:` field is a different digest (SHA1, base64) that could never
+match a real cross-format duplicate, and apt-rpm's binary pkglist doesn't
+currently carry a verified whole-file digest; both are deliberately left out
+rather than guessed at, since a false match would mean serving one
+package's bytes under a different package's name. When a match is found
+across two repos, the alphabetically-first `repo_id` is treated as
+canonical; every other repo serving that same file gets an internal nginx
+rewrite (`map`/`if`/`rewrite ... last`, generated in `dedup.map`, the same
+included-sub-config pattern as `purge.conf` above) to the canonical repo's
+own content location — so it reuses that repo's real cache entry, TTLs, and
+upstream, rather than fetching or storing a second copy. `nginx-apply`
+computes the actual pairs from `repo_packages` at apply time (a real SQL
+query — skipped entirely when this flag is off, so leaving it off costs
+nothing on every 15s apply cycle); `nginx-render` without `--policy` always
+shows an empty map, since it deliberately never opens the database. Index
+files (`Packages.gz`, `.db.tar.gz`, `repodata/*`, etc.) never participate —
+each repository's own index must always reflect its own real state.
 
 **Why `resolvers` is IPv4-only:** upstream resolution happens once via
 `nginx -t`/generation-time DNS, not a live `resolver` directive per request,

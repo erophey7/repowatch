@@ -35,6 +35,17 @@ class PackageRef:
     version: str
     # relative path of the package file from the repository's upstream URL, if known
     filename: str | None = None
+    # SHA256 hex digest of the package file, when the index publishes one
+    # (docs_dev/ROADMAP.md item 29 — cross-repository dedup). Deliberately
+    # left None for formats where a same-algorithm whole-file hash isn't
+    # available without downloading the file itself: apk's APKINDEX `C:`
+    # field is a different digest (SHA1, base64, "Q1" prefix) that would
+    # never match a SHA256 value from apt/pacman/dnf even for a genuinely
+    # identical file, and apt-rpm's pkglist RPM headers (parsers/apt_rpm.py)
+    # don't currently carry a verified whole-file digest tag — guessing
+    # either would risk a false-positive match (serving one package's bytes
+    # under a different one's name), so both stay unfilled rather than wrong.
+    content_hash: str | None = None
 
     @property
     def key(self) -> str:
@@ -76,6 +87,7 @@ class IndexParser(ABC):
             repo_id=self.repo.id,
             packages={p.key: p.filename or "" for p in packages},
             names={p.key: p.name for p in packages},
+            content_hashes={p.key: p.content_hash for p in packages if p.content_hash},
         )
 
     async def check_index_changed(

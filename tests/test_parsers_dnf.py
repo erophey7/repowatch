@@ -251,6 +251,29 @@ def test_primary_parser_only_requests_bounded_chunks():
     assert len(_parse_primary(BoundedReader(PRIMARY), 'x86_64')) == 3
 
 
+def test_parse_primary_reads_the_per_package_sha256_checksum():
+    """docs_dev/ROADMAP.md item 29 — content_hash comes from the per-package
+    <checksum type="sha256">, not the container-level checksum in repomd.xml
+    (that one's already covered by _checked_primary/_parse_repomd tests)."""
+    valid = 'c' * 64
+    raw = (
+        '<metadata xmlns="http://linux.duke.edu/metadata/common" packages="2">'
+        '<package type="rpm"><name>a</name><arch>x86_64</arch>'
+        '<version epoch="0" ver="1" rel="1"/>'
+        f'<checksum type="sha256" pkgid="YES">{valid}</checksum>'
+        '<location href="a.rpm"/></package>'
+        '<package type="rpm"><name>b</name><arch>x86_64</arch>'
+        '<version epoch="0" ver="1" rel="1"/>'
+        # Wrong length/algorithm — must not be trusted as a real SHA256.
+        '<checksum type="sha256" pkgid="YES">tooshort</checksum>'
+        '<location href="b.rpm"/></package>'
+        '</metadata>'
+    ).encode()
+    packages = {p.name: p for p in _parse_primary(raw, 'x86_64')}
+    assert packages['a'].content_hash == valid
+    assert packages['b'].content_hash is None
+
+
 def test_duplicate_primary_metadata_is_rejected():
     root = ET.fromstring(REPOMD)
     primary = root.find('{http://linux.duke.edu/metadata/repo}data')

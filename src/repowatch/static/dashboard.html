@@ -63,12 +63,22 @@
   .badge-changed { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
   .badge-stale { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
   .mono { font-family: var(--mono); font-size: 12px; }
-  .detail-row td { background: var(--bg); padding: 0; }
+  /* white-space:nowrap is inherited down from the "th, td" rule above (it's
+     what keeps ordinary repo-row cells like timestamps on one line) — reset
+     it here so text inside the detail row's panel (package keys, the purge
+     hint paragraph, etc.) can wrap at all instead of rendering as one
+     unbroken line that overflows into neighboring grid columns. */
+  .detail-row td { background: var(--bg); padding: 0; white-space: normal; }
   .detail-panel { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; padding: 14px 16px; }
+  /* min-width:0 lets the column shrink below its content's intrinsic width
+     (the default grid-item min-width is auto, sized to fit content);
+     overflow-wrap covers long unbreakable tokens (package keys, filenames)
+     that can still exceed the column width even once wrapping works. */
+  .detail-col { min-width: 0; overflow-wrap: anywhere; }
   .detail-col h3 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase;
                    letter-spacing: .04em; color: var(--text-dim); }
-  .scroll-list { max-height: 220px; overflow-y: auto; border: 1px solid var(--border);
-                 border-radius: 6px; background: var(--surface); }
+  .scroll-list { max-height: 220px; overflow-y: auto; overflow-wrap: anywhere;
+                 border: 1px solid var(--border); border-radius: 6px; background: var(--surface); }
   .scroll-list div { padding: 4px 8px; font-family: var(--mono); font-size: 12px;
                       border-bottom: 1px solid var(--border); }
   .scroll-list div:last-child { border-bottom: none; }
@@ -105,17 +115,12 @@
               cursor: pointer; }
   .pick-row:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
   .pick-row input { margin-right: 6px; }
+  .pick-row-inline { display: flex; align-items: center; gap: 6px; cursor: pointer; flex: 1; min-width: 0; }
+  .bulk-actions { display: flex; gap: 6px; margin: 8px 0; flex-wrap: wrap; }
   .warm-actions { display: flex; gap: 6px; margin-top: 8px; }
   .warm-actions input { flex: 1; font: inherit; padding: 5px 8px; border-radius: 6px;
                          border: 1px solid var(--border); background: var(--bg); color: var(--text); }
   .browse-link { font-size: 12px; }
-  .row-with-action { display: flex; align-items: center; justify-content: space-between;
-                      gap: 6px; padding: 4px 8px; font-family: var(--mono); font-size: 12px;
-                      border-bottom: 1px solid var(--border); }
-  .row-with-action:last-child { border-bottom: none; }
-  .mini-remove { font-size: 11px; padding: 1px 7px; border-radius: 999px; line-height: 1.4;
-                 border: 1px solid var(--border); background: var(--surface); color: var(--warn);
-                 cursor: pointer; }
   .ban-form { display: flex; gap: 6px; margin-top: 10px; }
   .ban-form input { flex: 1; font: inherit; padding: 5px 8px; border-radius: 6px;
                      border: 1px solid var(--border); background: var(--bg); color: var(--text); }
@@ -126,6 +131,7 @@
   .row-actions .danger { color: var(--warn); }
   .field input:disabled { opacity: .6; }
   .field-hint { font-size: 11px; color: var(--text-dim); }
+  .purge-section { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); }
   @media (max-width: 900px) {
     .detail-panel { grid-template-columns: 1fr; }
   }
@@ -173,10 +179,12 @@
   .login-bar .logout-link { font-size: 12px; cursor: pointer; color: var(--accent);
                              text-decoration: underline; background: none; border: none; padding: 0; }
   body:not([data-role="admin"]) .row-actions,
-  body:not([data-role="admin"]) .mini-remove,
   body:not([data-role="admin"]) .warm-actions,
+  body:not([data-role="admin"]) .bulk-actions,
+  body:not([data-role="admin"]) .purge-section,
   body:not([data-role="admin"]) .ban-form,
   body:not([data-role="admin"]) .pick-row input,
+  body:not([data-role="admin"]) .pick-row-inline input,
   body:not([data-role="admin"]) #logout-btn { display: none; }
 </style>
 </head>
@@ -205,6 +213,13 @@
       <button id="hide-token" type="button">Saved — hide</button>
     </div>
     <div id="tokens-list"></div>
+  </details>
+
+  <details id="storage-panel" hidden>
+    <summary>Storage</summary>
+    <div id="storage-body">Loading…</div>
+    <button type="button" id="calc-cache-size">Calculate cache directory size</button>
+    <span id="cache-size-note" class="dim"></span>
   </details>
 
   <div id="repos-groups"></div>
@@ -434,6 +449,7 @@ const sessionReady = nativeFetch('/api/auth/session').then(async response => {
   document.getElementById('admin-login').hidden = isLoggedIn;
   document.getElementById('logout-btn').hidden = !isLoggedIn;
   document.getElementById('tokens-panel').hidden = !isLoggedIn;
+  document.getElementById('storage-panel').hidden = !isLoggedIn;
   $toggleAddFormBtn.hidden = !isLoggedIn;
   $toggleSettingsFormBtn.hidden = false;
   $toggleSettingsFormBtn.textContent = isLoggedIn ? '⚙ Settings' : '⚙ View settings';
@@ -481,6 +497,57 @@ document.getElementById('tokens-panel').addEventListener('toggle', () => {
   if (document.getElementById('tokens-panel').open) loadTokens().catch(error => {
     document.getElementById('token-message').textContent = error.message;
   });
+});
+
+function renderStorageStats(stats) {
+  const bytes = n => `${n.toLocaleString()} bytes`;
+  let html = `<p>state_db: ${bytes(stats.state_db_bytes)}</p><ul>`;
+  for (const [table, count] of Object.entries(stats.tables)) {
+    html += `<li>${esc(table)}: ${count.toLocaleString()} row(s)</li>`;
+  }
+  html += '</ul>';
+  if (stats.cache_dir === undefined) {
+    // not requested yet
+  } else if (stats.cache_dir === null) {
+    html += '<p class="dim">cache_dir: not set in config.yaml (nginx.cache_dir) — nothing to calculate</p>';
+  } else if (stats.cache_dir.error) {
+    html += `<p class="form-msg error">cache_dir: ${esc(stats.cache_dir.error)}</p>`;
+  } else {
+    html += `<p>cache_dir (${esc(stats.cache_dir.path)}): ${bytes(stats.cache_dir.size_bytes)}, ` +
+      `${stats.cache_dir.file_count.toLocaleString()} file(s)</p>`;
+    if (stats.cache_dir.inaccessible_directories) {
+      html += `<p class="form-msg error">Warning: ${stats.cache_dir.inaccessible_directories.toLocaleString()} ` +
+        'subdirectory/ies could not be read (permission denied) — the numbers above are an ' +
+        'UNDERCOUNT. nginx creates proxy_cache_path\'s levels=1:2 subdirectories 0700, owned by ' +
+        'the nginx worker user; the repowatch service user typically can\'t read them at all.</p>';
+    }
+  }
+  return html;
+}
+async function loadStorageStats(includeCacheDir = false) {
+  const body = document.getElementById('storage-body');
+  const response = await fetch(`/api/stats${includeCacheDir ? '?cache_dir=1' : ''}`);
+  if (!response.ok) { body.textContent = 'Failed to load storage stats'; return; }
+  body.innerHTML = renderStorageStats(await response.json());
+}
+document.getElementById('storage-panel').addEventListener('toggle', () => {
+  if (document.getElementById('storage-panel').open) loadStorageStats().catch(() => {
+    document.getElementById('storage-body').textContent = 'Failed to load storage stats';
+  });
+});
+document.getElementById('calc-cache-size').addEventListener('click', async () => {
+  const button = document.getElementById('calc-cache-size');
+  const note = document.getElementById('cache-size-note');
+  button.disabled = true;
+  note.textContent = 'Walking the cache directory — this can take a while for a large cache…';
+  try {
+    await loadStorageStats(true);
+    note.textContent = '';
+  } catch (err) {
+    note.textContent = `Error: ${err.message}`;
+  } finally {
+    button.disabled = false;
+  }
 });
 document.getElementById('token-form').addEventListener('submit', async event => {
   event.preventDefault();
@@ -577,11 +644,25 @@ const REPOS_THEAD_HTML = `
   </tr>
 `;
 
-// Group open/closed state survives auto-refresh (loadRepos redraws
-// everything from scratch every 30s) — it's kept by group name, separately
-// from the DOM. By default (the first time a group is seen), only groups
-// with at least one changed repository are expanded.
-const groupOpenState = new Map();
+// Group open/closed state survives auto-refresh (loadRepos redraws everything
+// from scratch every 30s) — it's kept by group name, separately from the DOM.
+// Also persisted to localStorage so it survives a page reload, not just the
+// in-session redraw; per-browser/per-origin, not synced across devices.
+// By default (a group never seen before, in this session or a past one),
+// only groups with at least one changed repository start expanded.
+const GROUP_STATE_KEY = 'repowatch:group-open';
+function loadGroupOpenState() {
+  try {
+    const raw = localStorage.getItem(GROUP_STATE_KEY);
+    return raw ? new Map(Object.entries(JSON.parse(raw))) : new Map();
+  } catch {
+    return new Map(); // private browsing / storage disabled — falls back to session-only state
+  }
+}
+function saveGroupOpenState(map) {
+  try { localStorage.setItem(GROUP_STATE_KEY, JSON.stringify(Object.fromEntries(map))); } catch {}
+}
+const groupOpenState = loadGroupOpenState();
 
 function createRepoRow(repo) {
   const tr = document.createElement('tr');
@@ -632,7 +713,10 @@ function render(repos) {
       groupOpenState.set(name, groupItems.some(r => r.changed_at));
     }
     details.open = groupOpenState.get(name);
-    details.addEventListener('toggle', () => groupOpenState.set(name, details.open));
+    details.addEventListener('toggle', () => {
+      groupOpenState.set(name, details.open);
+      saveGroupOpenState(groupOpenState);
+    });
 
     const summary = document.createElement('summary');
     summary.innerHTML = `${esc(name)} <span class="group-count">(${groupItems.length})</span>`;
@@ -659,9 +743,9 @@ function render(repos) {
 function renderWarmedList(items) {
   return items.length
     ? items.map(w => `
-        <div class="row-with-action">
-          <span>${w.status === 'ok' ? '✓' : '✗'} ${esc(w.package_key)} <span class="dim">· ${fmtTs(w.warmed_at)}</span></span>
-          <button class="mini-remove" data-action="remove-warmed" data-key="${esc(w.package_key)}">✕</button>
+        <div>
+          <label class="pick-row-inline"><input type="checkbox" value="${esc(w.package_key)}">
+            ${w.status === 'ok' ? '✓' : '✗'} ${esc(w.package_key)} <span class="dim">· ${fmtTs(w.warmed_at)}</span></label>
         </div>`).join('')
     : '<div class="empty">nothing warmed yet</div>';
 }
@@ -703,12 +787,66 @@ function pageLoader(container, url, render, afterRender = () => {}) {
   return load;
 }
 
+// Shared "checkbox selection over a paginated/filtered list" behavior for
+// the warm-queue picker and the warmed-packages list: tracks selection in a
+// Map (value -> extra data, e.g. package_name for bans) that survives page
+// re-renders, wires "select all matching the current filter" (walks every
+// page via the list's own paginated endpoint, not just what's on screen —
+// selectedKeys is what bulk actions actually submit, independent of which
+// checkboxes happen to be rendered) and "clear selection". Returns the Map
+// so callers can read it for their own bulk-action buttons.
+function wireSelection(container, {fetchUrl, getQuery, selectAllBtn, clearBtn, msgEl, extraOf = () => null}) {
+  const selected = new Map();
+  container.addEventListener('change', ev => {
+    if (ev.target.type !== 'checkbox') return;
+    if (ev.target.checked) selected.set(ev.target.value, ev.target.dataset.extra ?? null);
+    else selected.delete(ev.target.value);
+  });
+  const reflectChecked = () => container.querySelectorAll('input').forEach(cb => { cb.checked = selected.has(cb.value); });
+  const SELECT_ALL_CAP = 5000;
+  selectAllBtn.addEventListener('click', async () => {
+    const q = getQuery();
+    selectAllBtn.disabled = true;
+    let count = 0, cursor = null;
+    try {
+      do {
+        const params = new URLSearchParams({ limit: '200', q });
+        if (cursor) params.set('cursor', cursor);
+        const res = await fetch(`${fetchUrl}?${params}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const page = await res.json();
+        for (const item of page.items) selected.set(item.package_key, extraOf(item));
+        count += page.items.length;
+        cursor = page.next_cursor;
+        selectAllBtn.textContent = `Selecting… (${count})`;
+      } while (cursor && count < SELECT_ALL_CAP);
+      reflectChecked();
+      if (msgEl) {
+        msgEl.className = 'form-msg ok';
+        msgEl.textContent = cursor
+          ? `Selected the first ${count} matching (stopped at the ${SELECT_ALL_CAP} safety limit — narrow the filter to select the rest).`
+          : `Selected ${count} matching item(s).`;
+      }
+    } catch (err) {
+      if (msgEl) { msgEl.className = 'form-msg error'; msgEl.textContent = `Selection error: ${err.message}`; }
+    } finally {
+      selectAllBtn.disabled = false;
+      selectAllBtn.textContent = 'Select all matching';
+    }
+  });
+  clearBtn.addEventListener('click', () => {
+    selected.clear();
+    reflectChecked();
+    if (msgEl) { msgEl.className = 'form-msg'; msgEl.textContent = ''; }
+  });
+  return { selected, reflectChecked };
+}
+
 function renderBannedList(names) {
   return names.length
     ? names.map(n => `
-        <div class="row-with-action">
-          <span class="mono">${esc(n)}</span>
-          <button class="mini-remove" data-action="unban" data-name="${esc(n)}">✕</button>
+        <div>
+          <label class="pick-row-inline mono"><input type="checkbox" value="${esc(n)}"> ${esc(n)}</label>
         </div>`).join('')
     : '<div class="empty">no bans</div>';
 }
@@ -741,7 +879,29 @@ async function toggleDetail(tr, repoId) {
   td.innerHTML = `<div class="detail-panel">
     <div class="detail-col">
       <h3>Warmed packages</h3>
+      <input type="text" class="pkg-search" data-slot="warmed-search" placeholder="filter by package name or filename…">
       <div class="scroll-list" data-slot="warmed">Loading…</div>
+      <div class="bulk-actions">
+        <button type="button" data-slot="warmed-remove-btn">Remove selected</button>
+        <button type="button" data-slot="warmed-select-all-btn">Select all matching</button>
+        <button type="button" data-slot="warmed-clear-btn">Clear selection</button>
+      </div>
+      <div class="form-msg" data-slot="warmed-msg"></div>
+
+      <div class="purge-section">
+        <div class="subsection-title">Cache purge (stale warmed entries)</div>
+        <p class="field-hint">Warmed entries whose package no longer exists in the current
+          index — real candidates for cleanup, but nginx is only asked when you purge, not
+          before (see docs_dev/ROADMAP.md for why a live pre-check risks the cache itself).</p>
+        <button type="button" data-slot="purge-scan-btn">Scan for stale entries</button>
+        <div class="scroll-list checklist" data-slot="purge-list" hidden></div>
+        <div class="bulk-actions" data-slot="purge-actions" hidden>
+          <button type="button" data-slot="purge-selected-btn">Purge selected</button>
+          <button type="button" data-slot="purge-select-all-btn">Select all</button>
+          <button type="button" data-slot="purge-clear-btn">Clear selection</button>
+        </div>
+        <div class="form-msg" data-slot="purge-msg"></div>
+      </div>
     </div>
     <div class="detail-col">
       <h3>${isLoggedIn ? 'Add to warm queue' : 'Packages'}</h3>
@@ -749,14 +909,24 @@ async function toggleDetail(tr, repoId) {
       <div class="scroll-list checklist" data-slot="picker">Loading…</div>
       <div class="warm-actions">
         <button data-slot="warm-btn">Warm</button>
+        <button type="button" data-slot="select-all-btn">Select all matching</button>
+        <button type="button" data-slot="clear-selection-btn">Clear selection</button>
+      </div>
+      <div class="bulk-actions">
+        <button type="button" data-slot="ban-selected-btn">Ban selected (by name)</button>
       </div>
       <div class="form-msg" data-slot="warm-msg"></div>
 
       <div class="subsection-title">Banned from auto-warm (by package name)</div>
       <div class="scroll-list" data-slot="bans">Loading…</div>
       <div class="ban-form">
-        <input type="text" data-slot="ban-name" placeholder="package name, e.g. linux-headers">
+        <input type="text" data-slot="ban-name" placeholder="package name(s), comma-separated, e.g. linux-headers, bash">
         <button data-slot="ban-btn">Ban</button>
+      </div>
+      <div class="bulk-actions">
+        <button type="button" data-slot="bans-select-all-btn">Select all</button>
+        <button type="button" data-slot="bans-clear-btn">Clear selection</button>
+        <button type="button" data-slot="unban-selected-btn">Unban selected</button>
       </div>
       <div class="form-msg" data-slot="ban-msg"></div>
     </div>
@@ -769,35 +939,261 @@ async function toggleDetail(tr, repoId) {
   tr.after(detailRow);
 
   const warmedSlot = td.querySelector('[data-slot="warmed"]');
+  const warmedSearchInput = td.querySelector('[data-slot="warmed-search"]');
+  const warmedRemoveBtn = td.querySelector('[data-slot="warmed-remove-btn"]');
+  const warmedSelectAllBtn = td.querySelector('[data-slot="warmed-select-all-btn"]');
+  const warmedClearBtn = td.querySelector('[data-slot="warmed-clear-btn"]');
+  const warmedMsg = td.querySelector('[data-slot="warmed-msg"]');
   const pickerSlot = td.querySelector('[data-slot="picker"]');
   const searchInput = td.querySelector('[data-slot="search"]');
   const histSlot = td.querySelector('[data-slot="history"]');
   const warmBtn = td.querySelector('[data-slot="warm-btn"]');
+  const selectAllBtn = td.querySelector('[data-slot="select-all-btn"]');
+  const clearSelectionBtn = td.querySelector('[data-slot="clear-selection-btn"]');
+  const banSelectedBtn = td.querySelector('[data-slot="ban-selected-btn"]');
   const warmMsg = td.querySelector('[data-slot="warm-msg"]');
   const bansSlot = td.querySelector('[data-slot="bans"]');
   const banNameInput = td.querySelector('[data-slot="ban-name"]');
   const banBtn = td.querySelector('[data-slot="ban-btn"]');
+  const bansSelectAllBtn = td.querySelector('[data-slot="bans-select-all-btn"]');
+  const bansClearBtn = td.querySelector('[data-slot="bans-clear-btn"]');
+  const unbanSelectedBtn = td.querySelector('[data-slot="unban-selected-btn"]');
   const banMsg = td.querySelector('[data-slot="ban-msg"]');
 
   const loadWarmed = pageLoader(warmedSlot,
-    `/api/repos/${encodeURIComponent(repoId)}/warmed`, renderWarmedList);
-  const selectedKeys = new Set();
-  pickerSlot.addEventListener('change', ev => {
-    if (ev.target.type !== 'checkbox') return;
-    if (ev.target.checked) selectedKeys.add(ev.target.value);
-    else selectedKeys.delete(ev.target.value);
+    `/api/repos/${encodeURIComponent(repoId)}/warmed`, renderWarmedList,
+    () => warmedSlot.querySelectorAll('input').forEach(cb => { cb.checked = warmedSelection.selected.has(cb.value); }));
+  let warmedSearchTimer;
+  warmedSearchInput.addEventListener('input', () => {
+    clearTimeout(warmedSearchTimer);
+    warmedSearchTimer = setTimeout(() => loadWarmed(true, warmedSearchInput.value.trim()), 250);
   });
+  const warmedSelection = wireSelection(warmedSlot, {
+    fetchUrl: `/api/repos/${encodeURIComponent(repoId)}/warmed`,
+    getQuery: () => warmedSearchInput.value.trim(),
+    selectAllBtn: warmedSelectAllBtn, clearBtn: warmedClearBtn, msgEl: warmedMsg,
+  });
+  warmedRemoveBtn.addEventListener('click', async () => {
+    const keys = [...warmedSelection.selected.keys()];
+    if (!keys.length) {
+      warmedMsg.className = 'form-msg error';
+      warmedMsg.textContent = 'Nothing selected';
+      return;
+    }
+    try {
+      const res = await fetch(`/api/repos/${encodeURIComponent(repoId)}/warmed/remove`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ package_keys: keys }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        warmedMsg.className = 'form-msg error';
+        warmedMsg.textContent = data.error || `HTTP ${res.status}`;
+        return;
+      }
+      warmedSelection.selected.clear();
+      warmedMsg.className = 'form-msg ok';
+      warmedMsg.textContent = `Removed: ${data.removed}`;
+      await loadWarmed();
+    } catch (err) {
+      warmedMsg.className = 'form-msg error';
+      warmedMsg.textContent = `Network error: ${err.message}`;
+    }
+  });
+
+  // Manual cache purge — step 1 (Scan) is DB-only, no nginx/network call;
+  // step 2 (Purge selected) is the only point where nginx is actually
+  // asked, and its response (200/404 per key) IS the "does this still
+  // exist" answer — see prefetch.purge_selected for why there's no
+  // separate non-destructive pre-check.
+  const purgeScanBtn = td.querySelector('[data-slot="purge-scan-btn"]');
+  const purgeListSlot = td.querySelector('[data-slot="purge-list"]');
+  const purgeActionsSlot = td.querySelector('[data-slot="purge-actions"]');
+  const purgeSelectedBtn = td.querySelector('[data-slot="purge-selected-btn"]');
+  const purgeSelectAllBtn = td.querySelector('[data-slot="purge-select-all-btn"]');
+  const purgeClearBtn = td.querySelector('[data-slot="purge-clear-btn"]');
+  const purgeMsg = td.querySelector('[data-slot="purge-msg"]');
+
+  // silent=true (used right after a purge) updates the list/checkboxes
+  // without touching purgeMsg — otherwise the re-scan's own "N candidates
+  // found" immediately overwrote the "Purged: X, not cached: Y" summary
+  // the operator actually clicked the button to see (a real bug caught
+  // while testing this feature, not just a hypothetical).
+  async function scanForStaleEntries(silent = false) {
+    if (!silent) {
+      purgeMsg.className = 'form-msg';
+      purgeMsg.textContent = 'Scanning…';
+    }
+    purgeActionsSlot.hidden = true;
+    try {
+      const res = await fetch(`/api/repos/${encodeURIComponent(repoId)}/purge-candidates`);
+      const data = await res.json();
+      if (!res.ok) {
+        purgeListSlot.hidden = true;
+        if (!silent) { purgeMsg.className = 'form-msg error'; purgeMsg.textContent = data.error || `HTTP ${res.status}`; }
+        return;
+      }
+      if (!data.enable_purge) {
+        purgeListSlot.hidden = true;
+        if (!silent) {
+          purgeMsg.className = 'form-msg error';
+          purgeMsg.textContent = 'nginx.enable_purge is not enabled in config.yaml — nothing to purge.';
+        }
+        return;
+      }
+      purgeListSlot.hidden = false;
+      if (!data.candidates.length) {
+        purgeListSlot.innerHTML = '<div class="empty">no stale entries found</div>';
+        if (!silent) purgeMsg.textContent = '';
+        return;
+      }
+      // All checked by default — the operator opts OUT of ones they don't want purged.
+      purgeListSlot.innerHTML = data.candidates.map(c =>
+        `<label class="pick-row"><input type="checkbox" value="${esc(c.package_key)}" checked> ` +
+        `${esc(c.package_key)} <span class="dim">(${esc(c.filename)})</span></label>`).join('');
+      purgeActionsSlot.hidden = false;
+      if (!silent) purgeMsg.textContent = `${data.candidates.length} candidate(s) found.`;
+    } catch (err) {
+      if (!silent) { purgeMsg.className = 'form-msg error'; purgeMsg.textContent = `Network error: ${err.message}`; }
+    }
+  }
+  purgeScanBtn.addEventListener('click', () => scanForStaleEntries());
+  purgeSelectAllBtn.addEventListener('click', () => {
+    purgeListSlot.querySelectorAll('input').forEach(cb => { cb.checked = true; });
+  });
+  purgeClearBtn.addEventListener('click', () => {
+    purgeListSlot.querySelectorAll('input').forEach(cb => { cb.checked = false; });
+  });
+  purgeSelectedBtn.addEventListener('click', async () => {
+    const keys = [...purgeListSlot.querySelectorAll('input:checked')].map(cb => cb.value);
+    if (!keys.length) {
+      purgeMsg.className = 'form-msg error';
+      purgeMsg.textContent = 'Nothing selected';
+      return;
+    }
+    purgeMsg.className = 'form-msg';
+    purgeMsg.textContent = 'Purging…';
+    try {
+      const res = await fetch(`/api/repos/${encodeURIComponent(repoId)}/purge`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ package_keys: keys }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        purgeMsg.className = 'form-msg error';
+        purgeMsg.textContent = data.error || `HTTP ${res.status}`;
+        return;
+      }
+      const counts = { purged: 0, not_cached: 0, error: 0 };
+      for (const outcome of Object.values(data.results)) {
+        counts[outcome.startsWith('error') ? 'error' : outcome] = (counts[outcome.startsWith('error') ? 'error' : outcome] || 0) + 1;
+      }
+      purgeMsg.className = counts.error ? 'form-msg error' : 'form-msg ok';
+      purgeMsg.textContent = `Purged: ${counts.purged}, not cached: ${counts.not_cached}` +
+        (counts.error ? `, errors: ${counts.error}` : '');
+      await scanForStaleEntries(true); // silent re-scan: keep the "Purged: ..." summary on screen
+      await loadWarmed(); // reflect the same cleanup in the warmed list above
+    } catch (err) {
+      purgeMsg.className = 'form-msg error';
+      purgeMsg.textContent = `Network error: ${err.message}`;
+    }
+  });
+
   const loadPackages = pageLoader(pickerSlot,
     `/api/repos/${encodeURIComponent(repoId)}/packages`,
     items => items.length ? items.map(p =>
-      `<label class="pick-row"><input type="checkbox" value="${esc(p.package_key)}"> ${esc(p.package_key)}</label>`).join('')
+      `<label class="pick-row"><input type="checkbox" value="${esc(p.package_key)}" data-extra="${esc(p.package_name || '')}"> ${esc(p.package_key)}</label>`).join('')
       : '<div class="empty">nothing found</div>',
-    () => pickerSlot.querySelectorAll('input').forEach(cb => { cb.checked = selectedKeys.has(cb.value); }));
+    () => packageSelection.reflectChecked());
   let searchTimer;
   searchInput.addEventListener('input', () => {
     clearTimeout(searchTimer);
     searchTimer = setTimeout(() => loadPackages(true, searchInput.value.trim()), 250);
   });
+  // "Select all matching" walks every page of the CURRENT filter (not just
+  // the loaded page) via the same cursor the picker itself uses, so a
+  // narrow search still selects packages beyond what's on screen. Remembers
+  // each package's bare name too (extraOf), not just its key — "Ban
+  // selected" needs names, and can't rely on the DOM having rendered every
+  // selected item's checkbox (see wireSelection).
+  const packageSelection = wireSelection(pickerSlot, {
+    fetchUrl: `/api/repos/${encodeURIComponent(repoId)}/packages`,
+    getQuery: () => searchInput.value.trim(),
+    selectAllBtn, clearBtn: clearSelectionBtn, msgEl: warmMsg,
+    extraOf: item => item.package_name || null,
+  });
+  banSelectedBtn.addEventListener('click', async () => {
+    const names = [...new Set([...packageSelection.selected.values()].filter(Boolean))];
+    if (!names.length) {
+      warmMsg.className = 'form-msg error';
+      warmMsg.textContent = 'Nothing selected (or selected packages have no known name)';
+      return;
+    }
+    try {
+      const res = await fetch(`/api/repos/${encodeURIComponent(repoId)}/bans`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ package_names: names }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        warmMsg.className = 'form-msg error';
+        warmMsg.textContent = data.error || `HTTP ${res.status}`;
+        return;
+      }
+      warmMsg.className = 'form-msg ok';
+      warmMsg.textContent = `Banned ${names.length} name(s)`;
+      bansSlot.innerHTML = renderBannedList(data.banned);
+    } catch (err) {
+      warmMsg.className = 'form-msg error';
+      warmMsg.textContent = `Network error: ${err.message}`;
+    }
+  });
+
+  // Bans is a short, unpaginated list — "select all" just checks everything
+  // currently rendered, no cursor-walking needed (unlike warmed/packages).
+  const bansSelection = new Set();
+  bansSlot.addEventListener('change', ev => {
+    if (ev.target.type !== 'checkbox') return;
+    if (ev.target.checked) bansSelection.add(ev.target.value);
+    else bansSelection.delete(ev.target.value);
+  });
+  bansSelectAllBtn.addEventListener('click', () => {
+    bansSlot.querySelectorAll('input').forEach(cb => { cb.checked = true; bansSelection.add(cb.value); });
+  });
+  bansClearBtn.addEventListener('click', () => {
+    bansSelection.clear();
+    bansSlot.querySelectorAll('input').forEach(cb => { cb.checked = false; });
+  });
+  unbanSelectedBtn.addEventListener('click', async () => {
+    const names = [...bansSelection];
+    if (!names.length) {
+      banMsg.className = 'form-msg error';
+      banMsg.textContent = 'Nothing selected';
+      return;
+    }
+    try {
+      const res = await fetch(`/api/repos/${encodeURIComponent(repoId)}/bans/remove`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ package_names: names }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        banMsg.className = 'form-msg error';
+        banMsg.textContent = data.error || `HTTP ${res.status}`;
+        return;
+      }
+      bansSelection.clear();
+      bansSlot.innerHTML = renderBannedList(data.banned);
+    } catch (err) {
+      banMsg.className = 'form-msg error';
+      banMsg.textContent = `Network error: ${err.message}`;
+    }
+  });
+
   void loadWarmed();
   void loadPackages();
   const [histRes, bansRes] = await Promise.all([
@@ -819,7 +1215,7 @@ async function toggleDetail(tr, repoId) {
   }
 
   warmBtn.addEventListener('click', async () => {
-    const selected = [...selectedKeys];
+    const selected = [...packageSelection.selected.keys()];
     if (!selected.length) {
       warmMsg.textContent = 'Nothing selected';
       warmMsg.className = 'form-msg error';
@@ -849,55 +1245,11 @@ async function toggleDetail(tr, repoId) {
     }
   });
 
-  // "remove from warmed" — click on ✕ in the warmed packages list
-  warmedSlot.addEventListener('click', async (ev) => {
-    const btn = ev.target.closest('[data-action="remove-warmed"]');
-    if (!btn) return;
-    try {
-      const res = await fetch(`/api/repos/${encodeURIComponent(repoId)}/warmed/remove`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ package_key: btn.dataset.key }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        warmMsg.textContent = data.error || `HTTP ${res.status}`;
-        warmMsg.className = 'form-msg error';
-        return;
-      }
-      await loadWarmed();
-    } catch (err) {
-      warmMsg.textContent = `Network error: ${err.message}`;
-      warmMsg.className = 'form-msg error';
-    }
-  });
-
-  // "unban" — click on ✕ in the ban list
-  bansSlot.addEventListener('click', async (ev) => {
-    const btn = ev.target.closest('[data-action="unban"]');
-    if (!btn) return;
-    try {
-      const res = await fetch(`/api/repos/${encodeURIComponent(repoId)}/bans/remove`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ package_name: btn.dataset.name }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        banMsg.textContent = data.error || `HTTP ${res.status}`;
-        banMsg.className = 'form-msg error';
-        return;
-      }
-      bansSlot.innerHTML = renderBannedList(data.banned);
-    } catch (err) {
-      banMsg.textContent = `Network error: ${err.message}`;
-      banMsg.className = 'form-msg error';
-    }
-  });
-
   banBtn.addEventListener('click', async () => {
-    const name = banNameInput.value.trim();
-    if (!name) {
+    // Comma-separated — a second way to ban several names at once, besides
+    // selecting packages in the queue above and using "Ban selected".
+    const names = banNameInput.value.split(',').map(n => n.trim()).filter(Boolean);
+    if (!names.length) {
       banMsg.textContent = 'Enter a package name';
       banMsg.className = 'form-msg error';
       return;
@@ -907,7 +1259,7 @@ async function toggleDetail(tr, repoId) {
       const res = await fetch(`/api/repos/${encodeURIComponent(repoId)}/bans`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ package_name: name }),
+        body: JSON.stringify({ package_names: names }),
       });
       const data = await res.json();
       if (!res.ok) {

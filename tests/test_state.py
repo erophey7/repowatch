@@ -19,6 +19,59 @@ def test_record_snapshot_persists_names(tmp_path):
     assert store.get_names("r") == {"linux-6.11.2-1": "linux"}
 
 
+def test_record_snapshot_persists_content_hash(tmp_path):
+    store = _store(tmp_path)
+    store.record_snapshot(RepoSnapshot(
+        repo_id="r", packages={"a-1": "a.deb"}, content_hashes={"a-1": "f" * 64},
+    ))
+    with store._connect() as conn:
+        assert conn.execute(
+            "SELECT content_hash FROM repo_packages WHERE repo_id = 'r' AND package_key = 'a-1'"
+        ).fetchone()[0] == "f" * 64
+
+
+def test_record_snapshot_leaves_content_hash_null_when_not_given(tmp_path):
+    store = _store(tmp_path)
+    store.record_snapshot(RepoSnapshot(repo_id="r", packages={"a-1": "a.apk"}))
+    with store._connect() as conn:
+        assert conn.execute(
+            "SELECT content_hash FROM repo_packages WHERE repo_id = 'r' AND package_key = 'a-1'"
+        ).fetchone()[0] is None
+
+
+def test_find_duplicate_files_groups_by_filename_and_hash_across_repos(tmp_path):
+    store = _store(tmp_path)
+    store.record_snapshot(RepoSnapshot(
+        repo_id="ubuntu", packages={"a-1": "pool/main/a/a.deb"}, content_hashes={"a-1": "f" * 64},
+    ))
+    store.record_snapshot(RepoSnapshot(
+        repo_id="debian", packages={"a-1": "pool/main/a/a.deb"}, content_hashes={"a-1": "f" * 64},
+    ))
+    # Same filename, DIFFERENT hash — must not be treated as a duplicate.
+    store.record_snapshot(RepoSnapshot(
+        repo_id="fork", packages={"b-1": "pool/main/a/a.deb"}, content_hashes={"b-1": "e" * 64},
+    ))
+    assert store.find_duplicate_files() == [("ubuntu", "debian", "pool/main/a/a.deb")]
+
+
+def test_find_duplicate_files_ignores_packages_without_a_hash(tmp_path):
+    store = _store(tmp_path)
+    store.record_snapshot(RepoSnapshot(repo_id="apk1", packages={"a-1": "same.apk"}))
+    store.record_snapshot(RepoSnapshot(repo_id="apk2", packages={"a-1": "same.apk"}))
+    assert store.find_duplicate_files() == []
+
+
+def test_find_duplicate_files_canonical_choice_is_stable_across_calls(tmp_path):
+    store = _store(tmp_path)
+    for repo_id in ("zzz", "aaa", "mmm"):
+        store.record_snapshot(RepoSnapshot(
+            repo_id=repo_id, packages={"a-1": "a.deb"}, content_hashes={"a-1": "f" * 64},
+        ))
+    result = store.find_duplicate_files()
+    assert result == store.find_duplicate_files()
+    assert all(canonical == "aaa" for _, canonical, _ in result)
+
+
 def test_record_snapshot_persists_normalized_packages_and_removes_old_rows(tmp_path):
     store = _store(tmp_path)
     store.record_snapshot(
@@ -156,6 +209,97 @@ def test_remove_warmed_package(tmp_path):
 def test_remove_warmed_package_returns_false_when_absent(tmp_path):
     store = _store(tmp_path)
     assert store.remove_warmed_package("r", "does-not-exist-1.0") is False
+
+
+def test_ban_packages_bulk_dedupes_and_ignores_repeats(tmp_path):
+    store = _store(tmp_path)
+    store.ban_package("r", "already-banned")
+    store.ban_packages("r", ["a", "b", "already-banned"])
+    assert store.get_banned_packages("r") == ["a", "already-banned", "b"]
+
+
+def test_ban_packages_bulk_noop_on_empty_list(tmp_path):
+    store = _store(tmp_path)
+    store.ban_packages("r", [])
+    assert store.get_banned_packages("r") == []
+
+
+def test_unban_packages_bulk(tmp_path):
+    store = _store(tmp_path)
+    store.ban_packages("r", ["a", "b", "c"])
+    store.unban_packages("r", ["a", "c", "never-was-banned"])
+    assert store.get_banned_packages("r") == ["b"]
+
+
+def test_remove_warmed_packages_bulk_counts_only_existing_rows(tmp_path):
+    store = _store(tmp_path)
+    store.record_warmed_package("r", "a-1", "a-1.apk", True, 200)
+    store.record_warmed_package("r", "b-1", "b-1.apk", True, 200)
+    store.record_warmed_package("r", "c-1", "c-1.apk", True, 200)
+
+    removed = store.remove_warmed_packages("r", ["a-1", "c-1", "does-not-exist"])
+
+    assert removed == 2
+    assert {p["package_key"] for p in store.get_warmed_packages("r")} == {"b-1"}
+
+
+def test_remove_warmed_packages_bulk_noop_on_empty_list(tmp_path):
+    store = _store(tmp_path)
+    store.record_warmed_package("r", "a-1", "a-1.apk", True, 200)
+    assert store.remove_warmed_packages("r", []) == 0
+    assert len(store.get_warmed_packages("r")) == 1
+
+
+def test_find_stale_warmed_finds_warmed_entries_with_no_current_package(tmp_path):
+    store = _store(tmp_path)
+    store.record_snapshot(RepoSnapshot("r", {"keep-1": "keep-1.deb"}))
+    store.record_warmed_package("r", "keep-1", "keep-1.deb", True, 200)
+    # Warmed but its package has since disappeared from the index — stale.
+    store.record_warmed_package("r", "gone-1", "gone-1.deb", True, 200)
+
+    stale = store.find_stale_warmed("r")
+
+    assert stale == [{"package_key": "gone-1", "filename": "gone-1.deb"}]
+
+
+def test_find_stale_warmed_empty_when_nothing_warmed_or_nothing_removed(tmp_path):
+    store = _store(tmp_path)
+    assert store.find_stale_warmed("r") == []
+    store.record_snapshot(RepoSnapshot("r", {"a-1": "a.deb"}))
+    store.record_warmed_package("r", "a-1", "a.deb", True, 200)
+    assert store.find_stale_warmed("r") == []
+
+
+def test_find_stale_warmed_is_scoped_per_repo(tmp_path):
+    store = _store(tmp_path)
+    store.record_warmed_package("repo-a", "gone-1", "gone-1.deb", True, 200)
+    assert store.find_stale_warmed("repo-a") == [{"package_key": "gone-1", "filename": "gone-1.deb"}]
+    assert store.find_stale_warmed("repo-b") == []
+
+
+def test_get_warmed_filenames_returns_only_the_requested_existing_keys(tmp_path):
+    store = _store(tmp_path)
+    store.record_warmed_package("r", "a-1", "a.deb", True, 200)
+    store.record_warmed_package("r", "b-1", "b.deb", True, 200)
+
+    assert store.get_warmed_filenames("r", ["a-1", "does-not-exist"]) == {"a-1": "a.deb"}
+    assert store.get_warmed_filenames("r", []) == {}
+
+
+def test_get_storage_stats_reports_db_size_and_table_counts(tmp_path):
+    store = _store(tmp_path)
+    store.record_snapshot(RepoSnapshot("r", {"a-1": "a.deb", "b-1": "b.deb"}))
+    store.record_warmed_package("r", "a-1", "a.deb", True, 200)
+    store.ban_package("r", "banned-name")
+
+    stats = store.get_storage_stats()
+
+    assert stats["state_db_bytes"] > 0
+    assert stats["tables"]["repo_packages"] == 2
+    assert stats["tables"]["warmed_packages"] == 1
+    assert stats["tables"]["prefetch_bans"] == 1
+    assert stats["tables"]["repo_events"] == 1  # the initial snapshot is itself a "change"
+    assert stats["tables"]["request_events"] == 0
 
 
 def test_record_snapshot_sets_package_count(tmp_path):

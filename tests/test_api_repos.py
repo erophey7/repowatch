@@ -6,18 +6,24 @@ from unittest.mock import patch
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from repowatch.api import (
     STATIC_DIR,
     add_repo_payload,
     ban_package_payload,
     banned_packages_payload,
+    cache_dir_stats,
     delete_repo_payload,
     healthz_payload,
     metrics_payload,
+    purge_candidates_payload,
+    purge_selected_payload,
     remove_warmed_package_payload,
     repos_list_payload,
     requests_summary_payload,
     safe_config_payload,
+    stats_payload,
     status_payload,
     unban_package_payload,
     update_repo_payload,
@@ -112,7 +118,7 @@ def test_repos_list_payload_falls_back_to_computed_count_when_package_count_is_n
             ("alpine-test", "2026-01-01T00:00:00+00:00"),
         )
         conn.execute(
-            "INSERT INTO repo_packages VALUES (?, ?, ?, ?)",
+            "INSERT INTO repo_packages (repo_id, package_key, package_name, filename) VALUES (?, ?, ?, ?)",
             ("alpine-test", "musl-1.2.5-r0", "musl", "musl-1.2.5-r0.apk"),
         )
 
@@ -311,10 +317,11 @@ def test_ban_package_unknown_repo_404(tmp_path):
     assert status == 404
 
 
-def test_ban_package_requires_package_name_in_body(tmp_path):
+@pytest.mark.parametrize("body", [{}, {"package_name": "musl"}, {"package_names": []}, {"package_names": "musl"}])
+def test_ban_package_requires_a_nonempty_package_names_list_in_body(tmp_path, body):
     config_path, store = _setup(tmp_path, admin_password="secret123")
 
-    status, data = ban_package_payload(config_path, store, "alpine-test", _session(config_path, "secret123"), {})
+    status, data = ban_package_payload(config_path, store, "alpine-test", _session(config_path, "secret123"), body)
 
     assert status == 400
 
@@ -323,7 +330,7 @@ def test_ban_then_unban_package_roundtrip(tmp_path):
     config_path, store = _setup(tmp_path, admin_password="secret123")
 
     status, data = ban_package_payload(
-        config_path, store, "alpine-test", _session(config_path, "secret123"), {"package_name": "musl"}
+        config_path, store, "alpine-test", _session(config_path, "secret123"), {"package_names": ["musl"]}
     )
     assert status == 200
     assert data["banned"] == ["musl"]
@@ -332,10 +339,29 @@ def test_ban_then_unban_package_roundtrip(tmp_path):
     assert banned == ["musl"]
 
     status, data = unban_package_payload(
-        config_path, store, "alpine-test", _session(config_path, "secret123"), {"package_name": "musl"}
+        config_path, store, "alpine-test", _session(config_path, "secret123"), {"package_names": ["musl"]}
     )
     assert status == 200
     assert data["banned"] == []
+
+
+def test_ban_then_unban_multiple_packages_at_once(tmp_path):
+    """The dashboard's "ban selected"/"unban selected" bulk actions send more
+    than one name in a single request — must not just handle a 1-element list."""
+    config_path, store = _setup(tmp_path, admin_password="secret123")
+    names = ["musl", "busybox", "openssl"]
+
+    status, data = ban_package_payload(
+        config_path, store, "alpine-test", _session(config_path, "secret123"), {"package_names": names}
+    )
+    assert status == 200
+    assert data["banned"] == sorted(names)
+
+    status, data = unban_package_payload(
+        config_path, store, "alpine-test", _session(config_path, "secret123"), {"package_names": ["musl", "openssl"]}
+    )
+    assert status == 200
+    assert data["banned"] == ["busybox"]
 
 
 def test_remove_warmed_package_disabled_without_admin_password(tmp_path):
@@ -353,12 +379,38 @@ def test_remove_warmed_package_removes_existing_entry(tmp_path):
     store.record_warmed_package("alpine-test", "musl-1.2.5-r0", "musl-1.2.5-r0.apk", True, 200)
 
     status, data = remove_warmed_package_payload(
-        config_path, store, "alpine-test", _session(config_path, "secret123"), {"package_key": "musl-1.2.5-r0"}
+        config_path, store, "alpine-test", _session(config_path, "secret123"), {"package_keys": ["musl-1.2.5-r0"]}
     )
 
     assert status == 200
-    assert data["removed"] is True
+    assert data["removed"] == 1
     assert store.get_warmed_packages("alpine-test") == []
+
+
+def test_remove_multiple_warmed_packages_at_once(tmp_path):
+    config_path, store = _setup(tmp_path, admin_password="secret123")
+    store.record_warmed_package("alpine-test", "a-1", "a-1.apk", True, 200)
+    store.record_warmed_package("alpine-test", "b-1", "b-1.apk", True, 200)
+    store.record_warmed_package("alpine-test", "c-1", "c-1.apk", True, 200)
+
+    status, data = remove_warmed_package_payload(
+        config_path, store, "alpine-test", _session(config_path, "secret123"),
+        {"package_keys": ["a-1", "c-1", "does-not-exist"]},
+    )
+
+    assert status == 200
+    assert data["removed"] == 2  # only a-1/c-1 actually existed
+    assert {p["package_key"] for p in store.get_warmed_packages("alpine-test")} == {"b-1"}
+
+
+@pytest.mark.parametrize("body", [{}, {"package_key": "x"}, {"package_keys": []}, {"package_keys": "x"}])
+def test_remove_warmed_package_requires_a_nonempty_package_keys_list(tmp_path, body):
+    config_path, store = _setup(tmp_path, admin_password="secret123")
+
+    status, data = remove_warmed_package_payload(
+        config_path, store, "alpine-test", _session(config_path, "secret123"), body)
+
+    assert status == 400
 
 
 def test_remove_warmed_package_unknown_repo_404(tmp_path):
@@ -462,7 +514,7 @@ def test_metrics_payload_falls_back_to_computed_count_when_package_count_is_null
             ("alpine-test", "2026-01-01T00:00:00+00:00"),
         )
         conn.execute(
-            "INSERT INTO repo_packages VALUES (?, ?, ?, ?)",
+            "INSERT INTO repo_packages (repo_id, package_key, package_name, filename) VALUES (?, ?, ?, ?)",
             ("alpine-test", "musl-1.2.5-r0", "musl", "musl-1.2.5-r0.apk"),
         )
 
@@ -924,3 +976,221 @@ def test_alt_schema_saved_and_conflicting_route_rejected_atomically(tmp_path):
     assert status == 400
     assert 'conflicting' in result['error']
     assert path.read_bytes() == before
+
+
+def test_stats_payload_reports_db_size_without_walking_the_cache_dir_by_default(tmp_path):
+    config_path, store = _setup(tmp_path)
+    store.record_snapshot(RepoSnapshot("alpine-test", {"a-1": "a.apk"}))
+
+    status, payload = stats_payload(config_path, store)
+
+    assert status == 200
+    assert payload["state_db_bytes"] > 0
+    assert payload["tables"]["repo_packages"] == 1
+    assert "cache_dir" not in payload
+
+
+def test_stats_payload_cache_dir_is_none_when_not_configured(tmp_path):
+    config_path, store = _setup(tmp_path)
+
+    status, payload = stats_payload(config_path, store, include_cache_dir=True)
+
+    assert status == 200
+    assert payload["cache_dir"] is None
+
+
+def test_stats_payload_walks_the_real_cache_dir_when_configured(tmp_path):
+    cache_dir = tmp_path / "nginx-cache"
+    (cache_dir / "1" / "23").mkdir(parents=True)
+    (cache_dir / "1" / "23" / "somefile").write_bytes(b"x" * 100)
+    (cache_dir / "1" / "23" / "otherfile").write_bytes(b"y" * 50)
+    config_path = _write_config(
+        tmp_path,
+        f"""  - id: alpine-test
+    type: apk
+    upstream: https://example.org/alpine/v3.20/main
+    arch: x86_64
+nginx:
+  enabled: true
+  cache_dir: {cache_dir}
+""",
+    )
+    store = StateStore(load_config(config_path).state_db)
+
+    status, payload = stats_payload(config_path, store, include_cache_dir=True)
+
+    assert status == 200
+    assert payload["cache_dir"] == {"path": str(cache_dir), "size_bytes": 150, "file_count": 2}
+
+
+def test_cache_dir_stats_raises_for_a_missing_path(tmp_path):
+    with pytest.raises(OSError):
+        cache_dir_stats(str(tmp_path / "does-not-exist"))
+
+
+def test_cache_dir_stats_flags_undercount_from_inaccessible_subdirectories(tmp_path):
+    """Real production finding (2026-09-10): nginx creates proxy_cache_path's
+    levels=1:2 subdirectories 0700, owned by the nginx worker user — the
+    repowatch service user (a DIFFERENT, unprivileged user by design) cannot
+    read into them at all. os.walk()'s default onerror is a silent no-op,
+    which made a permission-blocked, actually-41GB cache report "0 bytes" —
+    indistinguishable from genuinely empty. Must surface the gap instead."""
+    cache_dir = tmp_path / "nginx-cache"
+    readable = cache_dir / "0"
+    readable.mkdir(parents=True)
+    (readable / "somefile").write_bytes(b"x" * 100)
+    blocked = cache_dir / "1"
+    blocked.mkdir()
+    (blocked / "hidden").write_bytes(b"y" * 999)
+    blocked.chmod(0o000)
+    try:
+        result = cache_dir_stats(str(cache_dir))
+        assert result["size_bytes"] == 100  # only the readable subdirectory counted
+        assert result["file_count"] == 1
+        assert result["inaccessible_directories"] == 1
+    finally:
+        blocked.chmod(0o755)  # tmp_path cleanup needs to be able to remove it
+
+
+def test_stats_payload_surfaces_a_missing_cache_dir_as_an_error_not_zero(tmp_path):
+    missing = tmp_path / "does-not-exist"
+    config_path = _write_config(
+        tmp_path,
+        f"""  - id: alpine-test
+    type: apk
+    upstream: https://example.org/alpine/v3.20/main
+    arch: x86_64
+nginx:
+  enabled: true
+  cache_dir: {missing}
+""",
+    )
+    store = StateStore(load_config(config_path).state_db)
+
+    status, payload = stats_payload(config_path, store, include_cache_dir=True)
+
+    assert status == 200
+    assert "error" in payload["cache_dir"]
+
+
+def _setup_purge(tmp_path, admin_password="secret123", enable_purge=True):
+    config_path = _write_config(
+        tmp_path,
+        f"""  - id: alpine-test
+    type: apk
+    upstream: https://example.org/alpine/v3.20/main
+    arch: x86_64
+nginx:
+  enabled: true
+  enable_purge: {"true" if enable_purge else "false"}
+""",
+        admin_password=admin_password,
+    )
+    store = StateStore(load_config(config_path).state_db)
+    return config_path, store
+
+
+def test_purge_candidates_payload_lists_stale_warmed_entries_and_enable_purge_flag(tmp_path):
+    config_path, store = _setup_purge(tmp_path)
+    store.record_snapshot(RepoSnapshot("alpine-test", {"keep-1": "keep-1.apk"}))
+    store.record_warmed_package("alpine-test", "keep-1", "keep-1.apk", True, 200)
+    store.record_warmed_package("alpine-test", "gone-1", "gone-1.apk", True, 200)
+
+    status, payload = purge_candidates_payload(config_path, store, "alpine-test")
+
+    assert status == 200
+    assert payload["enable_purge"] is True
+    assert payload["candidates"] == [{"package_key": "gone-1", "filename": "gone-1.apk"}]
+
+
+def test_purge_candidates_payload_reports_enable_purge_false(tmp_path):
+    config_path, store = _setup_purge(tmp_path, enable_purge=False)
+    status, payload = purge_candidates_payload(config_path, store, "alpine-test")
+    assert status == 200
+    assert payload["enable_purge"] is False
+
+
+def test_purge_candidates_payload_unknown_repo_404(tmp_path):
+    config_path, store = _setup_purge(tmp_path)
+    status, payload = purge_candidates_payload(config_path, store, "does-not-exist")
+    assert status == 404
+
+
+def test_purge_selected_payload_disabled_without_admin_password(tmp_path):
+    config_path, store = _setup_purge(tmp_path, admin_password=None)
+    status, payload = purge_selected_payload(
+        config_path, store, "alpine-test", _session(config_path, "whatever"), {"package_keys": ["x"]}
+    )
+    assert status == 501
+
+
+def test_purge_selected_payload_rejects_wrong_password(tmp_path):
+    config_path, store = _setup_purge(tmp_path)
+    status, payload = purge_selected_payload(
+        config_path, store, "alpine-test", _session(config_path, "wrong"), {"package_keys": ["x"]}
+    )
+    assert status == 401
+
+
+def test_purge_selected_payload_unknown_repo_404(tmp_path):
+    config_path, store = _setup_purge(tmp_path)
+    status, payload = purge_selected_payload(
+        config_path, store, "does-not-exist", _session(config_path, "secret123"), {"package_keys": ["x"]}
+    )
+    assert status == 404
+
+
+def test_purge_selected_payload_400_when_enable_purge_is_off(tmp_path):
+    config_path, store = _setup_purge(tmp_path, enable_purge=False)
+    store.record_warmed_package("alpine-test", "gone-1", "gone-1.apk", True, 200)
+
+    status, payload = purge_selected_payload(
+        config_path, store, "alpine-test", _session(config_path, "secret123"), {"package_keys": ["gone-1"]}
+    )
+
+    assert status == 400
+    assert "enable_purge" in payload["error"]
+
+
+@pytest.mark.parametrize("body", [{}, {"package_key": "x"}, {"package_keys": []}, {"package_keys": "x"}])
+def test_purge_selected_payload_requires_a_nonempty_package_keys_list(tmp_path, body):
+    config_path, store = _setup_purge(tmp_path)
+    status, payload = purge_selected_payload(
+        config_path, store, "alpine-test", _session(config_path, "secret123"), body
+    )
+    assert status == 400
+
+
+def test_purge_selected_payload_purges_and_cleans_up_warmed_bookkeeping(tmp_path, monkeypatch):
+    """End-to-end through the payload function (not the real network) —
+    filenames are re-derived from warmed_packages, never trusted from the
+    request body, and a confirmed outcome (purged/not_cached) removes the
+    now-meaningless warmed_packages row so a re-scan doesn't show it again."""
+    config_path, store = _setup_purge(tmp_path)
+    store.record_warmed_package("alpine-test", "purged-1", "purged-1.apk", True, 200)
+    store.record_warmed_package("alpine-test", "already-gone-1", "already-gone-1.apk", True, 200)
+    store.record_warmed_package("alpine-test", "flaky-1", "flaky-1.apk", True, 200)
+
+    async def fake_purge_selected(config, repo, items):
+        assert items == {
+            "purged-1": "purged-1.apk",
+            "already-gone-1": "already-gone-1.apk",
+            "flaky-1": "flaky-1.apk",
+            # a client-supplied filename for a key not actually in
+            # warmed_packages must never reach here at all (re-derived
+            # server-side, absent keys silently drop out of `items`)
+        }
+        return {"purged-1": "purged", "already-gone-1": "not_cached", "flaky-1": "error (timeout)"}
+
+    monkeypatch.setattr("repowatch.api.purge_selected", fake_purge_selected)
+
+    status, payload = purge_selected_payload(
+        config_path, store, "alpine-test", _session(config_path, "secret123"),
+        {"package_keys": ["purged-1", "already-gone-1", "flaky-1", "not-actually-warmed"]},
+    )
+
+    assert status == 200
+    assert payload["results"] == {"purged-1": "purged", "already-gone-1": "not_cached", "flaky-1": "error (timeout)"}
+    assert payload["not_found"] == ["not-actually-warmed"]
+    remaining = {p["package_key"] for p in store.get_warmed_packages("alpine-test")}
+    assert remaining == {"flaky-1"}  # only the errored one survives for a retry

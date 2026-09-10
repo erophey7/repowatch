@@ -97,21 +97,30 @@ def _parse_packages_gz(raw: bytes) -> list[PackageRef]:
     name: str | None = None
     version: str | None = None
     filename: str | None = None
+    content_hash: str | None = None
 
     for line in text.splitlines():
         if line.startswith("Package:"):
             # start of a new stanza — save the previous one if it was complete
             if name and version:
-                packages.append(PackageRef(name=name, version=version, filename=filename))
+                packages.append(PackageRef(name=name, version=version, filename=filename, content_hash=content_hash))
             name = line.split(":", 1)[1].strip()
             version = None
             filename = None
+            content_hash = None
         elif line.startswith("Version:"):
             version = line.split(":", 1)[1].strip()
         elif line.startswith("Filename:"):
             filename = line.split(":", 1)[1].strip()
+        elif line.startswith("SHA256:"):
+            # Standard per-stanza field, distinct from the by-hash SHA256 of
+            # the whole Packages.gz index checked elsewhere (gpgverify.py) —
+            # this one is per package file, used for cross-repo dedup
+            # (docs_dev/ROADMAP.md item 29).
+            value = line.split(":", 1)[1].strip()
+            content_hash = value if re.fullmatch(r"[0-9a-fA-F]{64}", value) else None
 
     if name and version:
-        packages.append(PackageRef(name=name, version=version, filename=filename))
+        packages.append(PackageRef(name=name, version=version, filename=filename, content_hash=content_hash))
 
     return packages

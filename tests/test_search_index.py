@@ -28,7 +28,7 @@ def test_search_migration_update_delete_and_reopen(tmp_path):
         for trigger in ('insert', 'update', 'delete'):
             conn.execute('DROP TRIGGER package_search_' + trigger)
         conn.execute('DROP TABLE package_search')
-        conn.execute("INSERT INTO repo_packages VALUES ('a','old-1','old','file')")
+        conn.execute("INSERT INTO repo_packages (repo_id, package_key, package_name, filename) VALUES ('a','old-1','old','file')")
     store = StateStore(path)
     assert store.get_page('packages', 'a', q='old')['items']
     with store._connect() as conn:

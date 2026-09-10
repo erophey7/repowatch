@@ -39,6 +39,54 @@ def test_check_config_valid_does_not_create_state_db(tmp_path):
     assert not (tmp_path / "state.sqlite3").exists()
 
 
+def test_stats_prints_db_size_and_table_counts(tmp_path, capsys):
+    config_path = _write_config(tmp_path)
+
+    rc = main(["-c", str(config_path), "stats"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "state_db:" in out
+    assert "bytes)" in out
+    for table in ("repo_packages", "repo_events", "request_events", "warmed_packages", "prefetch_bans"):
+        assert f"{table}: 0 row(s)" in out
+    assert "cache_dir" not in out
+
+
+def test_stats_cache_dir_flag_reports_not_set_without_nginx_cache_dir(tmp_path, capsys):
+    config_path = _write_config(tmp_path)
+
+    rc = main(["-c", str(config_path), "stats", "--cache-dir"])
+
+    assert rc == 0
+    assert "not set in config.yaml" in capsys.readouterr().out
+
+
+def test_stats_cache_dir_flag_walks_the_configured_directory(tmp_path, capsys):
+    cache_dir = tmp_path / "nginx-cache"
+    (cache_dir / "1").mkdir(parents=True)
+    (cache_dir / "1" / "f").write_bytes(b"x" * 42)
+    config_path = _write_config(tmp_path, f"nginx:\n  enabled: true\n  cache_dir: {cache_dir}\n")
+
+    rc = main(["-c", str(config_path), "stats", "--cache-dir"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert str(cache_dir) in out
+    assert "42 bytes" in out
+    assert "1 file(s)" in out
+
+
+def test_stats_cache_dir_flag_fails_clearly_for_a_missing_directory(tmp_path, capsys):
+    missing = tmp_path / "does-not-exist"
+    config_path = _write_config(tmp_path, f"nginx:\n  enabled: true\n  cache_dir: {missing}\n")
+
+    rc = main(["-c", str(config_path), "stats", "--cache-dir"])
+
+    assert rc == 1
+    assert "error" in capsys.readouterr().err
+
+
 def test_check_config_invalid_returns_one(tmp_path, capsys):
     config_path = tmp_path / "config.yaml"
     config_path.write_text("this is not valid yaml: [unclosed")

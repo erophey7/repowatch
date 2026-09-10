@@ -256,6 +256,48 @@ def test_check_repo_end_to_end_version_churn_updates_packages_and_history(tmp_pa
     assert summary["changed_at"] is not None
 
 
+def test_check_repo_calls_purge_removed_with_removed_filenames(tmp_path, monkeypatch):
+    """docs_dev/ROADMAP.md item 24: check_repo must hand the REMOVED
+    package's filename (not just its key) to purge_removed the moment the
+    diff confirms it's gone — purge_removed itself no-ops unless
+    nginx.enable_purge is set, this test is only about the wiring."""
+    calls = []
+
+    class _ChurningParser:
+        def __init__(self, repo):
+            self.repo = repo
+
+        async def check_index_changed(self, client, prev_etag, prev_last_modified):
+            return IndexHeadResult(unchanged=False, etag=None, last_modified=None)
+
+        async def fetch(self, client):
+            calls.append(1)
+            if len(calls) == 1:
+                packages = {"linux-headers-6.11.2-1": "linux-headers-6.11.2-1-x86_64.pkg.tar.zst"}
+            else:
+                packages = {}
+            return RepoSnapshot(repo_id=self.repo.id, packages=packages)
+
+    store = StateStore(tmp_path / "state.sqlite3")
+    repo = RepoConfig(
+        id="r", type="pacman", upstream="https://example.org", arch="x86_64",
+        repo_name="core", prefetch=False,
+    )
+    config = _config(repos=[repo])
+    monkeypatch.setitem(watcher.PARSERS, "pacman", _ChurningParser)
+
+    purge_calls = []
+    async def fake_purge_removed(cfg, r, removed):
+        purge_calls.append((r.id, removed))
+    monkeypatch.setattr(watcher, "purge_removed", fake_purge_removed)
+
+    asyncio.run(check_repo(config, repo, store))
+    assert purge_calls == []  # nothing removed yet on the first check
+
+    asyncio.run(check_repo(config, repo, store))
+    assert purge_calls == [("r", {"linux-headers-6.11.2-1": "linux-headers-6.11.2-1-x86_64.pkg.tar.zst"})]
+
+
 def test_run_forever_invokes_check_all_and_prune_all_on_its_own_timer(tmp_path, monkeypatch):
     """Regression for the wiring itself: prune_all/check_all are each
     covered individually elsewhere, but nothing previously exercised that

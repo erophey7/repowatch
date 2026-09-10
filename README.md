@@ -23,9 +23,8 @@ state stored in one SQLite file.
 
 **Contents:** [Features](#features) · [Repository layout](#repository-layout)
 · [Quick start](#quick-start-dev) · [System install](#system-install) ·
-[Requirements](#requirements) · [Project status](#project-status) ·
-[Documentation](#documentation) · [Contributing](#contributing) ·
-[License](#license)
+[Requirements](#requirements) · [Documentation](#documentation) ·
+[Contributing](#contributing) · [License](#license)
 
 ## Features
 
@@ -40,10 +39,14 @@ state stored in one SQLite file.
   configurable per repository.
 - **`status.json` / `/healthz` / `/metrics`**: a minimal HTTP contract for
   automated clients, a liveness check, and Prometheus-format metrics.
-- **Web dashboard**: view/add/edit repositories, trigger manual warms, ban
-  individual packages from auto-warming, group repositories into collapsible
-  sections, see charts of what clients actually requested — a plain static
-  page, no build step or JS frameworks.
+- **Web dashboard**: view/add/edit repositories, trigger manual warms
+  (individually or in bulk, including "select all matching the current
+  filter" across the whole package index, not just what's on screen),
+  ban/unban packages from auto-warming individually or in bulk, remove
+  warmed-tracking entries individually or in bulk, group repositories into
+  collapsible sections, see charts of what clients actually requested, and a
+  storage panel (state_db size, per-table row counts, on-demand nginx cache
+  directory size) — a plain static page, no build step or JS frameworks.
 - **Access control**: admin password (session + CSRF), separate revocable
   tokens for status-API host clients (optionally restricted to specific
   repo IDs), an optional guest read-only mode.
@@ -54,6 +57,14 @@ state stored in one SQLite file.
   match whatever path scheme your clients expect.
 - **Webhook notifications** on repeated warm/signature-check failures
   (Slack/Mattermost/Discord-compatible JSON).
+- **Cache purge**: evict a package's cache entry the moment it disappears
+  from the upstream index, automatically, plus a manual "scan stale entries
+  → confirm → purge" flow in the dashboard for anything left behind. Needs
+  the third-party `ngx_cache_purge` nginx module — off by default.
+- **Cross-repository dedup**: when two different repositories (e.g. Debian
+  and Ubuntu) publish the byte-identical file, cache and serve it once via
+  an nginx-level rewrite instead of twice, detected from index checksums
+  already parsed (apt/pacman/dnf only) — off by default.
 - **Self-update**: `repowatch self-update` checks GitHub Releases and
   installs a newer, checksum-verified version — no source checkout needed.
 
@@ -85,6 +96,7 @@ repowatch -c config/config.yaml serve-status   # HTTP server with status.json
 repowatch -c config/config.yaml run            # daemon with scheduled checks (systemd-oriented)
 repowatch -c config/config.yaml supervise      # same, for environments without systemd
 repowatch -c config/config.yaml backup ./out   # one-shot SQLite backup, no dependencies beyond stdlib
+repowatch -c config/config.yaml stats          # state_db size + row counts; --cache-dir also walks nginx.cache_dir
 repowatch self-update --repo owner/name --check  # check GitHub Releases; no config.yaml needed
 ```
 
@@ -109,17 +121,42 @@ or restarting services is a separate, explicit `make activate`.
 
 ## Requirements
 
-Python 3.11+, `PyYAML`, `httpx`; signature verification needs system `gpgv`
-(apt/pacman/RPM-MD) and either `openssl` or `apk-tools >= 3.0` (apk). The
-caching layer needs nginx (or a compatible proxy, if you're not using the
-built-in config generator). No external database — state lives in a single
-SQLite file.
+**Build** (only to build a wheel or install from source):
 
-## Project status
+- Python 3.11+ with `pip` and `venv`.
+- `setuptools >= 68` — the build backend declared in `pyproject.toml`, pulled
+  in automatically by `pip`; nothing to install by hand.
 
-Actively developed. All parsers, cache warming, the dashboard, signature
-verification, and nginx generation listed above are implemented, covered by
-tests, and exercised against real mirrors.
+**Runtime, required:**
+
+- Python 3.11+.
+- `PyYAML >= 6.0`, `httpx >= 0.27` — installed automatically as package
+  dependencies.
+- SQLite, via Python's stdlib `sqlite3` — no separate database server.
+
+**Runtime, recommended** (each gates one specific feature; without it, the
+rest of repowatch runs normally):
+
+- `nginx` — the actual caching layer. repowatch generates and applies its
+  config (`nginx-render`/`nginx-apply`) but doesn't serve HTTP itself; you
+  can run a hand-written nginx config instead and skip this.
+  - third-party `ngx_cache_purge` module (Debian/Ubuntu:
+    `libnginx-mod-http-cache-purge`; Arch: `nginx-mod-cache_purge`) — only if
+    `nginx.enable_purge` is on.
+- `gpgv` — signature verification for apt/pacman/RPM-MD/apt-rpm repositories
+  with `verify_signature: true`.
+- `openssl`, or `apk-tools >= 3.0` — signature verification for apk
+  repositories with `verify_signature: true` (apk uses a different, non-GPG
+  scheme; see `apk_signature_backend` in
+  [docs/configuration.md](docs/configuration.md)).
+- `systemd` — production process supervision. Without it, run
+  `repowatch supervise` instead (see
+  [docs/deployment.md](docs/deployment.md#running-without-systemd)).
+- Python 3.14+ — only if an RPM-MD repository publishes
+  Zstandard-compressed metadata (stdlib `compression.zstd`).
+
+Run `make check` for a read-only diagnostic of what's actually present on a
+given host (`OK`/`WARN`/`FAIL` per item).
 
 ## Documentation
 

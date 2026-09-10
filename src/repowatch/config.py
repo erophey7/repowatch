@@ -146,10 +146,35 @@ class NginxConfig:
     # read. To actually change the cache directory, use
     # `CACHE_DIR=... make install && sudo make activate`/`nginx-apply`.
     cache_dir: str | None = None
+    # Active cache eviction on package removal (see docs_dev/ROADMAP.md item
+    # 24) via the third-party ngx_cache_purge nginx module — NOT bundled
+    # with stock nginx, and NOT the nginx-plus proxy_cache_purge API. Off by
+    # default: without it, behavior is exactly as before (inactive=/
+    # max_size= are the only eviction, see nginx.py) — enabling this doesn't
+    # change existing configs' rendered output at all besides adding the
+    # purge locations. The operator must separately add
+    # `load_module ".../ngx_http_cache_purge_module.so";` to their own main
+    # nginx.conf (a main-context directive — the generated file here lives
+    # inside http{}/sites-enabled, which can't emit it); nginx -t during
+    # nginx-apply catches a missing module with a clear error and rolls
+    # back, same as any other bad generated config.
+    enable_purge: bool = False
+    # docs_dev/ROADMAP.md item 29 — reroute a package request to another
+    # repository's already-cached copy when the index reports the SAME
+    # filename+SHA256 in more than one repo (real dedup, saves both origin
+    # bandwidth and cache disk — see nginx.render_dedup()). Off by default,
+    # no effect on existing configs' rendered output when disabled. Only
+    # apt/pacman/dnf packages currently carry a comparable SHA256 (see
+    # PackageRef.content_hash) — apk/apt-rpm files never participate.
+    enable_dedup: bool = False
 
     def __post_init__(self) -> None:
         if type(self.enabled) is not bool:
             raise ConfigError("nginx.enabled: must be a bool")
+        if type(self.enable_purge) is not bool:
+            raise ConfigError("nginx.enable_purge: must be a bool")
+        if type(self.enable_dedup) is not bool:
+            raise ConfigError("nginx.enable_dedup: must be a bool")
         if not isinstance(self.listen, str) or not re.fullmatch(r"(?:[0-9.]+:)?[0-9]{1,5}", self.listen):
             raise ConfigError("nginx.listen: a port or IPv4:port string")
         host, _, port = self.listen.rpartition(":")
