@@ -16,6 +16,9 @@ import io
 import lzma
 from pathlib import PurePosixPath
 import re
+import shutil
+import subprocess
+import tempfile
 from typing import BinaryIO
 from urllib.parse import urlsplit
 import xml.etree.ElementTree as ET
@@ -112,6 +115,71 @@ def _verify_bytes(raw: bytes, algorithm: str | None, digest: str | None, size: i
         raise SignatureError('dnf: primary checksum does not match repomd.xml')
 
 
+class _ZstdSubprocessStream:
+    """Streaming Zstandard decompression via the system `zstd` binary
+    (subprocess), not stdlib `compression.zstd` (Python 3.14+) — same
+    "external tool for one feature" pattern already used for
+    gpgv/openssl/apk-tools elsewhere in this project, and for XBPS's own
+    repodata decompression (see parsers/xbps.py, converted the same way
+    after the same reasoning: gating this on a Python 3.14+-only stdlib
+    module would raise the whole project's floor for one optional
+    compression format).
+
+    Streams the decompressed bytes from the subprocess's stdout — a
+    read(size) never materializes the whole decompressed primary.xml in
+    memory at once, same memory profile gzip.GzipFile/lzma.LZMAFile already
+    have for the other branches here. That streaming is not cosmetic: on a
+    real Rocky primary.gz (~23MB compressed / ~168MB XML), switching this
+    module to streaming cut peak RSS from ~399 to ~65 MiB — a
+    subprocess.run()-style "decompress everything into one bytes object up
+    front" would silently regress that.
+
+    The compressed input is written to a temp file rather than piped via
+    stdin: writing a large payload directly to a subprocess's stdin can
+    deadlock if its stdout pipe fills up before anything drains it (nothing
+    reads stdout until decompression is already underway) — a temp file
+    sidesteps that without needing a second thread just to feed stdin.
+    """
+
+    def __init__(self, raw: bytes):
+        self._tmp = tempfile.NamedTemporaryFile(suffix='.zst')
+        try:
+            self._tmp.write(raw)
+            self._tmp.flush()
+            self._process = subprocess.Popen(
+                ['zstd', '-d', '-c', '-q', self._tmp.name],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+        except Exception:
+            self._tmp.close()
+            raise
+
+    def read(self, size: int = -1) -> bytes:
+        return self._process.stdout.read(size)
+
+    def close(self) -> None:
+        try:
+            self._process.stdout.close()
+            self._process.wait(timeout=60)
+            stderr = self._process.stderr.read()
+        finally:
+            self._tmp.close()
+        if self._process.returncode != 0:
+            # Caught even if iterparse already "succeeded" on a truncated
+            # stream (see _checked_primary — its `return` sits inside the
+            # `with` block, so __exit__/close() below still runs, and a
+            # raise here replaces the pending return) — a corrupted/
+            # truncated zstd stream must not be silently accepted just
+            # because the truncation happened to land on valid-looking XML.
+            raise ValueError(f'dnf: zstd decompression failed: {stderr.decode(errors="replace")[-500:]}')
+
+    def __enter__(self) -> '_ZstdSubprocessStream':
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+
 def _open_primary(raw: bytes, href: str) -> BinaryIO:
     source = io.BytesIO(raw)
     if href.endswith('.gz'):
@@ -121,11 +189,9 @@ def _open_primary(raw: bytes, href: str) -> BinaryIO:
     if href.endswith('.bz2'):
         return bz2.BZ2File(source)
     if href.endswith(('.zst', '.zstd')):
-        try:
-            from compression import zstd
-        except ImportError as exc:
-            raise ValueError('dnf: primary Zstandard requires Python 3.14+ with the compression.zstd module') from exc
-        return zstd.ZstdFile(source)
+        if shutil.which('zstd') is None:
+            raise ValueError('dnf: primary is Zstandard-compressed — install the system "zstd" package')
+        return _ZstdSubprocessStream(raw)
     if href.endswith('.xml'):
         return source
     raise ValueError(f'dnf: unsupported primary compression: {href!r}')

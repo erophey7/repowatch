@@ -35,7 +35,10 @@ CREATE TABLE IF NOT EXISTS repo_state (
     changed_at    TEXT,
     index_etag    TEXT,           -- index ETag from the previous check (for HEAD comparison)
     index_last_modified TEXT,     -- index Last-Modified from the previous check
-    package_count INTEGER
+    package_count INTEGER,
+    key_expires_at TEXT           -- soonest GPG key expiry in this repo's keyring, from the
+                                   -- last check cycle (see gpgverify.soonest_key_expiry); NULL
+                                   -- for apk repos, unsigned repos, or when unknown
 );
 
 -- Current snapshot: the single source of truth for package data.
@@ -62,19 +65,28 @@ CREATE TABLE IF NOT EXISTS repo_events (
 CREATE INDEX IF NOT EXISTS idx_repo_events_repo_ts ON repo_events(repo_id, ts DESC);
 
 CREATE TABLE IF NOT EXISTS request_events (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts           TEXT NOT NULL,
-    repo_id      TEXT,           -- best-effort match by path prefix, may be NULL
-    client_ip    TEXT,           -- $remote_addr from nginx, may be NULL (old log_format)
-    method       TEXT NOT NULL,
-    path         TEXT NOT NULL,
-    status       TEXT,
-    cache_status TEXT
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts               TEXT NOT NULL,
+    repo_id          TEXT,           -- best-effort match by path prefix, may be NULL
+    client_ip        TEXT,           -- $remote_addr from nginx, may be NULL (old log_format)
+    method           TEXT NOT NULL,
+    path             TEXT NOT NULL,
+    status           TEXT,
+    cache_status     TEXT,
+    package_key      TEXT,           -- set only when exactly one repo's known packages
+    package_repo_id  TEXT            -- contain this basename (see match_all_package_keys);
+                                      -- independent of repo_id above, which is prefix-based
+                                      -- and can disagree (e.g. NULL on an ambiguous shared
+                                      -- pool/) or point at a different repo entirely
 );
 
 CREATE INDEX IF NOT EXISTS idx_request_events_repo_ts ON request_events(repo_id, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_request_events_ts ON request_events(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_request_events_repo_id ON request_events(repo_id, id DESC);
+-- idx_request_events_package is created in _migrate(), not here: it
+-- references package_key/package_repo_id, which on an existing (pre-item-19)
+-- database only exist after _migrate()'s ALTER TABLE runs — see the
+-- identical reasoning on idx_repo_packages_hash below.
 
 -- Current warm state (not an event log — one row per package, upserted on
 -- every warm attempt). Packages long gone from upstream are never written
@@ -88,6 +100,9 @@ CREATE TABLE IF NOT EXISTS warmed_packages (
     warmed_at   TEXT NOT NULL,
     status      TEXT NOT NULL,   -- "ok" | "failed"
     http_status INTEGER,
+    source      TEXT,            -- "prefetch" (repowatch warmed it ahead of demand) |
+                                  -- "client" (first seen via a real client request) |
+                                  -- NULL for rows written before this column existed
     PRIMARY KEY (repo_id, package_key)
 );
 
@@ -298,6 +313,27 @@ class StateStore:
             return None, None
         return row[0], row[1]
 
+    def record_key_expiry(self, repo_id: str, expires_at: str | None) -> None:
+        """Soonest GPG key expiry for this repo's keyring, from the current
+        check cycle (see gpgverify.soonest_key_expiry, watcher.check_repo).
+        An upsert, not a plain UPDATE — this can run before the first
+        record_snapshot()/touch_last_check() of a brand-new repository ever
+        creates its repo_state row (the key-expiry check runs unconditionally
+        at the top of every cycle, independent of whether the index itself
+        changed, so a quiet repository that rarely changes still gets its
+        key checked on schedule). The placeholder last_check this INSERT
+        branch writes is immediately superseded later in the same cycle by
+        the real touch_last_check()/record_snapshot() call."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO repo_state (repo_id, last_check, key_expires_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(repo_id) DO UPDATE SET key_expires_at = excluded.key_expires_at
+                """,
+                (repo_id, _utcnow(), expires_at),
+            )
+
     def touch_last_check(self, repo_id: str) -> None:
         """Update only last_check — used when a HEAD check showed the index
         is unchanged and the full cycle (download/parse/diff) was skipped."""
@@ -316,9 +352,12 @@ class StateStore:
         poll. The HTTP status.json also uses this compact selection.
         """
         with self._connect() as conn:
-            rows = conn.execute("SELECT repo_id, last_check, changed_at, package_count FROM repo_state").fetchall()
+            rows = conn.execute(
+                "SELECT repo_id, last_check, changed_at, package_count, key_expires_at FROM repo_state"
+            ).fetchall()
             warmed = dict(conn.execute("SELECT repo_id, COUNT(*) FROM warmed_packages GROUP BY repo_id")) if include_warmed else {}
-        result = {row[0]: {"last_check": row[1], "changed_at": row[2], "package_count": row[3]} for row in rows}
+        result = {row[0]: {"last_check": row[1], "changed_at": row[2], "package_count": row[3],
+                            "key_expires_at": row[4]} for row in rows}
         if include_warmed:
             # Keep the count even for orphaned warmed rows without repo_state:
             # a per-repo count shouldn't require a snapshot to exist either.
@@ -384,25 +423,37 @@ class StateStore:
         filename: str,
         ok: bool,
         http_status: int | None,
+        source: str = "prefetch",
     ) -> None:
-        """Record the outcome of one warm attempt for a single package. This
-        reflects what repowatch itself tried to warm and with what result —
-        NOT a live check of the current nginx cache state (the file could
-        have since been evicted by proxy_cache_path's inactive/max_size,
-        see nginx.py)."""
+        """Record the outcome of one warm attempt for a single package.
+        Called both when repowatch itself actively warmed it (source=
+        "prefetch", see prefetch.py) and when a real client request was
+        merely observed to succeed (source="client", see
+        syslog_listener.py) — NOT a live check of the current nginx cache
+        state either way (the file could have since been evicted by
+        proxy_cache_path's inactive/max_size, see nginx.py).
+
+        `source` is deliberately NOT overwritten on a later call for the
+        same (repo_id, package_key): it records how this package FIRST
+        entered warmed_packages, which is what
+        StateStore.get_prefetch_efficiency needs — a package repowatch
+        prefetched ahead of demand and only later happened to also be
+        requested by a client is still a "prefetch" success, not
+        reclassified as "client" just because a client eventually asked
+        for it too."""
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO warmed_packages
-                    (repo_id, package_key, filename, warmed_at, status, http_status)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (repo_id, package_key, filename, warmed_at, status, http_status, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(repo_id, package_key) DO UPDATE SET
                     filename = excluded.filename,
                     warmed_at = excluded.warmed_at,
                     status = excluded.status,
                     http_status = excluded.http_status
                 """,
-                (repo_id, package_key, filename, _utcnow(), "ok" if ok else "failed", http_status),
+                (repo_id, package_key, filename, _utcnow(), "ok" if ok else "failed", http_status, source),
             )
 
     def get_warmed_packages(self, repo_id: str) -> list[dict]:
@@ -522,6 +573,16 @@ class StateStore:
                 (repo_id,),
             ).fetchall()
         return [r[0] for r in rows]
+
+    def get_ban_counts(self) -> dict[str, int]:
+        """Number of banned-from-auto-warm packages per repo, one query for
+        all repos (for api.metrics_payload — a per-repo loop calling
+        get_banned_packages would be one query per repo)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT repo_id, COUNT(*) FROM prefetch_bans GROUP BY repo_id"
+            ).fetchall()
+        return {repo_id: count for repo_id, count in rows}
 
     def remove_warmed_package(self, repo_id: str, package_key: str) -> bool:
         """"Remove from warmed" — only repowatch's own bookkeeping (the
@@ -744,15 +805,25 @@ class StateStore:
         path: str,
         status: str | None,
         cache_status: str | None,
+        package_key: str | None = None,
+        package_repo_id: str | None = None,
     ) -> None:
-        """Record one client request received via syslog_listener."""
+        """Record one client request received via syslog_listener.
+        package_key/package_repo_id are the (optional) result of matching
+        this request against a specific repository's known packages (see
+        syslog_listener.match_all_package_keys) — independent of repo_id,
+        which is a separate, prefix-based match and may be NULL or point at
+        a different repository (see request_events.package_repo_id)."""
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO request_events (ts, repo_id, client_ip, method, path, status, cache_status)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO request_events
+                    (ts, repo_id, client_ip, method, path, status, cache_status,
+                     package_key, package_repo_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (_utcnow(), repo_id, client_ip, method, path, status, cache_status),
+                (_utcnow(), repo_id, client_ip, method, path, status, cache_status,
+                 package_key, package_repo_id),
             )
 
     def get_recent_requests(self, repo_id: str | None = None, limit: int = 100) -> list[dict]:
@@ -815,8 +886,10 @@ class StateStore:
 
     def get_top_request_paths(self, repo_id: str | None = None, limit: int = 10) -> list[dict]:
         """Top request paths by count — a simplified stand-in for "by
-        package": request_events stores the raw path, not a resolved
-        package name (requests aren't linked to package_key yet)."""
+        package": grouped by the raw path, not by the resolved package_key
+        (see request_events.package_key/get_prefetch_efficiency for the
+        latter, used for a different question — "was this prefetched?" —
+        not "what's most popular")."""
         with self._connect() as conn:
             if repo_id:
                 rows = conn.execute(
@@ -849,6 +922,91 @@ class StateStore:
                 (limit,),
             ).fetchall()
         return [{"key": key, "count": count} for key, count in rows]
+
+    def get_request_hit_stats(self) -> dict[str | None, dict[str, int]]:
+        """Per-repo request count and cache-HIT count over the currently
+        retained window of request_events (see prune_requests/
+        request_max_rows) — for api.metrics_payload. A snapshot gauge, not a
+        counter: retention can shrink these numbers, they are not
+        monotonically increasing. Key None groups requests whose path
+        didn't match any configured repo (see syslog_listener.match_repo_id)
+        — the caller decides whether/how to surface that bucket."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT repo_id, COUNT(*) AS total,
+                       SUM(CASE WHEN cache_status = 'HIT' THEN 1 ELSE 0 END) AS hits
+                FROM request_events
+                GROUP BY repo_id
+                """
+            ).fetchall()
+        return {repo_id: {"total": total, "hits": hits or 0} for repo_id, total, hits in rows}
+
+    def get_requests_timeline(self, repo_id: str | None = None, hours: int = 24) -> list[dict]:
+        """Hourly request-count buckets for the last `hours` hours, oldest
+        first — docs_dev/ROADMAP.md item 19's "timeline" chart. Bucketing is
+        a plain substr() on the ISO-8601 `ts` (always "YYYY-MM-DDTHH:...",
+        fixed width, UTC — see _utcnow), not a datetime() call: cheap and
+        exact for this format, no timezone conversion needed. A snapshot
+        like the rest of this module — retention pruning can make an older
+        hour's bucket shrink or disappear between two calls."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat(timespec="seconds")
+        params: tuple = (cutoff,)
+        where = "ts >= ?"
+        if repo_id is not None:
+            where += " AND repo_id = ?"
+            params += (repo_id,)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT substr(ts, 1, 13) AS hour, COUNT(*) AS total,
+                       SUM(CASE WHEN cache_status = 'HIT' THEN 1 ELSE 0 END) AS hits
+                FROM request_events
+                WHERE {where}
+                GROUP BY hour ORDER BY hour
+                """,
+                params,
+            ).fetchall()
+        return [{"hour": hour, "total": total, "hits": hits or 0} for hour, total, hits in rows]
+
+    def get_prefetch_efficiency(self) -> list[dict]:
+        """Per-repo: of the packages repowatch actively prefetched ahead of
+        demand (warmed_packages.source = "prefetch"), how many were later
+        actually requested by a real client — docs_dev/ROADMAP.md item 19.
+        Answers "was prefetching this repo worth it", as opposed to
+        get_request_hit_stats (nginx's cache HIT/MISS, which also counts
+        packages that became cached only because an earlier client
+        requested them, not because repowatch prefetched them).
+
+        The correlation is exact, not basename-guessing: it uses
+        request_events.package_key/package_repo_id, populated by
+        syslog_listener only when a request's basename unambiguously
+        matches exactly one repository's known packages (see
+        match_all_package_keys) — the same resolution warmed_packages
+        itself relies on, so the two line up even when the plain,
+        prefix-based repo_id column is NULL (e.g. several apt repos sharing
+        one pool/).
+
+        Repos with zero prefetched packages are omitted — a ratio of "0 of
+        0" is not a meaningful data point, not the same thing as 0%."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT w.repo_id, COUNT(*) AS prefetched,
+                       COUNT(*) FILTER (WHERE EXISTS (
+                           SELECT 1 FROM request_events r
+                           WHERE r.package_repo_id = w.repo_id AND r.package_key = w.package_key
+                       )) AS used
+                FROM warmed_packages w
+                WHERE w.source = 'prefetch'
+                GROUP BY w.repo_id
+                """
+            ).fetchall()
+        return [
+            {"repo_id": repo_id, "prefetched": prefetched, "used": used,
+             "ratio": used / prefetched if prefetched else 0.0}
+            for repo_id, prefetched, used in rows
+        ]
 
     def prune_requests(self, retention_days: int) -> int:
         """Same as prune_events but for request_events — grows much faster
@@ -1000,6 +1158,18 @@ class StateStore:
             )
             return bool(row[0])
 
+    def get_failure_counts(self) -> dict[tuple[str, str], int]:
+        """(repo_id, kind) -> current consecutive_failures, one query for all
+        repos/kinds (for api.metrics_payload). A row only exists here while
+        a streak is active — reset_failure deletes it on the first success,
+        so an absent (repo_id, kind) pair means "currently healthy", not
+        "never failed"."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT repo_id, kind, consecutive_failures FROM failure_state"
+            ).fetchall()
+        return {(repo_id, kind): count for repo_id, kind, count in rows}
+
 
 def _prev_changed_at(conn: sqlite3.Connection, repo_id: str) -> str | None:
     row = conn.execute(
@@ -1032,10 +1202,26 @@ def _migrate(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE repo_state ADD COLUMN {column} TEXT")
     if "package_count" not in existing:
         conn.execute("ALTER TABLE repo_state ADD COLUMN package_count INTEGER")
+    if "key_expires_at" not in existing:
+        conn.execute("ALTER TABLE repo_state ADD COLUMN key_expires_at TEXT")
 
     existing_request_events = {row[1] for row in conn.execute("PRAGMA table_info(request_events)")}
     if "client_ip" not in existing_request_events:
         conn.execute("ALTER TABLE request_events ADD COLUMN client_ip TEXT")
+    if "package_key" not in existing_request_events:
+        conn.execute("ALTER TABLE request_events ADD COLUMN package_key TEXT")
+        conn.execute("ALTER TABLE request_events ADD COLUMN package_repo_id TEXT")
+    # Same reasoning as idx_repo_packages_hash above: only safe to create
+    # once package_key/package_repo_id are guaranteed to exist, which for an
+    # upgraded database is only true after the ALTER TABLE calls just above.
+    conn.execute(
+        'CREATE INDEX IF NOT EXISTS idx_request_events_package '
+        'ON request_events(package_repo_id, package_key) WHERE package_key IS NOT NULL'
+    )
+
+    existing_warmed = {row[1] for row in conn.execute("PRAGMA table_info(warmed_packages)")}
+    if "source" not in existing_warmed:
+        conn.execute("ALTER TABLE warmed_packages ADD COLUMN source TEXT")
 
     if "packages_json" in existing:
         # JSON is authoritative for the dual-write release, including after

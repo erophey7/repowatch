@@ -185,6 +185,69 @@ def test_check_repo_success_without_prior_gpg_failure_creates_no_failure_row(tmp
     assert store.bump_failure("r", "gpg", "peek") == (1, False)
 
 
+def test_check_repo_skips_key_expiry_check_for_apk(tmp_path, monkeypatch):
+    """apk's embedded RSA keys have no expiry concept (see apkverify.py) —
+    soonest_key_expiry must not even be called for an apk repo, regardless
+    of verify_signature."""
+    store = StateStore(tmp_path / "state.sqlite3")
+    repo = RepoConfig(
+        id="r", type="apk", upstream="https://example.org", arch="x86_64",
+        verify_signature=True, apk_keys_dir="/fake/keys",
+    )
+    config = _config(repos=[repo])
+    monkeypatch.setitem(watcher.PARSERS, "apk", _SucceedingParser)
+
+    def _boom(keyring_path):
+        raise AssertionError("soonest_key_expiry must not be called for apk")
+    monkeypatch.setattr(watcher, "soonest_key_expiry", _boom)
+
+    asyncio.run(check_repo(config, repo, store))
+
+    assert store.get_repo_summaries()["r"]["key_expires_at"] is None
+
+
+def test_check_repo_records_key_expiry_from_keyring(tmp_path, monkeypatch):
+    store = StateStore(tmp_path / "state.sqlite3")
+    repo = RepoConfig(
+        id="r", type="pacman", upstream="https://example.org", arch="x86_64", repo_name="core",
+        verify_signature=True, keyring_path="/fake/keyring.gpg",
+    )
+    config = _config(repos=[repo], key_expiry_warning_days=30)
+    monkeypatch.setitem(watcher.PARSERS, "pacman", _SucceedingParser)
+
+    far_future = (datetime.now(timezone.utc) + timedelta(days=200)).isoformat(timespec="seconds")
+    monkeypatch.setattr(watcher, "soonest_key_expiry", lambda keyring_path: far_future)
+
+    asyncio.run(check_repo(config, repo, store))
+
+    assert store.get_repo_summaries()["r"]["key_expires_at"] == far_future
+    # well outside the warning window — no notification streak started
+    assert store.bump_failure("r", "key_expiry", "peek") == (1, False)
+
+
+def test_check_repo_notifies_key_expiry_warning_and_recovery(tmp_path, monkeypatch):
+    store = StateStore(tmp_path / "state.sqlite3")
+    repo = RepoConfig(
+        id="r", type="pacman", upstream="https://example.org", arch="x86_64", repo_name="core",
+        verify_signature=True, keyring_path="/fake/keyring.gpg",
+    )
+    config = _config(repos=[repo], key_expiry_warning_days=30)
+    monkeypatch.setitem(watcher.PARSERS, "pacman", _SucceedingParser)
+
+    soon = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat(timespec="seconds")
+    monkeypatch.setattr(watcher, "soonest_key_expiry", lambda keyring_path: soon)
+
+    asyncio.run(check_repo(config, repo, store))
+    # inside the warning window — a "key_expiry" streak was started
+    assert store.bump_failure("r", "key_expiry", "peek") == (2, False)
+
+    far_future = (datetime.now(timezone.utc) + timedelta(days=200)).isoformat(timespec="seconds")
+    monkeypatch.setattr(watcher, "soonest_key_expiry", lambda keyring_path: far_future)
+    asyncio.run(check_repo(config, repo, store))
+    # renewed past the threshold — the streak is fully reset
+    assert store.bump_failure("r", "key_expiry", "peek") == (1, False)
+
+
 def test_check_repo_end_to_end_version_churn_updates_packages_and_history(tmp_path, monkeypatch):
     """Regression for the full fetch -> diff -> record path (not just
     record_snapshot() given an already-built dict directly, see other tests

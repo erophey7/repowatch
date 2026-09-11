@@ -12,9 +12,15 @@ RepoConfig.__post_init__ in config.py) — out of scope here.
 
 from __future__ import annotations
 
+import logging
+import os
+import shutil
 import subprocess
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 class SignatureError(Exception):
@@ -101,6 +107,63 @@ def _extract_clearsigned_body(data: bytes) -> bytes:
     body = text[header_end:end]
     lines = [line[2:] if line.startswith("- ") else line for line in body.splitlines()]
     return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def soonest_key_expiry(keyring_path: str) -> str | None:
+    """The nearest expiration date among the public keys in an exported
+    keyring (the same file already used with `gpgv --keyring`), as an
+    ISO 8601 UTC string — or None if no key in it has an expiry, the
+    keyring has no keys, or the check couldn't be performed at all.
+
+    Requires the full `gpg` binary, not just `gpgv` — gpgv only verifies
+    signatures, it has no key-listing capability. This is strictly a
+    diagnostic feature (docs_dev/ROADMAP.md item 20, "trust state"): unlike
+    everywhere else in this module, failure here is never raised, only
+    logged and treated as "unknown" — a host with `gpgv` but not the full
+    `gpg` package must not lose the ability to VERIFY signatures just
+    because it can't also report on key freshness.
+
+    Imports the keyring into a throwaway GNUPGHOME rather than pointing
+    `gpg --keyring` directly at the file: modern GnuPG (2.4+) can default to
+    its "keyboxd" backend, which silently IGNORES an explicit --keyring
+    argument for a legacy-format file ("Specified keyrings are ignored due
+    to option 'use-keyboxd'") — found by hand, not documented behavior a
+    caller should have to know about. --import always works regardless of
+    which backend the local gpg build defaults to.
+    """
+    if shutil.which("gpg") is None:
+        return None
+    try:
+        with tempfile.TemporaryDirectory(prefix="repowatch-gpg-home-") as home:
+            os.chmod(home, 0o700)
+            env = {**os.environ, "GNUPGHOME": home}
+            subprocess.run(
+                ["gpg", "--batch", "--yes", "--import", keyring_path],
+                capture_output=True, text=True, timeout=10, env=env,
+            )
+            result = subprocess.run(
+                ["gpg", "--batch", "--with-colons", "--list-keys"],
+                capture_output=True, text=True, timeout=10, env=env,
+            )
+    except (OSError, subprocess.TimeoutExpired):
+        logger.warning("could not run gpg to check key expiry for %s", keyring_path, exc_info=True)
+        return None
+    if result.returncode != 0:
+        logger.warning("gpg --list-keys failed for %s: %s", keyring_path, result.stderr.strip())
+        return None
+
+    soonest: datetime | None = None
+    for line in result.stdout.splitlines():
+        fields = line.split(":")
+        if fields[0] != "pub" or len(fields) < 7 or not fields[6]:
+            continue
+        try:
+            expires = datetime.fromtimestamp(int(fields[6]), tz=timezone.utc)
+        except (ValueError, OSError):
+            continue
+        if soonest is None or expires < soonest:
+            soonest = expires
+    return soonest.isoformat(timespec="seconds") if soonest else None
 
 
 def find_sha256_in_release(release_body: bytes, target_path: str) -> str:

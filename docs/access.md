@@ -17,6 +17,7 @@ implementation.
 
 - [Admin login](#admin-login)
 - [Host tokens (`status.json` clients)](#host-tokens-statusjson-clients)
+- [Versioned status API (`/api/v1/...`)](#versioned-status-api-apiv1)
 - [Guest read-only mode](#guest-read-only-mode)
 - [TLS and `allow_insecure_http`](#tls-and-allow_insecure_http)
 - [Reverse proxies and `trusted_proxies`](#reverse-proxies-and-trusted_proxies)
@@ -94,6 +95,36 @@ Note what host tokens *don't* grant: they're read-only against the status
 API specifically. They cannot log into the dashboard, trigger a warm-up, add
 a repository, or change any config — those all require the admin session
 and CSRF token above.
+
+## Versioned status API (`/api/v1/...`)
+
+Every route a host client actually needs — `status.json`, per-repository
+status, per-repository history, `/healthz`, `/metrics` — is also reachable
+under an `/api/v1/` prefix, with identical behavior and the same
+authentication rules described above:
+
+```
+GET /api/v1/status.json
+GET /api/v1/status/<repo_id>.json
+GET /api/v1/status/<repo_id>/history
+GET /api/v1/healthz
+GET /api/v1/metrics
+```
+
+Today `/api/v1/...` and the unversioned paths above are the same thing —
+`/api/v1/` is a stable alias, not a different implementation. The point of
+having it is forward-looking: if this specific client-facing contract ever
+needs an incompatible change, that change lands in `/api/v2/...` instead of
+breaking what's already polling `/api/v1/...` (or the unversioned routes,
+which keep working as a permanent alias of `v1`). New integrations should
+prefer the `/api/v1/` form for that reason, but nothing currently pointed at
+the unversioned paths needs to change.
+
+This versioning applies only to this client-facing status API. The
+dashboard's own API (`/api/repos`, `/api/config`, `/api/tokens`, and so on)
+is intentionally **not** versioned — it's an implementation detail of the
+bundled dashboard, released and upgraded together with it, not a contract
+promised to outside consumers.
 
 ## Guest read-only mode
 

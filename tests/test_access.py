@@ -47,7 +47,8 @@ def login(client):
 
 @pytest.mark.parametrize('path', ['/', '/dashboard', '/api/repos', '/api/config', '/api/requests',
     '/api/requests/summary', '/status/r/history', '/api/repos/r/packages', '/api/repos/r/warmed',
-    '/api/repos/r/bans', '/api/tokens', '/api/auth/session', '/status.json', '/status/r.json'])
+    '/api/repos/r/bans', '/api/tokens', '/api/auth/session', '/status.json', '/status/r.json',
+    '/api/prefetch-efficiency'])
 def test_anonymous_routes_closed(api, path):
     client, _, _ = api
     response = client.get(path)
@@ -155,6 +156,25 @@ def test_health_minimal_metrics_local_and_proxy_cannot_bypass(api):
     path.write_text(yaml.safe_dump(raw))
     assert client.get('/metrics', headers={'X-Forwarded-For': '192.0.2.9'}).status_code == 200
     assert client.get('/metrics', headers={'X-Forwarded-For': '192.0.2.9, 203.0.113.1'}).status_code == 403
+
+
+def test_v1_prefix_aliases_client_facing_status_api_only(api):
+    client, _, _ = api
+    # Admin/dashboard routes are not versioned — /api/v1/... does not alias them,
+    # so an unauthenticated request behaves the same as the unversioned route.
+    assert client.get('/api/v1/repos').status_code == client.get('/api/repos').status_code == 401
+    login(client)
+    for versioned, plain in [
+        ('/api/v1/healthz', '/healthz'),
+        ('/api/v1/metrics', '/metrics'),
+        ('/api/v1/status.json', '/status.json'),
+        ('/api/v1/status/r.json', '/status/r.json'),
+        ('/api/v1/status/r/history', '/status/r/history'),
+    ]:
+        v1_response = client.get(versioned)
+        plain_response = client.get(plain)
+        assert v1_response.status_code == plain_response.status_code == 200
+        assert v1_response.text == plain_response.text
 
 
 def test_trusted_https_login_sets_secure_cookie_and_checks_origin(api):
@@ -304,7 +324,8 @@ def test_guest_reads_and_live_disable_without_password(api):
     headers = {'X-Forwarded-For': '192.0.2.5'}
     for route in ['/', '/dashboard', '/status.json', '/status/r.json', '/api/repos',
                   '/status/r/history', '/api/repos/r/packages', '/api/repos/r/warmed',
-                  '/api/repos/r/bans', '/api/requests', '/api/requests/summary', '/api/config']:
+                  '/api/repos/r/bans', '/api/requests', '/api/requests/summary', '/api/config',
+                  '/api/prefetch-efficiency']:
         response = client.get(route, headers=headers)
         assert response.status_code == 200, (route, response.text)
         assert response.headers['cache-control'] == 'no-store'

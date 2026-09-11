@@ -514,6 +514,17 @@ def test_dnf_prefix_uses_repo_id_and_preserves_relative_package_path():
     assert match_repo_id(path, [repo]) == repo.id
 
 
+def test_xbps_prefix_uses_repo_id_flat_namespace():
+    from repowatch.prefetch import _build_warm_url
+    from repowatch.syslog_listener import match_repo_id
+    repo = RepoConfig(id='void-current', type='xbps',
+                      upstream='https://repo-default.voidlinux.org/current', arch='x86_64')
+    path = '/xbps/void-current/bash-5.3_2.x86_64.xbps'
+    assert _repo_url_prefix(repo) == '/xbps/void-current'
+    assert _build_warm_url(_config(), repo, 'bash-5.3_2.x86_64.xbps') == _config().cache_base_url + path
+    assert match_repo_id(path, [repo]) == repo.id
+
+
 # --- active cache purge on package removal (docs_dev/ROADMAP.md item 24) ---
 
 def _purge_config(**overrides):

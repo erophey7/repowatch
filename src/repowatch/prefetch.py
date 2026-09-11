@@ -106,6 +106,14 @@ def _repo_url_prefix(repo: RepoConfig) -> str:
         # namespace by repo_id avoids mixing hosts/architectures that
         # happen to share a path.
         return f"/rpm/{urllib.parse.quote(repo.id, safe='')}"
+    if repo.type == "xbps":
+        # Same reasoning as dnf above — Void mirrors/components (nonfree,
+        # multilib, multilib/nonfree, debug) have no common upstream
+        # structure either, and packages sit flat next to <arch>-repodata,
+        # so a plain repo_id namespace is enough (no component suffix
+        # needed here, unlike apt-rpm's RPMS.<component> — a Void
+        # component is just a different upstream directory).
+        return f"/xbps/{urllib.parse.quote(repo.id, safe='')}"
     if repo.type == "apt":
         # apt packages live under pool/<component>/..., where component is
         # the first segment after pool/ (that's upstream's actual
@@ -229,7 +237,7 @@ async def warm_cache(
         key, filename, url = task
         async with semaphore:
             ok, http_status = await _warm_one(client, url, limiter)
-        store.record_warmed_package(repo.id, key, filename, ok, http_status)
+        store.record_warmed_package(repo.id, key, filename, ok, http_status, source="prefetch")
         if not ok:
             # A single event loop, no real thread parallelism — append()
             # from different coroutines is safe here without a lock.

@@ -62,6 +62,7 @@
   .badge { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; }
   .badge-changed { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
   .badge-stale { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+  .badge-warn { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
   .mono { font-family: var(--mono); font-size: 12px; }
   /* white-space:nowrap is inherited down from the "th, td" rule above (it's
      what keeps ordinary repo-row cells like timestamps on one line) — reset
@@ -147,7 +148,9 @@
   .chart-svg-wrap svg { display: block; }
   .chart-label { fill: var(--text-dim); font-size: 11px; font-family: var(--mono); }
   .chart-bar { fill: var(--accent); }
+  .chart-bar-total { fill: var(--text-dim); opacity: .35; }
   .chart-count { fill: var(--text); font-size: 11px; }
+  .chart-axis-label { fill: var(--text-dim); font-size: 9px; font-family: var(--mono); }
   code { font-family: var(--mono); background: var(--surface); padding: 1px 5px;
          border-radius: 4px; border: 1px solid var(--border); }
 
@@ -247,6 +250,7 @@
         <option value="apk">apk</option>
         <option value="apt-rpm">apt-rpm (ALT Linux)</option>
         <option value="dnf">dnf / rpm</option>
+        <option value="xbps">xbps (Void Linux)</option>
       </select>
     </div>
 
@@ -386,6 +390,10 @@
         the webhook itself (notify_webhook_url) is a secret, set only by hand in config.yaml
       </span>
     </div>
+    <div class="field">
+      <label for="s-key-expiry-warning-days">key_expiry_warning_days (GPG trust state)</label>
+      <input type="text" id="s-key-expiry-warning-days">
+    </div>
 
     <div class="form-actions">
       <button type="submit" class="primary">Save</button>
@@ -416,6 +424,19 @@
     <div class="chart-panel">
       <h3>Requests by repository</h3>
       <div class="chart-svg-wrap" data-chart="by_repo">Loading…</div>
+    </div>
+    <div class="chart-panel">
+      <h3>Requests over time (last 24h, hourly)</h3>
+      <div class="chart-svg-wrap" data-chart="timeline">Loading…</div>
+    </div>
+    <div class="chart-panel">
+      <h3>Cache hit ratio</h3>
+      <div class="chart-svg-wrap" data-chart="cache_hit_stats">Loading…</div>
+    </div>
+    <div class="chart-panel">
+      <h3>Prefetch efficiency</h3>
+      <p class="subtitle" style="margin: 0 0 8px;">Of what repowatch prefetched ahead of demand, the share a client actually went on to request.</p>
+      <div class="chart-svg-wrap" data-chart="prefetch_efficiency">Loading…</div>
     </div>
   </div>
   <div class="table-wrap">
@@ -575,6 +596,21 @@ function fmtTs(ts) {
   return ts ? ts.replace('T', ' ').replace(/\+00:00$/, ' UTC') : '—';
 }
 
+// docs_dev/ROADMAP.md item 20 — trust state. repo.key_expires_at/
+// key_expiring_soon come pre-computed from the last check cycle (see
+// api.repos_list_payload); this just renders them, no live gpg call from
+// the browser. '—' covers apk repos, repos without verify_signature, and
+// "unknown" (e.g. the full gpg binary isn't installed on the host) alike —
+// the dashboard can't tell those apart from key_expires_at alone, and
+// doesn't need to: none of them call for operator attention right now.
+function fmtKeyExpiry(repo) {
+  if (!repo.key_expires_at) return '—';
+  const days = Math.floor((new Date(repo.key_expires_at) - Date.now()) / 86400000);
+  const label = days < 0 ? `expired ${-days}d ago` : `expires in ${days}d`;
+  if (!repo.key_expiring_soon) return `<span class="mono">${fmtTs(repo.key_expires_at)}</span>`;
+  return `<span class="badge badge-warn" title="${esc(fmtTs(repo.key_expires_at))}">${esc(label)}</span>`;
+}
+
 function esc(s) {
   return String(s).replace(/[&<>"']/g, c => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -640,7 +676,7 @@ const REPOS_THEAD_HTML = `
     <th>id</th><th class="col-type">type</th><th class="col-upstream">upstream</th>
     <th class="col-prefetch">prefetch</th><th class="col-interval">interval</th>
     <th>packages</th><th class="col-warmed">warmed</th><th>last check</th>
-    <th class="col-changed">changed at</th><th>files</th><th>actions</th>
+    <th class="col-changed">changed at</th><th class="col-key">key</th><th>files</th><th>actions</th>
   </tr>
 `;
 
@@ -681,6 +717,7 @@ function createRepoRow(repo) {
     <td class="col-warmed">${repo.warmed_count ?? '—'}</td>
     <td class="mono">${fmtTs(repo.last_check)}</td>
     <td class="col-changed">${changedBadge} <span class="mono">${fmtTs(repo.changed_at)}</span></td>
+    <td class="col-key">${fmtKeyExpiry(repo)}</td>
     <td class="browse-link">${repo.browse_url
       ? `<a href="${esc(repo.browse_url)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">browse →</a>`
       : '—'}</td>
@@ -1378,8 +1415,13 @@ function updateConditionalFields() {
   });
   const verifyField = document.getElementById('f-verify-signature-field');
   const keyringField = document.getElementById('f-keyring-path-field');
-  verifyField.hidden = false;
-  keyringField.hidden = type === 'apk' || !$verifySignature.checked;
+  // xbps repos don't publish a signed index at all — the server rejects
+  // verify_signature=true outright (see config.py) — so the checkbox isn't
+  // just hidden but force-unchecked, otherwise a stale "checked" state
+  // from a previously selected type would submit a doomed request.
+  verifyField.hidden = type === 'xbps';
+  if (type === 'xbps') $verifySignature.checked = false;
+  keyringField.hidden = type === 'apk' || type === 'xbps' || !$verifySignature.checked;
 }
 $typeSelect.addEventListener('change', updateConditionalFields);
 $verifySignature.addEventListener('change', updateConditionalFields);
@@ -1469,6 +1511,7 @@ const SETTINGS_FIELDS = {
   'cache_base_url': 's-cache-base-url',
   'public_cache_url': 's-public-cache-url',
   'notify_after_failures': 's-notify-after-failures',
+  'key_expiry_warning_days': 's-key-expiry-warning-days',
 };
 
 async function openSettingsForm() {
@@ -1613,6 +1656,66 @@ function renderBarChart(container, rows) {
   container.innerHTML = `<svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}">${bars}</svg>`;
 }
 
+// Horizontal bars sized by a ratio (numKey/denKey), e.g. cache hit ratio or
+// prefetch efficiency — same layout as renderBarChart, but the bar length
+// and the trailing label both come from a fraction, not a raw count.
+function renderRatioChart(container, rows, labelKey, numKey, denKey) {
+  rows = rows.filter(r => r[denKey] > 0);
+  if (!rows.length) {
+    container.innerHTML = '<div class="empty">no data</div>';
+    return;
+  }
+  const barHeight = 16, gap = 6, labelWidth = 120, barAreaWidth = 140;
+  const width = labelWidth + barAreaWidth + 80;
+  const height = rows.length * (barHeight + gap);
+
+  const bars = rows.map((r, i) => {
+    const y = i * (barHeight + gap);
+    const ratio = r[numKey] / r[denKey];
+    const w = Math.max(2, ratio * barAreaWidth);
+    const label = truncateLabel(r[labelKey] === null || r[labelKey] === undefined ? '(unmatched)' : String(r[labelKey]));
+    const pct = Math.round(ratio * 100);
+    return `
+      <text x="${labelWidth - 6}" y="${y + barHeight - 4}" text-anchor="end" class="chart-label">${esc(label)}</text>
+      <rect x="${labelWidth}" y="${y}" width="${w}" height="${barHeight - 2}" class="chart-bar" rx="2"></rect>
+      <text x="${labelWidth + barAreaWidth + 6}" y="${y + barHeight - 4}" class="chart-count">${pct}% (${r[numKey]}/${r[denKey]})</text>
+    `;
+  }).join('');
+
+  container.innerHTML = `<svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}">${bars}</svg>`;
+}
+
+// Vertical stacked bars, one per hourly bucket: full bar height is
+// row.total, the accent-colored overlay on top of it is row.hits — so the
+// HIT share within each hour is visible at a glance, not just the volume.
+function renderTimelineChart(container, rows) {
+  if (!rows.length) {
+    container.innerHTML = '<div class="empty">no data</div>';
+    return;
+  }
+  const maxTotal = Math.max(...rows.map(r => r.total), 1);
+  const barWidth = 12, gap = 4, chartHeight = 90, topPad = 4;
+  const width = rows.length * (barWidth + gap) + gap;
+  const height = chartHeight + topPad + 14;
+
+  const bars = rows.map((r, i) => {
+    const x = gap + i * (barWidth + gap);
+    const totalH = Math.max(1, (r.total / maxTotal) * chartHeight);
+    const hitH = r.total ? (r.hits / r.total) * totalH : 0;
+    const yTotal = topPad + (chartHeight - totalH);
+    const yHit = topPad + (chartHeight - hitH);
+    const hourLabel = r.hour.slice(-2);
+    return `
+      <rect x="${x}" y="${yTotal}" width="${barWidth}" height="${totalH}" class="chart-bar-total" rx="1"></rect>
+      <rect x="${x}" y="${yHit}" width="${barWidth}" height="${hitH}" class="chart-bar" rx="1"></rect>
+      <title>${esc(r.hour)}: ${r.total} requests, ${r.hits} cache HIT</title>
+      ${i % 3 === 0 ? `<text x="${x}" y="${height - 2}" class="chart-axis-label">${esc(hourLabel)}h</text>` : ''}
+    `;
+  }).join('');
+
+  container.innerHTML = `<svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}">${bars}</svg>`;
+}
+
 async function loadRequestsSummary() {
   const repoId = $reqFilter.value;
   const qs = new URLSearchParams();
@@ -1622,6 +1725,8 @@ async function loadRequestsSummary() {
     by_client_ip: document.querySelector('[data-chart="by_client_ip"]'),
     by_path: document.querySelector('[data-chart="by_path"]'),
     by_repo: document.querySelector('[data-chart="by_repo"]'),
+    timeline: document.querySelector('[data-chart="timeline"]'),
+    cache_hit_stats: document.querySelector('[data-chart="cache_hit_stats"]'),
   };
 
   try {
@@ -1631,6 +1736,8 @@ async function loadRequestsSummary() {
     renderBarChart(panels.by_client_ip, data.by_client_ip);
     renderBarChart(panels.by_path, data.by_path);
     renderBarChart(panels.by_repo, data.by_repo);
+    renderTimelineChart(panels.timeline, data.timeline);
+    renderRatioChart(panels.cache_hit_stats, data.cache_hit_stats, 'repo_id', 'hits', 'total');
   } catch (err) {
     for (const panel of Object.values(panels)) {
       panel.innerHTML = `<div class="empty">Load error: ${esc(err.message)}</div>`;
@@ -1638,11 +1745,28 @@ async function loadRequestsSummary() {
   }
 }
 
-$reqRefresh.addEventListener('click', () => { loadRequests(); loadRequestsSummary(); });
+async function loadPrefetchEfficiency() {
+  const panel = document.querySelector('[data-chart="prefetch_efficiency"]');
+  try {
+    const res = await fetch('/api/prefetch-efficiency');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    renderRatioChart(panel, data.items, 'repo_id', 'used', 'prefetched');
+  } catch (err) {
+    panel.innerHTML = `<div class="empty">Load error: ${esc(err.message)}</div>`;
+  }
+}
+
+$reqRefresh.addEventListener('click', () => { loadRequests(); loadRequestsSummary(); loadPrefetchEfficiency(); });
 $reqFilter.addEventListener('change', () => { loadRequests(); loadRequestsSummary(); });
 loadRequests();
 loadRequestsSummary();
-setInterval(() => { if (requestRows.length <= 50 && !requestsBusy) loadRequests(); loadRequestsSummary(); }, 30000);
+loadPrefetchEfficiency();
+setInterval(() => {
+  if (requestRows.length <= 50 && !requestsBusy) loadRequests();
+  loadRequestsSummary();
+  loadPrefetchEfficiency();
+}, 30000);
 </script>
 </body>
 </html>

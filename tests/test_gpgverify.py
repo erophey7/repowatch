@@ -9,10 +9,13 @@ import subprocess
 
 import pytest
 
+from datetime import datetime, timedelta, timezone
+
 from repowatch.gpgverify import (
     SignatureError,
     _extract_clearsigned_body,
     find_sha256_in_release,
+    soonest_key_expiry,
     verify_clearsigned,
     verify_detached,
 )
@@ -196,3 +199,54 @@ def test_extract_clearsigned_body_unescapes_dash_lines():
 def test_extract_clearsigned_body_rejects_non_clearsigned_input():
     with pytest.raises(SignatureError):
         _extract_clearsigned_body(b"just some random bytes, not pgp at all")
+
+
+def _gen_expiring_key(env, name: str, expire_date: str) -> None:
+    batch = (
+        "%no-protection\nKey-Type: RSA\nKey-Length: 2048\n"
+        f"Name-Real: {name}\nName-Email: {name}@example.org\n"
+        f"Expire-Date: {expire_date}\n%commit\n"
+    )
+    subprocess.run(
+        ["gpg", "--batch", "--gen-key"],
+        input=batch, text=True, env=env, check=True, capture_output=True,
+    )
+
+
+def test_soonest_key_expiry_returns_none_for_non_expiring_key(gpg_env):
+    # gpg_env's key uses Expire-Date: 0 (never expires)
+    _env, keyring_path = gpg_env
+    assert soonest_key_expiry(keyring_path) is None
+
+
+def test_soonest_key_expiry_reports_nearest_of_several_keys(tmp_path):
+    gnupghome = tmp_path / "gnupg"
+    gnupghome.mkdir(mode=0o700)
+    env = {**os.environ, "GNUPGHOME": str(gnupghome)}
+    _gen_expiring_key(env, "soon", "10")
+    _gen_expiring_key(env, "later", "300")
+
+    keyring_path = tmp_path / "keyring.gpg"
+    subprocess.run(
+        ["gpg", "--export", "-o", str(keyring_path)],
+        env=env, check=True, capture_output=True,
+    )
+
+    result = soonest_key_expiry(str(keyring_path))
+    assert result is not None
+    expires_at = datetime.fromisoformat(result)
+    now = datetime.now(timezone.utc)
+    # ~10 days out, not the ~300-day key
+    assert timedelta(days=8) < (expires_at - now) < timedelta(days=12)
+
+
+def test_soonest_key_expiry_returns_none_for_empty_keyring(tmp_path):
+    empty_keyring = tmp_path / "empty-keyring.gpg"
+    empty_keyring.write_bytes(b"")
+    assert soonest_key_expiry(str(empty_keyring)) is None
+
+
+def test_soonest_key_expiry_returns_none_without_gpg_binary(monkeypatch, gpg_env):
+    _env, keyring_path = gpg_env
+    monkeypatch.setattr("repowatch.gpgverify.shutil.which", lambda name: None)
+    assert soonest_key_expiry(keyring_path) is None

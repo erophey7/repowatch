@@ -18,7 +18,7 @@ test('dashboard searches, appends pages, keeps selection and ignores stale respo
         let data = [];
         if (url.pathname === '/api/auth/session') data = {role:'admin', csrf_token:'csrf'};
         else if (url.pathname === '/api/repos') data = [repo];
-        else if (url.pathname.endsWith('/summary')) data = {by_client_ip: [], by_path: [], by_repo: []};
+        else if (url.pathname.endsWith('/summary')) data = {by_client_ip: [], by_path: [], by_repo: [], timeline: [], cache_hit_stats: []};
         else if (url.pathname.endsWith('/packages')) {
           const q = url.searchParams.get('q');
           if (q === 'slow') await delay(450);
@@ -89,7 +89,7 @@ test('dashboard filters warmed packages by search and selects all matching packa
         let data = [];
         if (url.pathname === '/api/auth/session') data = {role: 'admin', csrf_token: 'csrf'};
         else if (url.pathname === '/api/repos') data = [repo];
-        else if (url.pathname.endsWith('/summary')) data = {by_client_ip: [], by_path: [], by_repo: []};
+        else if (url.pathname.endsWith('/summary')) data = {by_client_ip: [], by_path: [], by_repo: [], timeline: [], cache_hit_stats: []};
         else if (url.pathname.endsWith('/warm') && options.method === 'POST') {
           data = {warmed: JSON.parse(options.body).package_keys, not_found: []};
         } else if (url.pathname.endsWith('/packages')) {
@@ -179,7 +179,7 @@ test('dashboard bulk-removes warmed packages, bulk-bans/unbans, and shows storag
         let data = [];
         if (url.pathname === '/api/auth/session') data = {role: 'admin', csrf_token: 'csrf'};
         else if (url.pathname === '/api/repos') data = [repo];
-        else if (url.pathname.endsWith('/summary')) data = {by_client_ip: [], by_path: [], by_repo: []};
+        else if (url.pathname.endsWith('/summary')) data = {by_client_ip: [], by_path: [], by_repo: [], timeline: [], cache_hit_stats: []};
         else if (url.pathname === '/api/stats') {
           data = {state_db_bytes: 1234, tables: {repo_packages: 5, repo_events: 1, request_events: 0, warmed_packages: 3, prefetch_bans: 1}};
           if (url.searchParams.get('cache_dir') === '1') data.cache_dir = {path: '/cache', size_bytes: 999, file_count: 7};
@@ -290,7 +290,7 @@ test('dashboard manual cache purge: scan shows candidates all-checked, purge rep
         let data = [];
         if (url.pathname === '/api/auth/session') data = {role: 'admin', csrf_token: 'csrf'};
         else if (url.pathname === '/api/repos') data = [repo];
-        else if (url.pathname.endsWith('/summary')) data = {by_client_ip: [], by_path: [], by_repo: []};
+        else if (url.pathname.endsWith('/summary')) data = {by_client_ip: [], by_path: [], by_repo: [], timeline: [], cache_hit_stats: []};
         else if (url.pathname.endsWith('/purge-candidates')) data = {enable_purge: true, candidates};
         else if (url.pathname.endsWith('/purge') && options.method === 'POST') {
           const keys = JSON.parse(options.body).package_keys;
@@ -347,7 +347,7 @@ test('dashboard manual cache purge shows a clear message when enable_purge is of
         let data = [];
         if (url.pathname === '/api/auth/session') data = {role: 'admin', csrf_token: 'csrf'};
         else if (url.pathname === '/api/repos') data = [repo];
-        else if (url.pathname.endsWith('/summary')) data = {by_client_ip: [], by_path: [], by_repo: []};
+        else if (url.pathname.endsWith('/summary')) data = {by_client_ip: [], by_path: [], by_repo: [], timeline: [], cache_hit_stats: []};
         else if (url.pathname.endsWith('/purge-candidates')) data = {enable_purge: false, candidates: []};
         else if (url.pathname.endsWith('/packages')) data = {items: [], next_cursor: null};
         else if (url.pathname.endsWith('/warmed')) data = {items: [], next_cursor: null};
@@ -389,7 +389,7 @@ test('dashboard issues one-time host tokens with CSRF and supports revocation', 
         } else if (url === '/api/tokens') data = issued ? [{id:'id1', name:'host-a', created_at:1, revoked_at:revoked ? 2 : null}] : [];
         else if (url === '/api/tokens/id1/revoke') { revoked = true; data = {ok:true}; }
         else if (url === '/api/repos') data = [];
-        else if (url.startsWith('/api/requests/summary')) data = {by_client_ip:[], by_path:[], by_repo:[]};
+        else if (url.startsWith('/api/requests/summary')) data = {by_client_ip:[], by_path:[], by_repo:[], timeline:[], cache_hit_stats:[]};
         else if (url.startsWith('/api/requests')) data = {items:[], next_cursor:null};
         return {ok:true, status:200, json:async () => data};
       };
@@ -428,7 +428,7 @@ test('guest dashboard reads data and hides administrative controls', async () =>
         let data = [];
         if (url === '/api/auth/session') data = {role:'guest'};
         else if (url === '/api/repos') data = [{id:'r', type:'apt', config:{}, upstream:'example'}];
-        else if (url.startsWith('/api/requests/summary')) data = {by_client_ip:[], by_path:[], by_repo:[]};
+        else if (url.startsWith('/api/requests/summary')) data = {by_client_ip:[], by_path:[], by_repo:[], timeline:[], cache_hit_stats:[]};
         else if (url.includes('/packages?')) data = {items:[{package_key:'visible-package'}], next_cursor:null};
         else if (url.includes('/warmed?')) data = {items:[{package_key:'visible-warmed', status:'ok'}], next_cursor:null};
         else if (url.startsWith('/api/requests')) data = {items:[], next_cursor:null};
@@ -482,7 +482,7 @@ test('repository editor preserves ALT type and custom URL scheme on save', async
       if (url==='/api/auth/session') data={role:'admin',csrf_token:'csrf'};
       else if(url==='/api/repos') data=[{...cfg,config:cfg}];
       else if(url==='/api/repos/alt') data={id:'alt'};
-      else if(url.startsWith('/api/requests/summary')) data={by_client_ip:[],by_path:[],by_repo:[]};
+      else if(url.startsWith('/api/requests/summary')) data={by_client_ip:[],by_path:[],by_repo:[],timeline:[],cache_hit_stats:[]};
       else if(url.startsWith('/api/requests')) data={items:[],next_cursor:null};
       return {ok:true,status:200,json:async()=>data};
     };
@@ -518,7 +518,7 @@ test('APK editor preserves signature backend and trusted keys', async () => {
       let data=[];
       if(url==='/api/auth/session') data={role:'admin',csrf_token:'csrf'};
       else if(url==='/api/repos') data=[{...cfg,config:cfg}];
-      else if(url.startsWith('/api/requests/summary')) data={by_client_ip:[],by_path:[],by_repo:[]};
+      else if(url.startsWith('/api/requests/summary')) data={by_client_ip:[],by_path:[],by_repo:[],timeline:[],cache_hit_stats:[]};
       else if(url.startsWith('/api/requests')) data={items:[],next_cursor:null};
       return {ok:true,status:200,json:async()=>data};
     };
@@ -537,4 +537,36 @@ test('APK editor preserves signature backend and trusted keys', async () => {
     assert.equal(body.apk_signature_backend,'apk-tools');
     assert.equal(body.apk_keys_dir,cfg.apk_keys_dir);
   } finally {dom.window.close();}
+});
+
+
+test('dashboard shows a warning badge for a repo with an expiring GPG key, plain date otherwise', async () => {
+  const soon = {id: 'soon', type: 'apt', upstream: 'example', config: {},
+    key_expires_at: '2026-01-05T00:00:00+00:00', key_expiring_soon: true};
+  const fine = {id: 'fine', type: 'apt', upstream: 'example', config: {},
+    key_expires_at: '2030-01-01T00:00:00+00:00', key_expiring_soon: false};
+  const none = {id: 'none', type: 'apk', upstream: 'example', config: {}};
+  const dom = new JSDOM(html, {
+    url: 'http://localhost/', runScripts: 'dangerously',
+    beforeParse(w) {
+      w.fetch = async raw => {
+        const url = new URL(raw, 'http://localhost');
+        let data = [];
+        if (url.pathname === '/api/auth/session') data = {role: 'admin', csrf_token: 'csrf'};
+        else if (url.pathname === '/api/repos') data = [soon, fine, none];
+        else if (url.pathname.endsWith('/summary')) data = {by_client_ip: [], by_path: [], by_repo: [], timeline: [], cache_hit_stats: []};
+        return {ok: true, json: async () => data};
+      };
+    }
+  });
+  try {
+    const w = dom.window, doc = w.document;
+    await delay(30);
+    const rows = [...doc.querySelectorAll('.repo-row')];
+    const cell = id => rows.find(r => r.dataset.repoId === id).querySelector('.col-key');
+    assert.match(cell('soon').innerHTML, /badge-warn/);
+    assert.doesNotMatch(cell('fine').innerHTML, /badge-warn/);
+    assert.match(cell('fine').textContent, /2030-01-01/);
+    assert.equal(cell('none').textContent.trim(), '—');
+  } finally { dom.window.close(); }
 });

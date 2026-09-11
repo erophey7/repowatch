@@ -233,6 +233,15 @@ def run_listener(config_path: str, initial_config: Config, store: StateStore) ->
             continue
 
         repo_id = match_repo_id(parsed.path, repos)
+        # Computed once, used for both request_events (below) and the
+        # warmed_packages loop further down — same matching, two consumers.
+        matches = match_all_package_keys(parsed.path, by_basename)
+        # Only recorded on request_events when unambiguous: with more than
+        # one match we'd have to pick one repo_id/package_key pair to put in
+        # these two columns, which would silently favor whichever repo
+        # happens to come first — see get_prefetch_efficiency, which needs
+        # this link to be exact, not a guess.
+        package_repo_id, package_key = matches[0] if len(matches) == 1 else (None, None)
         try:
             store.record_request(
                 repo_id=repo_id,
@@ -241,6 +250,8 @@ def run_listener(config_path: str, initial_config: Config, store: StateStore) ->
                 path=parsed.path,
                 status=parsed.status,
                 cache_status=parsed.cache_status,
+                package_key=package_key,
+                package_repo_id=package_repo_id,
             )
         except Exception:
             logger.exception("failed to record request_event")
@@ -256,9 +267,9 @@ def run_listener(config_path: str, initial_config: Config, store: StateStore) ->
         # mark EVERY repository whose known packages actually contain this
         # file as warmed; there can be more than one.
         if parsed.status == "200":
-            for matched_repo_id, key in match_all_package_keys(parsed.path, by_basename):
+            for matched_repo_id, key in matches:
                 filename = packages_by_repo.get(matched_repo_id, {}).get(key, "")
                 try:
-                    store.record_warmed_package(matched_repo_id, key, filename, True, 200)
+                    store.record_warmed_package(matched_repo_id, key, filename, True, 200, source="client")
                 except Exception:
                     logger.exception("failed to update warmed_packages from a real request")

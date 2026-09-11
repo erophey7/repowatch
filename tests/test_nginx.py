@@ -25,6 +25,7 @@ def test_routes_match_parsers_and_warming():
         apt('ppa', 'https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu'),
         RepoConfig('apk', 'apk', 'https://alpine.test/alpine/v3.20/main', 'x86_64'),
         RepoConfig('rpm', 'dnf', 'https://rpm.test/9/BaseOS/x86_64/os', 'x86_64'),
+        RepoConfig('void', 'xbps', 'https://xbps.test/current', 'x86_64'),
     ])
     text = nginx.render(c)
     assert 'rewrite ^/arch/core/os/x86_64/(.*)$ /core/os/x86_64/$1 break;' in text
@@ -32,6 +33,8 @@ def test_routes_match_parsers_and_warming():
     assert 'location /alpine/v3.20/main/x86_64/' in text
     assert 'rewrite ^/ubuntu\\-security/(.*)$ /ubuntu/$1 break;' in text
     assert 'rewrite ^/rpm/rpm/(.*)$ /9/BaseOS/x86_64/os/$1 break;' in text
+    assert 'rewrite ^/xbps/void/(.*)$ /current/$1 break;' in text
+    assert 'location ~ ^/xbps/void/[^/]+-repodata$' in text
     assert 'arch-index-v2:$scheme$proxy_host$request_uri' in text
     assert 'location ~ ^/debian/dists/' in text
     assert nginx.render(replace(c, repos=list(reversed(c.repos)))) == text
@@ -209,6 +212,7 @@ def test_real_nginx_proxy_routes_and_cache(tmp_path):
                    url_template='/altlinux/p11/{arch}/'),
         RepoConfig('apk', 'apk', host + '/alpine/v3/main', 'x86_64'),
         RepoConfig('rpm', 'dnf', host + '/9/BaseOS/os', 'x86_64'),
+        RepoConfig('void', 'xbps', host + '/current', 'x86_64'),
     ])
     c = replace(c, nginx=replace(c.nginx, listen=f'127.0.0.1:{port}'))
     text = nginx.render(c, cache_dir=str(tmp_path / 'cache'), access_log=str(tmp_path / 'access.log'))
@@ -233,7 +237,9 @@ def test_real_nginx_proxy_routes_and_cache(tmp_path):
                  ('/alpine/v3/main/x86_64/APKINDEX.tar.gz', '/alpine/v3/main/x86_64/APKINDEX.tar.gz'),
                  ('/rpm/rpm/repodata/repomd.xml', '/9/BaseOS/os/repodata/repomd.xml'),
                  ('/altlinux/p11/x86_64/base/pkglist.classic.xz', '/p11/branch/x86_64/base/pkglist.classic.xz'),
-                 ('/altlinux/p11/x86_64/RPMS.classic/package.rpm', '/p11/branch/x86_64/RPMS.classic/package.rpm')]
+                 ('/altlinux/p11/x86_64/RPMS.classic/package.rpm', '/p11/branch/x86_64/RPMS.classic/package.rpm'),
+                 ('/xbps/void/x86_64-repodata', '/current/x86_64-repodata'),
+                 ('/xbps/void/bash-5.3_2.x86_64.xbps', '/current/bash-5.3_2.x86_64.xbps')]
         for local, remote in pairs:
             for attempt in range(2):
                 with urllib.request.urlopen(f'http://127.0.0.1:{port}{local}', timeout=5) as response:
@@ -477,6 +483,39 @@ def test_render_purge_key_matches_the_real_content_locations_key_format():
     text = nginx.render(c)
     assert 'proxy_cache_key "v7:$scheme$proxy_host$request_uri";' in text
     assert 'proxy_cache_purge repo_cache "v7:${scheme}deb.debian.org/debian/$1";' in nginx.render_purge(c)
+
+
+def test_render_purge_key_matches_dedup_uri_basis_when_dedup_is_also_enabled():
+    """Real bug found on production (2026-09-12, rocky-9-baseos-x86_64):
+    with nginx.enable_dedup on, the real content location's proxy_cache_key
+    switches from $request_uri (the local path) to $uri, which — after
+    that location's own internal `rewrite local -> remote` — holds the
+    POST-rewrite upstream-relative path instead. render_purge() must match
+    THAT basis, not the local path, or purge silently misses every real
+    cache entry (confirmed by hand: curl showed a real X-Cache-Status: HIT
+    immediately followed by 404 from the purge location for the identical
+    file)."""
+    c = config([apt()])
+    c = replace(c, nginx=replace(c.nginx, enable_purge=True, enable_dedup=True, cache_key_version='v7'))
+    text = nginx.render(c)
+    assert 'proxy_cache_key "v7:$scheme$proxy_host$uri";' in text
+    # NOT .../debian/$1 (the local prefix) — /debian/pool/main is the local
+    # prefix, but $uri after the location's own rewrite is the upstream
+    # path (apt() defaults upstream to deb.debian.org/debian, so local ==
+    # remote here — pick a repo whose local/remote genuinely differ to make
+    # the distinction unambiguous).
+    pacman_repo = RepoConfig('core', 'pacman', 'https://mirror.test/core/os/x86_64', 'x86_64', repo_name='core')
+    c2 = config([pacman_repo])
+    c2 = replace(c2, nginx=replace(c2.nginx, enable_purge=True, enable_dedup=True))
+    rendered = nginx.render(c2)
+    assert 'rewrite ^/arch/core/os/x86_64/(.*)$ /core/os/x86_64/$1 break;' in rendered
+    assert 'proxy_cache_key "$scheme$proxy_host$uri";' in rendered
+    purge_text = nginx.render_purge(c2)
+    # Local prefix (/arch/core/os/x86_64) must NOT appear as the key basis —
+    # that was the bug. The upstream-relative path (/core/os/x86_64, what
+    # $uri actually holds post-rewrite) must.
+    assert 'proxy_cache_purge repo_cache "${scheme}mirror.test/core/os/x86_64/$1";' in purge_text
+    assert '"${scheme}mirror.test/arch/core/os/x86_64/$1"' not in purge_text
 
 
 def test_purge_location_omitted_entirely_when_disabled_even_with_cache_key_version():

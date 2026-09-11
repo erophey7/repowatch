@@ -17,6 +17,7 @@ from repowatch.api import (
     delete_repo_payload,
     healthz_payload,
     metrics_payload,
+    prefetch_efficiency_payload,
     purge_candidates_payload,
     purge_selected_payload,
     remove_warmed_package_payload,
@@ -91,6 +92,27 @@ def test_repos_list_payload_lists_configured_repo(tmp_path):
     assert data[0]["warmed_count"] == 0
     assert data[0]["browse_url"] == "http://127.0.0.1:8080/alpine/v3.20/main/x86_64/"
     assert data[0]["last_check"] is None
+
+
+def test_repos_list_payload_exposes_key_expiry_and_warning_flag(tmp_path):
+    config_path, store = _setup(tmp_path)
+
+    status, data = repos_list_payload(config_path, store)
+    assert status == 200
+    assert data[0]["key_expires_at"] is None
+    assert data[0]["key_expiring_soon"] is False
+
+    far_future = (datetime.now(timezone.utc) + timedelta(days=200)).isoformat(timespec="seconds")
+    store.record_key_expiry("alpine-test", far_future)
+    status, data = repos_list_payload(config_path, store)
+    assert data[0]["key_expires_at"] == far_future
+    assert data[0]["key_expiring_soon"] is False
+
+    soon = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat(timespec="seconds")
+    store.record_key_expiry("alpine-test", soon)
+    status, data = repos_list_payload(config_path, store)
+    assert data[0]["key_expires_at"] == soon
+    assert data[0]["key_expiring_soon"] is True
 
 
 def test_repos_list_payload_reflects_recorded_snapshot(tmp_path):
@@ -534,6 +556,74 @@ def test_metrics_payload_healthy_zero_when_repo_stale(tmp_path):
     assert "repowatch_healthy 0" in body
 
 
+def test_metrics_payload_extended_gauges(tmp_path):
+    config_path, store = _setup(tmp_path)
+    _set_last_check(store, "alpine-test", datetime.now(timezone.utc) - timedelta(seconds=1000))
+    store.bump_failure("alpine-test", "gpg", "bad signature")
+    store.bump_failure("alpine-test", "gpg", "bad signature")
+    store.ban_package("alpine-test", "musl")
+
+    status, body = metrics_payload(config_path, store)
+
+    assert status == 200
+    assert 'repowatch_repo_stale{repo_id="alpine-test"} 1' in body
+    assert 'repowatch_repo_consecutive_failures{repo_id="alpine-test",kind="gpg"} 2' in body
+    assert 'repowatch_repo_consecutive_failures{repo_id="alpine-test",kind="prefetch"} 0' in body
+    assert 'repowatch_repo_banned_packages{repo_id="alpine-test"} 1' in body
+    assert 'repowatch_repos_by_type{type="apk"} 1' in body
+    assert "repowatch_state_db_bytes " in body
+    # syslog_listener is off by default — no per-repo request gauges emitted.
+    assert "repowatch_repo_requests" not in body
+
+
+def test_metrics_payload_key_expiry_gauges(tmp_path):
+    config_path, store = _setup(tmp_path)
+
+    status, body = metrics_payload(config_path, store)
+    assert status == 200
+    # never checked yet — no key_expires_at recorded, gauges absent for this repo
+    assert 'repowatch_repo_key_expires_at_timestamp_seconds{repo_id="alpine-test"}' not in body
+    assert 'repowatch_repo_key_expiring_soon{repo_id="alpine-test"}' not in body
+
+    soon = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat(timespec="seconds")
+    store.record_key_expiry("alpine-test", soon)
+    status, body = metrics_payload(config_path, store)
+    assert 'repowatch_repo_key_expires_at_timestamp_seconds{repo_id="alpine-test"}' in body
+    assert 'repowatch_repo_key_expiring_soon{repo_id="alpine-test"} 1' in body
+
+    far_future = (datetime.now(timezone.utc) + timedelta(days=200)).isoformat(timespec="seconds")
+    store.record_key_expiry("alpine-test", far_future)
+    status, body = metrics_payload(config_path, store)
+    assert 'repowatch_repo_key_expiring_soon{repo_id="alpine-test"} 0' in body
+
+
+def test_metrics_payload_includes_request_gauges_only_when_syslog_listener_enabled(tmp_path):
+    config_path, store = _setup(tmp_path)
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO request_events (ts, repo_id, client_ip, method, path, status, cache_status) "
+            "VALUES (?, ?, ?, 'GET', '/alpine/x', '200', ?)",
+            ("2026-01-01T00:00:00+00:00", "alpine-test", "192.0.2.1", "HIT"),
+        )
+        conn.execute(
+            "INSERT INTO request_events (ts, repo_id, client_ip, method, path, status, cache_status) "
+            "VALUES (?, ?, ?, 'GET', '/alpine/y', '200', ?)",
+            ("2026-01-01T00:00:01+00:00", "alpine-test", "192.0.2.1", "MISS"),
+        )
+
+    status, body = metrics_payload(config_path, store)
+    assert status == 200
+    assert "repowatch_repo_requests" not in body
+
+    raw = config_path.read_text()
+    config_path.write_text(raw + "\nsyslog_listener:\n  enabled: true\n")
+
+    status, body = metrics_payload(config_path, store)
+    assert status == 200
+    assert 'repowatch_repo_requests{repo_id="alpine-test"} 2' in body
+    assert 'repowatch_repo_requests_cache_hit{repo_id="alpine-test"} 1' in body
+
+
 def test_metrics_payload_returns_500_on_broken_config(tmp_path):
     config_path, store = _setup(tmp_path)
     config_path.write_text("this is not valid yaml: [unclosed")
@@ -578,6 +668,30 @@ def test_requests_summary_payload_shape(tmp_path):
     assert data["by_client_ip"][0] == {"key": "1.1.1.1", "count": 2}
     assert data["by_path"][0] == {"key": "/x.apk", "count": 2}
     assert {"key": "alpine-test", "count": 3} in data["by_repo"]
+    assert data["timeline"][0]["total"] == 3
+    assert data["timeline"][0]["hits"] == 2
+    assert {"repo_id": "alpine-test", "total": 3, "hits": 2} in data["cache_hit_stats"]
+
+
+def test_requests_summary_payload_timeline_respects_repo_filter(tmp_path):
+    _config_path, store = _setup(tmp_path)
+    store.record_request("alpine-test", "1.1.1.1", "GET", "/x.apk", "200", "HIT")
+    store.record_request("other-repo", "9.9.9.9", "GET", "/z.apk", "200", "HIT")
+
+    status, data = requests_summary_payload(store, repo_id="alpine-test")
+
+    assert status == 200
+    assert sum(bucket["total"] for bucket in data["timeline"]) == 1
+
+
+def test_prefetch_efficiency_payload(tmp_path):
+    _config_path, store = _setup(tmp_path)
+    assert prefetch_efficiency_payload(store) == (200, {"items": []})
+
+    store.record_warmed_package("alpine-test", "musl-1.2.5-r0", "musl-1.2.5-r0.apk", True, 200, source="prefetch")
+    status, data = prefetch_efficiency_payload(store)
+    assert status == 200
+    assert data == {"items": [{"repo_id": "alpine-test", "prefetched": 1, "used": 0, "ratio": 0.0}]}
 
 
 def test_requests_summary_payload_filters_by_repo(tmp_path):
@@ -747,6 +861,7 @@ def test_safe_config_payload_returns_current_values(tmp_path):
     assert data["check_concurrency"] == 8
     assert data["prefetch_bandwidth_limit"] is None
     assert data["cache_base_url"] == "http://127.0.0.1:8080"
+    assert data["key_expiry_warning_days"] == 30
 
 
 def test_update_safe_config_disabled_without_admin_password(tmp_path):

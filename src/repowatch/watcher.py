@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 import httpx
 
 from repowatch.config import Config, ConfigError, RepoConfig, load_config
-from repowatch.gpgverify import SignatureError
+from repowatch.gpgverify import SignatureError, soonest_key_expiry
 from repowatch.notifications import record_failure_and_maybe_notify, record_success_and_maybe_notify
 from repowatch.parsers import PARSERS
 from repowatch.parsers.base import IndexHeadResult
@@ -35,7 +35,43 @@ _SCHEDULER_TICK_SECONDS = 10
 _PRUNE_INTERVAL_SECONDS = 3600
 
 
+async def _check_key_expiry(config: Config, repo: RepoConfig, store: StateStore) -> None:
+    """Trust state (docs_dev/ROADMAP.md item 20) — runs unconditionally at
+    the very start of every check cycle, independent of whether the index
+    itself turns out to be unchanged: a quiet repository that rarely
+    changes must still get its signing key's expiry reassessed on
+    schedule, not only when there happens to be a new snapshot to record.
+
+    apk is excluded — its embedded RSA keys (see apkverify.py) have no
+    expiry concept at all, unlike apt/pacman/dnf/apt-rpm's GPG keys.
+    Notification reuses the same (repo_id, kind) consecutive-streak
+    mechanism as repeated warm/gpg-verification failures (kind=
+    "key_expiry") — "still within the warning window" behaves exactly like
+    "still failing" for that purpose: notify once when first crossed, once
+    more on recovery (renewed past the threshold), silent in between.
+    """
+    if repo.verify_signature and repo.type != "apk" and repo.keyring_path:
+        expires_at = await asyncio.to_thread(soonest_key_expiry, repo.keyring_path)
+    else:
+        expires_at = None
+    store.record_key_expiry(repo.id, expires_at)
+
+    if expires_at is None:
+        await record_success_and_maybe_notify(config, store, repo.id, "key_expiry")
+        return
+    remaining_days = (datetime.fromisoformat(expires_at) - datetime.now(timezone.utc)).days
+    if remaining_days < config.key_expiry_warning_days:
+        await record_failure_and_maybe_notify(
+            config, store, repo.id, "key_expiry",
+            f"soonest key in keyring expires {expires_at} ({remaining_days} day(s) left)",
+        )
+    else:
+        await record_success_and_maybe_notify(config, store, repo.id, "key_expiry")
+
+
 async def check_repo(config: Config, repo: RepoConfig, store: StateStore) -> None:
+    await _check_key_expiry(config, repo, store)
+
     parser_cls = PARSERS[repo.type]
     parser = parser_cls(repo)
 

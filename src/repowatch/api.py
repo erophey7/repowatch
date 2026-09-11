@@ -61,7 +61,14 @@ Endpoints:
                                          and .../warmed above) — requires syslog_listener.enabled
                                          in config.yaml
     GET /api/requests/summary         — aggregates for dashboard charts: top IPs,
-                                         top paths, requests per repository (query ?repo_id=)
+                                         top paths, requests per repository, an hourly
+                                         timeline, and per-repo cache HIT/MISS counts
+                                         (query ?repo_id=&timeline_hours=1..720, default 24)
+    GET /api/prefetch-efficiency      — per repo, of what repowatch actively prefetched
+                                         ahead of demand, how much a client actually went
+                                         on to request (see StateStore.get_prefetch_efficiency,
+                                         docs_dev/ROADMAP.md item 19) — requires
+                                         syslog_listener.enabled to have any data to show
     GET /healthz                      — 200 if every repository was checked within the last
                                          3×check_interval (see healthz_payload), otherwise 503
     GET /metrics                      — Prometheus text format (see metrics_payload) —
@@ -88,7 +95,7 @@ import logging
 import os
 import ssl
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
@@ -145,6 +152,7 @@ def repos_list_payload(config_path: str | Path, store: StateStore) -> tuple[int,
             browse_url = f"{current.browse_base_url}{_repo_url_prefix(repo)}/"
         except ValueError:
             browse_url = None
+        key_expires_at = status.get("key_expires_at")
         result.append(
             {
                 "id": repo.id,
@@ -157,6 +165,20 @@ def repos_list_payload(config_path: str | Path, store: StateStore) -> tuple[int,
                 "check_interval": current.effective_check_interval(repo),
                 "last_check": status.get("last_check"),
                 "changed_at": status.get("changed_at"),
+                # Trust state (docs_dev/ROADMAP.md item 20) — the soonest
+                # expiring key in this repo's keyring, from the last check
+                # cycle (see gpgverify.soonest_key_expiry). None for apk
+                # repos, repos without verify_signature, or when unknown
+                # (e.g. the full `gpg` binary isn't installed). Computed
+                # once per check_interval by the watcher, not on this
+                # request — a live `gpg` call on every dashboard poll would
+                # be wasteful, see repowatch_repo_key_expires_at in metrics.
+                "key_expires_at": key_expires_at,
+                "key_expiring_soon": (
+                    key_expires_at is not None
+                    and datetime.fromisoformat(key_expires_at) - datetime.now(timezone.utc)
+                    < timedelta(days=current.key_expiry_warning_days)
+                ),
                 # Raw RepoConfig fields as-is (unlike check_interval above,
                 # which is already merged with the global default) — used
                 # to pre-fill the dashboard edit form, so "inherits the
@@ -338,16 +360,33 @@ def delete_repo_payload(
     return 200, {"deleted": repo_id}
 
 
-def requests_summary_payload(store: StateStore, repo_id: str | None) -> tuple[int, dict]:
+def requests_summary_payload(store: StateStore, repo_id: str | None, timeline_hours: int = 24) -> tuple[int, dict]:
     """Aggregates for the dashboard's request charts (top IPs/paths, requests
-    per repository) — already-computed counters, separate from the paged
-    request list. by_repo ignores the repo_id filter (it's already broken
-    down by repository)."""
+    per repository, an hourly timeline, and per-repo cache HIT/MISS) —
+    already-computed counters, separate from the paged request list. by_repo
+    and cache_hit_stats ignore the repo_id filter (already broken down by
+    repository); timeline respects it (a per-repo or global chart, per the
+    dashboard's current selection)."""
     return 200, {
         "by_client_ip": store.get_top_client_ips(repo_id=repo_id),
         "by_path": store.get_top_request_paths(repo_id=repo_id),
         "by_repo": store.get_requests_by_repo(),
+        "timeline": store.get_requests_timeline(repo_id=repo_id, hours=timeline_hours),
+        "cache_hit_stats": [
+            {"repo_id": rid, "total": v["total"], "hits": v["hits"]}
+            for rid, v in store.get_request_hit_stats().items()
+        ],
     }
+
+
+def prefetch_efficiency_payload(store: StateStore) -> tuple[int, dict]:
+    """docs_dev/ROADMAP.md item 19 — of what repowatch actively prefetched
+    ahead of demand per repo, how much was actually requested by a client
+    afterward. See StateStore.get_prefetch_efficiency for the exact
+    correlation. Always 200: an empty list (no repo has prefetched anything
+    yet, or syslog_listener is disabled so nothing can be linked to a
+    request) is a normal state, not an error."""
+    return 200, {"items": store.get_prefetch_efficiency()}
 
 
 def warm_packages_payload(
@@ -710,6 +749,7 @@ SAFE_CONFIG_FIELDS: dict[str, Callable[[Any], Any]] = {
     "cache_base_url": _cast_url,
     "public_cache_url": _cast_optional_url,
     "notify_after_failures": _cast_int,
+    "key_expiry_warning_days": _cast_int,
 }
 
 
@@ -923,14 +963,140 @@ def metrics_payload(config_path: str | Path, store: StateStore) -> tuple[int, st
             label = _escape_label_value(repo.id)
             lines.append(f'repowatch_repo_changed_at_timestamp_seconds{{repo_id="{label}"}} {ts}')
 
+    lines.append(
+        "# HELP repowatch_repo_key_expires_at_timestamp_seconds Unix timestamp of the soonest "
+        "expiring GPG key in this repo's keyring (docs_dev/ROADMAP.md item 20) — absent for apk "
+        "repos, repos without verify_signature, or when unknown."
+    )
+    lines.append("# TYPE repowatch_repo_key_expires_at_timestamp_seconds gauge")
+    for repo in current.repos:
+        key_expires_at = statuses[repo.id].get("key_expires_at")
+        if key_expires_at:
+            ts = datetime.fromisoformat(key_expires_at).timestamp()
+            label = _escape_label_value(repo.id)
+            lines.append(f'repowatch_repo_key_expires_at_timestamp_seconds{{repo_id="{label}"}} {ts}')
+
+    lines.append(
+        "# HELP repowatch_repo_key_expiring_soon Whether the soonest expiring key is within "
+        "key_expiry_warning_days (1) or not (0) — absent (not 0) when there is no known expiry "
+        "to compare, same reasoning as repowatch_repo_stale."
+    )
+    lines.append("# TYPE repowatch_repo_key_expiring_soon gauge")
+    for repo in current.repos:
+        key_expires_at = statuses[repo.id].get("key_expires_at")
+        if key_expires_at:
+            soon = datetime.fromisoformat(key_expires_at) - datetime.now(timezone.utc) < timedelta(
+                days=current.key_expiry_warning_days)
+            label = _escape_label_value(repo.id)
+            lines.append(f'repowatch_repo_key_expiring_soon{{repo_id="{label}"}} {1 if soon else 0}')
+
     stale = _repo_staleness(current, store, statuses)
+    stale_ids = {item["repo_id"] for item in stale}
+    lines.append(
+        "# HELP repowatch_repo_stale Whether this repo's last check is older than "
+        f"{_HEALTHZ_STALE_MULTIPLIER}x its check_interval (1) or not (0) — a repo never "
+        "checked at all is not stale, see /healthz."
+    )
+    lines.append("# TYPE repowatch_repo_stale gauge")
+    for repo in current.repos:
+        label = _escape_label_value(repo.id)
+        lines.append(f'repowatch_repo_stale{{repo_id="{label}"}} {1 if repo.id in stale_ids else 0}')
+
     lines.append(
         "# HELP repowatch_healthy Whether repowatch considers itself healthy (1) or not (0) — see /healthz."
     )
     lines.append("# TYPE repowatch_healthy gauge")
     lines.append(f"repowatch_healthy {0 if stale else 1}")
 
+    failure_counts = store.get_failure_counts()
+    lines.append(
+        "# HELP repowatch_repo_consecutive_failures Current consecutive-failure streak for this "
+        "repo and kind (gpg: signature/checksum verification, prefetch: at least one warm failure "
+        "in a check cycle) — 0 once the streak is reset by a success, see notifications.py."
+    )
+    lines.append("# TYPE repowatch_repo_consecutive_failures gauge")
+    for repo in current.repos:
+        label = _escape_label_value(repo.id)
+        for kind in ("gpg", "prefetch"):
+            count = failure_counts.get((repo.id, kind), 0)
+            lines.append(f'repowatch_repo_consecutive_failures{{repo_id="{label}",kind="{kind}"}} {count}')
+
+    ban_counts = store.get_ban_counts()
+    lines.append(
+        "# HELP repowatch_repo_banned_packages Number of package names currently excluded "
+        "from auto-warm for this repo (prefetch_bans)."
+    )
+    lines.append("# TYPE repowatch_repo_banned_packages gauge")
+    for repo in current.repos:
+        label = _escape_label_value(repo.id)
+        lines.append(f'repowatch_repo_banned_packages{{repo_id="{label}"}} {ban_counts.get(repo.id, 0)}')
+
+    type_counts: dict[str, int] = {}
+    for repo in current.repos:
+        type_counts[repo.type] = type_counts.get(repo.type, 0) + 1
+    lines.append(
+        "# HELP repowatch_repos_by_type Number of configured repositories of this type."
+    )
+    lines.append("# TYPE repowatch_repos_by_type gauge")
+    for repo_type, count in sorted(type_counts.items()):
+        label = _escape_label_value(repo_type)
+        lines.append(f'repowatch_repos_by_type{{type="{label}"}} {count}')
+
+    lines.append(
+        "# HELP repowatch_state_db_bytes Size in bytes of the state_db SQLite file."
+    )
+    lines.append("# TYPE repowatch_state_db_bytes gauge")
+    lines.append(f"repowatch_state_db_bytes {store.get_storage_stats()['state_db_bytes']}")
+
+    if current.syslog_listener.enabled:
+        # Only emitted when the syslog listener is on — otherwise request_events
+        # stays empty and these gauges would be a misleading, permanent 0 rather
+        # than "not tracked". repo_id is bounded by the number of configured
+        # repos (already used as a label above); the unmatched (repo_id IS NULL)
+        # bucket is skipped here, same as everywhere else, to avoid a label
+        # that isn't one of the fixed repo_ids.
+        hit_stats = store.get_request_hit_stats()
+        lines.append(
+            "# HELP repowatch_repo_requests Number of client requests recorded for this repo "
+            "within the current request_events retention window (see request_retention_days/"
+            "request_max_rows) — a gauge, not a running total."
+        )
+        lines.append("# TYPE repowatch_repo_requests gauge")
+        for repo in current.repos:
+            label = _escape_label_value(repo.id)
+            total = hit_stats.get(repo.id, {}).get("total", 0)
+            lines.append(f'repowatch_repo_requests{{repo_id="{label}"}} {total}')
+
+        lines.append(
+            "# HELP repowatch_repo_requests_cache_hit Of repowatch_repo_requests, how many nginx "
+            "reported as a cache HIT (cache_status)."
+        )
+        lines.append("# TYPE repowatch_repo_requests_cache_hit gauge")
+        for repo in current.repos:
+            label = _escape_label_value(repo.id)
+            hits = hit_stats.get(repo.id, {}).get("hits", 0)
+            lines.append(f'repowatch_repo_requests_cache_hit{{repo_id="{label}"}} {hits}')
+
     return 200, "\n".join(lines) + "\n"
+
+
+# The versioned prefix covers only the client-facing status API — the one
+# external host agents poll (`status.json`, `/healthz`, `/metrics`) — not the
+# admin/dashboard API, which stays tied to the dashboard's own version and is
+# never promised stable to outside consumers. `/api/v1/...` is currently a
+# pure alias for the same unversioned routes below; a future breaking change
+# to this specific contract would land in `/api/v2/` instead, leaving `v1`
+# (and the unversioned routes, kept as a permanent alias of it) working.
+_V1_PREFIX = "/api/v1"
+
+
+def _normalize_v1_path(path: str) -> str:
+    if not path.startswith(_V1_PREFIX + "/"):
+        return path
+    rest = path[len(_V1_PREFIX):]
+    if rest in ("/healthz", "/metrics", "/status.json") or rest.startswith("/status/"):
+        return rest
+    return path
 
 
 def make_handler(
@@ -1014,6 +1180,7 @@ def make_handler(
 
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
+            parsed = parsed._replace(path=_normalize_v1_path(parsed.path))
             parts = [p for p in parsed.path.split("/") if p]
 
             if parsed.path == '/healthz':
@@ -1036,7 +1203,8 @@ def make_handler(
             # Explicit read allowlist: future administrative GET routes stay closed.
             guest_route = (
                 parsed.path in ('/', '/dashboard', '/api/auth/session', '/api/repos',
-                                '/api/requests', '/api/requests/summary', '/api/config')
+                                '/api/requests', '/api/requests/summary', '/api/config',
+                                '/api/prefetch-efficiency')
                 or is_status
                 or (len(parts) == 3 and parts[0] == 'status' and parts[2] == 'history')
                 or (len(parts) == 4 and parts[:2] == ['api', 'repos']
@@ -1144,7 +1312,14 @@ def make_handler(
             if parsed.path == "/api/requests/summary":
                 qs = parse_qs(parsed.query)
                 repo_id = qs.get("repo_id", [None])[0]
-                status, payload = requests_summary_payload(store, repo_id)
+                try:
+                    timeline_hours = int(qs.get("timeline_hours", ["24"])[0])
+                    if not 1 <= timeline_hours <= 24 * 30:
+                        raise ValueError()
+                except ValueError:
+                    self._json({'error': 'timeline_hours must be 1..720'}, status=400)
+                    return
+                status, payload = requests_summary_payload(store, repo_id, timeline_hours)
                 self._json(payload, status=status)
                 return
 
@@ -1152,6 +1327,11 @@ def make_handler(
                 qs = parse_qs(parsed.query)
                 repo_id = qs.get("repo_id", [None])[0]
                 status, payload = paged_payload(store, "requests", repo_id, parsed.query)
+                self._json(payload, status=status)
+                return
+
+            if parsed.path == "/api/prefetch-efficiency":
+                status, payload = prefetch_efficiency_payload(store)
                 self._json(payload, status=status)
                 return
 

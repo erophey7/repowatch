@@ -1,11 +1,12 @@
 import asyncio
-import builtins
 import bz2
 from dataclasses import replace
 import gzip
 import hashlib
 import lzma
 from pathlib import Path
+import shutil
+import subprocess
 from unittest.mock import Mock
 import xml.etree.ElementTree as ET
 
@@ -138,21 +139,27 @@ def test_standard_compressions_and_optional_open_checksum(suffix, compress):
     assert len(_checked_primary(packed, metadata, 'x86_64')) == 3
 
 
+@pytest.mark.skipif(shutil.which('zstd') is None, reason="system 'zstd' binary is not installed")
 def test_zstandard_when_available():
-    zstd = pytest.importorskip('compression.zstd')
-    with _open_primary(zstd.compress(PRIMARY), 'primary.xml.zst') as stream:
+    # Compressed with the real system zstd binary, the same tool
+    # _open_primary now shells out to for decompression (not
+    # compression.zstd) — see parsers/dnf.py's _ZstdSubprocessStream.
+    packed = subprocess.run(['zstd', '-c', '-q'], input=PRIMARY, capture_output=True, check=True).stdout
+    with _open_primary(packed, 'primary.xml.zst') as stream:
         assert stream.read() == PRIMARY
 
 
-def test_zstandard_missing_stdlib_has_actionable_error(monkeypatch):
-    original_import = builtins.__import__
-    def import_without_zstd(name, *args, **kwargs):
-        if name == 'compression':
-            raise ImportError('unavailable')
-        return original_import(name, *args, **kwargs)
-    monkeypatch.setattr(builtins, '__import__', import_without_zstd)
-    with pytest.raises(ValueError, match='Python 3.14'):
+def test_zstandard_missing_binary_has_actionable_error(monkeypatch):
+    monkeypatch.setattr('repowatch.parsers.dnf.shutil.which', lambda name: None)
+    with pytest.raises(ValueError, match='zstd'):
         _open_primary(b'anything', 'primary.xml.zst')
+
+
+@pytest.mark.skipif(shutil.which('zstd') is None, reason="system 'zstd' binary is not installed")
+def test_zstandard_decompression_failure_is_reported():
+    with pytest.raises(ValueError, match='zstd'):
+        with _open_primary(b'not actually zstd-compressed data', 'primary.xml.zst') as stream:
+            stream.read()
 
 
 @pytest.mark.parametrize('href', ['primary.xml.zck', 'primary.sqlite.bz2.unknown'])

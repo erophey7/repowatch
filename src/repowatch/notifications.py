@@ -36,7 +36,11 @@ async def record_failure_and_maybe_notify(
 ) -> None:
     """Record another failure in the (repo_id, kind) streak and, if the
     threshold was just reached (and this streak hasn't been notified yet),
-    send a webhook. kind: "prefetch" | "gpg"."""
+    send a webhook. kind: "prefetch" | "gpg" | "key_expiry" (the last one —
+    docs_dev/ROADMAP.md item 20 — behaves slightly differently in spirit
+    from the other two: it's not a transient failure but "still within the
+    expiry warning window", reassessed once per check_repo cycle by
+    watcher._check_key_expiry; the mechanism itself is identical)."""
     count, already_notified = store.bump_failure(repo_id, kind, message)
 
     if not config.notify_webhook_url or already_notified or count < config.notify_after_failures:

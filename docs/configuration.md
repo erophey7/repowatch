@@ -52,7 +52,7 @@ and adding a new one; there's no rename.
 | Field | Type | Default | Applies to | Notes |
 |---|---|---|---|---|
 | `id` | string | — (required) | all | Stable identifier. Immutable in practice — see above. |
-| `type` | `pacman` \| `apt` \| `apk` \| `dnf` \| `apt-rpm` | — (required) | all | Selects the index parser. `dnf` covers any RPM-MD repository (Rocky, Fedora, openSUSE, …), not just Fedora/DNF-branded ones. `apt-rpm` is for ALT Linux-style apt-over-RPM repositories, not RPM-MD. |
+| `type` | `pacman` \| `apt` \| `apk` \| `dnf` \| `apt-rpm` \| `xbps` | — (required) | all | Selects the index parser. `dnf` covers any RPM-MD repository (Rocky, Fedora, openSUSE, …), not just Fedora/DNF-branded ones. `apt-rpm` is for ALT Linux-style apt-over-RPM repositories, not RPM-MD. `xbps` is Void Linux; it requires the system `zstd` binary (see the README) and does not support `verify_signature`. |
 | `upstream` | URL | — (required) | all | The real upstream mirror address. repowatch's own index checks go straight here; warm-up requests go through `cache_base_url` instead (see architecture note in the README). |
 | `arch` | string | — (required) | all | Target architecture (`x86_64`, `amd64`, `i686`, `noarch`, …). One `RepoConfig` = one architecture; to mirror multiple architectures of the same repository, add multiple entries (see `group` below for grouping them visually). |
 | `prefetch` | bool | `true` | all | Whether repowatch actively warms new packages into the cache. Set `false` for repositories you only want indexed/tracked in `status.json` without eagerly pulling every new package (useful for very large or rarely-used repos). |
@@ -91,6 +91,13 @@ and adding a new one; there's no rename.
   the system `openssl` binary, or via `apk-tools >= 3.0` if you set
   `apk_signature_backend: apk-tools`. There is no plain-OpenPGP option for
   apk — `keyring_path` is not used here.
+- **xbps** (Void Linux): `verify_signature: true` is rejected at config
+  time. Unlike every other type here, XBPS repositories don't publish a
+  signed index at all (`<arch>-repodata` has no accompanying `.sig`/`.sig2`
+  upstream); trust instead comes from a per-*package* RSA signature
+  (`<file>.xbps.sig2`), checked by the real `xbps` client at install time —
+  a different shape of verification (per package, at warm-time) that isn't
+  implemented yet.
 
 A repository with `verify_signature: true` and a missing/wrong keyring or
 key is not silently skipped — the check fails, the last good snapshot is
@@ -198,7 +205,7 @@ config actually serves them.
 | `package_ttl` | int (seconds) | `15552000` (180 days) | `proxy_cache_valid` for immutable package files, addressed by exact version/checksum. |
 | `cache_dir` | path or `null` | `null` | **Read-only/informational** — the actual cache directory nginx writes to is set once, at install time, in the root-owned `policy.json` (see `CACHE_DIR` in [deployment.md](deployment.md)), not here. Setting this makes the path visible in `config.yaml` instead of hidden inside a file the service user can't read; `nginx-apply` cross-checks it against `policy.json` and refuses to apply on a mismatch, so it can't silently go stale. To actually change the cache directory: `CACHE_DIR=... make install && sudo make activate`. Setting it also unlocks the cache directory's size in `repowatch stats --cache-dir` and the dashboard's Storage panel ("Calculate cache directory size") — without it there is no path to walk, so that number is simply omitted rather than guessed at or defaulted to zero. **A real permissions caveat, found on a live deployment**: nginx creates `proxy_cache_path`'s `levels=1:2` subdirectories `0700`, owned by the nginx worker user (e.g. `www-data`) — regardless of the top-level `cache_dir`'s own mode. The repowatch service user is a deliberately different, unprivileged account (see "Ключевые решения" in CLAUDE.md), so on most real installs it can list the top-level directory but cannot descend into any of the hashed subdirectories at all. When that happens the reported size is a real undercount, but it is never silently wrong: the result includes `inaccessible_directories` (CLI prints a `WARNING`, the dashboard shows it in red) whenever this happens, so a permission wall doesn't read as "the cache is empty". There is no supported way to make this fully accurate without either running the walk as `root`/the nginx user (against the privilege-separation this project deliberately keeps) or granting broader read access to the cache tree yourself. |
 | `enable_purge` | bool | `false` | Actively evict a package's cache entry the moment it disappears from the upstream index, instead of waiting for `inactive`/`max_size` to notice on their own. Requires the third-party `ngx_cache_purge` nginx module (Debian/Ubuntu: `libnginx-mod-http-cache-purge`; Arch: `nginx-mod-cache_purge`) — **not** the nginx-plus `proxy_cache_purge on` API, and not a real `PURGE` HTTP method (nginx core rejects unknown methods outright); the generator instead adds a dedicated, loopback-only `GET /purge<prefix>/...` location per repository. You must separately add `load_module ".../ngx_http_cache_purge_module.so";` to your own main `nginx.conf` — that's a main-context directive the generated file (which lives inside `http{}`/`sites-enabled`) can't emit itself. Without the module loaded, `nginx -t` fails clearly during `nginx-apply` and the usual atomic rollback applies — it doesn't silently do nothing. When it's on, the dashboard's per-repository panel also gets a "Cache purge (stale warmed entries)" section: "Scan for stale entries" computes candidates from repowatch's own records only (no nginx/network call), then "Purge selected" is the only point that actually asks nginx — its 200/404 response IS the "was this cached" answer, so there's no separate non-destructive pre-check (a live HEAD/GET probe against the same cache key real traffic uses has a real correctness cost/risk — see `docs_dev/ROADMAP.md` item 32 for the full reasoning). |
-| `enable_dedup` | bool | `false` | When two DIFFERENT repositories publish the byte-identical file (e.g. the same binary package shipped by both Debian and Ubuntu), serve and cache it once instead of twice. Detected from a per-package SHA256 that apt/pacman/dnf indexes already publish — apk and apt-rpm packages never participate (see below). No extra download or storage of file content is needed; only the already-parsed index metadata is compared. |
+| `enable_dedup` | bool | `false` | When two DIFFERENT repositories publish the byte-identical file (e.g. the same binary package shipped by both Debian and Ubuntu), serve and cache it once instead of twice. Detected from a per-package SHA256 that apt/pacman/dnf/xbps indexes already publish — apk and apt-rpm packages never participate (see below). No extra download or storage of file content is needed; only the already-parsed index metadata is compared. |
 
 **Purge locations live in a separate included file.** When `enable_purge` is
 on, the generated `active.conf` doesn't inline the purge locations among the
@@ -213,9 +220,10 @@ you're generating the config manually with `nginx-render` (no `--policy`,
 no root), the purge locations print as a separate labeled block after the
 main config — save it to the path nginx will `include`.
 
-**How dedup works, and its one real limitation.** Only apt, pacman, and dnf
-packages carry a per-package SHA256 in their index today (apt's `SHA256:`
-field, pacman's `%SHA256SUM%`, dnf's `<checksum type="sha256">`) — apk's
+**How dedup works, and its one real limitation.** Only apt, pacman, dnf, and
+xbps packages carry a per-package SHA256 in their index today (apt's
+`SHA256:` field, pacman's `%SHA256SUM%`, dnf's `<checksum type="sha256">`,
+xbps's `filename-sha256`) — apk's
 `APKINDEX` `C:` field is a different digest (SHA1, base64) that could never
 match a real cross-format duplicate, and apt-rpm's binary pkglist doesn't
 currently carry a verified whole-file digest; both are deliberately left out

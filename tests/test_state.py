@@ -425,6 +425,186 @@ def test_reset_failure_reports_false_when_series_was_never_notified(tmp_path):
     assert store.reset_failure("r", "prefetch") is False
 
 
+def test_get_failure_counts_reflects_active_streaks_only(tmp_path):
+    store = _store(tmp_path)
+    store.bump_failure("r", "gpg", "x")
+    store.bump_failure("r", "gpg", "x")
+    store.bump_failure("r", "prefetch", "y")
+    store.bump_failure("other-repo", "gpg", "z")
+
+    assert store.get_failure_counts() == {
+        ("r", "gpg"): 2,
+        ("r", "prefetch"): 1,
+        ("other-repo", "gpg"): 1,
+    }
+
+    store.reset_failure("r", "prefetch")
+    assert ("r", "prefetch") not in store.get_failure_counts()
+
+
+def test_get_ban_counts_groups_by_repo(tmp_path):
+    store = _store(tmp_path)
+    store.ban_package("r", "musl")
+    store.ban_package("r", "linux-headers")
+    store.ban_package("other-repo", "musl")
+
+    assert store.get_ban_counts() == {"r": 2, "other-repo": 1}
+
+
+def test_migration_adds_package_link_and_source_columns_to_existing_db(tmp_path):
+    """A database created before item 19's package_key/package_repo_id
+    (request_events), source (warmed_packages), and item 20's
+    key_expires_at (repo_state) columns must upgrade in place — the CREATE
+    INDEX referencing the item 19 columns lives in _migrate(), not SCHEMA,
+    specifically so it doesn't run before ALTER TABLE has added them (see
+    the comment on idx_request_events_package)."""
+    path = tmp_path / "state.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.executescript("""
+            CREATE TABLE repo_state (
+                repo_id TEXT PRIMARY KEY, last_check TEXT, changed_at TEXT,
+                index_etag TEXT, index_last_modified TEXT, package_count INTEGER
+            );
+            CREATE TABLE repo_packages (
+                repo_id TEXT, package_key TEXT, package_name TEXT, filename TEXT,
+                content_hash TEXT, PRIMARY KEY(repo_id, package_key));
+            CREATE TABLE repo_events (
+                id INTEGER PRIMARY KEY, repo_id TEXT, ts TEXT,
+                new_packages TEXT, removed_packages TEXT);
+            CREATE TABLE request_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, repo_id TEXT,
+                client_ip TEXT, method TEXT NOT NULL, path TEXT NOT NULL,
+                status TEXT, cache_status TEXT);
+            CREATE TABLE warmed_packages (
+                repo_id TEXT NOT NULL, package_key TEXT NOT NULL, filename TEXT NOT NULL,
+                warmed_at TEXT NOT NULL, status TEXT NOT NULL, http_status INTEGER,
+                PRIMARY KEY (repo_id, package_key));
+            CREATE TABLE prefetch_bans (repo_id TEXT, package_name TEXT, banned_at TEXT,
+                PRIMARY KEY (repo_id, package_name));
+            CREATE TABLE failure_state (repo_id TEXT, kind TEXT, consecutive_failures INTEGER,
+                last_error TEXT, last_failure_at TEXT, notified INTEGER,
+                PRIMARY KEY (repo_id, kind));
+            CREATE TABLE host_tokens (id TEXT PRIMARY KEY, name TEXT, token_hash TEXT,
+                created_at TEXT, expires_at TEXT, revoked_at TEXT, last_used_at TEXT);
+        """)
+        conn.execute(
+            "INSERT INTO request_events (ts, repo_id, client_ip, method, path, status, cache_status) "
+            "VALUES ('2026-01-01T00:00:00+00:00', 'r', '192.0.2.1', 'GET', '/x', '200', 'HIT')"
+        )
+        conn.execute(
+            "INSERT INTO warmed_packages (repo_id, package_key, filename, warmed_at, status, http_status) "
+            "VALUES ('r', 'a-1', 'a-1.deb', '2026-01-01T00:00:00+00:00', 'ok', 200)"
+        )
+
+    store = StateStore(path)
+
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert {"package_key", "package_repo_id"} <= {
+            row[1] for row in conn.execute("PRAGMA table_info(request_events)")}
+        assert "source" in {row[1] for row in conn.execute("PRAGMA table_info(warmed_packages)")}
+        assert "key_expires_at" in {row[1] for row in conn.execute("PRAGMA table_info(repo_state)")}
+
+    # Pre-existing rows survive with NULL for the new columns, not an error.
+    assert store.get_request_hit_stats() == {"r": {"total": 1, "hits": 1}}
+    assert store.get_warmed_packages("r")[0]["package_key"] == "a-1"
+
+    # Re-opening (idempotent migration) and normal writes both still work.
+    store2 = StateStore(path)
+    store2.record_warmed_package("r", "b-1", "b-1.deb", True, 200, source="prefetch")
+    assert store2.get_prefetch_efficiency() == [{"repo_id": "r", "prefetched": 1, "used": 0, "ratio": 0.0}]
+    store2.record_key_expiry("r", "2027-01-01T00:00:00+00:00")
+    assert store2.get_repo_summaries()["r"]["key_expires_at"] == "2027-01-01T00:00:00+00:00"
+
+
+def test_get_request_hit_stats_counts_total_and_hits_per_repo(tmp_path):
+    store = _store(tmp_path)
+    with store._connect() as conn:
+        for repo_id, cache_status in [("r", "HIT"), ("r", "MISS"), ("r", "HIT"), (None, "MISS")]:
+            conn.execute(
+                "INSERT INTO request_events (ts, repo_id, client_ip, method, path, status, cache_status) "
+                "VALUES (?, ?, '192.0.2.1', 'GET', '/x', '200', ?)",
+                ("2026-01-01T00:00:00+00:00", repo_id, cache_status),
+            )
+
+    stats = store.get_request_hit_stats()
+    assert stats["r"] == {"total": 3, "hits": 2}
+    assert stats[None] == {"total": 1, "hits": 0}
+
+
+def test_get_requests_timeline_buckets_by_hour_and_respects_window_and_repo(tmp_path):
+    store = _store(tmp_path)
+    with store._connect() as conn:
+        rows = [
+            ("2026-01-01T10:05:00+00:00", "r", "HIT"),
+            ("2026-01-01T10:40:00+00:00", "r", "MISS"),
+            ("2026-01-01T11:05:00+00:00", "r", "HIT"),
+            ("2026-01-01T11:06:00+00:00", "other", "HIT"),
+        ]
+        for ts, repo_id, cache_status in rows:
+            conn.execute(
+                "INSERT INTO request_events (ts, repo_id, client_ip, method, path, status, cache_status) "
+                "VALUES (?, ?, '192.0.2.1', 'GET', '/x', '200', ?)",
+                (ts, repo_id, cache_status),
+            )
+        # far outside any reasonable "hours" window used below
+        conn.execute(
+            "INSERT INTO request_events (ts, repo_id, client_ip, method, path, status, cache_status) "
+            "VALUES ('2020-01-01T00:00:00+00:00', 'r', '192.0.2.1', 'GET', '/x', '200', 'HIT')"
+        )
+
+    timeline = store.get_requests_timeline(hours=1_000_000)
+    assert timeline[-2:] == [
+        {"hour": "2026-01-01T10", "total": 2, "hits": 1},
+        {"hour": "2026-01-01T11", "total": 2, "hits": 2},
+    ]
+
+    scoped = store.get_requests_timeline(repo_id="r", hours=1_000_000)
+    assert scoped[-2:] == [
+        {"hour": "2026-01-01T10", "total": 2, "hits": 1},
+        {"hour": "2026-01-01T11", "total": 1, "hits": 1},
+    ]
+
+
+def test_get_prefetch_efficiency_links_by_package_key_not_basename_guessing(tmp_path):
+    store = _store(tmp_path)
+    # Prefetched ahead of demand, later actually requested by a client —
+    # counts as "used".
+    store.record_warmed_package("r", "used-1", "used-1.deb", True, 200, source="prefetch")
+    # Prefetched, never requested — counts against the ratio.
+    store.record_warmed_package("r", "unused-1", "unused-1.deb", True, 200, source="prefetch")
+    # First seen via a real client request, not repowatch's own prefetch —
+    # excluded entirely, it was never a prefetch decision to begin with.
+    store.record_warmed_package("r", "client-only-1", "client-only-1.deb", True, 200, source="client")
+
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO request_events (ts, repo_id, client_ip, method, path, status, cache_status, "
+            "package_key, package_repo_id) VALUES "
+            "('2026-01-01T00:00:00+00:00', 'r', '192.0.2.1', 'GET', '/used-1.deb', '200', 'HIT', "
+            "'used-1', 'r')"
+        )
+        # Same basename/package_key string, but under a DIFFERENT repo — must
+        # not count towards repo "r"'s efficiency (the point of matching on
+        # (package_repo_id, package_key), not package_key alone).
+        conn.execute(
+            "INSERT INTO request_events (ts, repo_id, client_ip, method, path, status, cache_status, "
+            "package_key, package_repo_id) VALUES "
+            "('2026-01-01T00:00:01+00:00', 'other', '192.0.2.1', 'GET', '/unused-1.deb', '200', 'HIT', "
+            "'unused-1', 'other')"
+        )
+
+    assert store.get_prefetch_efficiency() == [
+        {"repo_id": "r", "prefetched": 2, "used": 1, "ratio": 0.5},
+    ]
+
+
+def test_get_prefetch_efficiency_omits_repos_with_nothing_prefetched(tmp_path):
+    store = _store(tmp_path)
+    store.record_warmed_package("r", "a-1", "a-1.deb", True, 200, source="client")
+    assert store.get_prefetch_efficiency() == []
+
+
 def test_repo_summaries_skip_history_and_keep_counts(tmp_path, monkeypatch):
     store = StateStore(tmp_path / 'state')
     store.record_snapshot(RepoSnapshot('a', {'one': 'one.rpm'}))
@@ -438,7 +618,7 @@ def test_repo_summaries_skip_history_and_keep_counts(tmp_path, monkeypatch):
         raise AssertionError('summary must not decode history JSON')
     monkeypatch.setattr('repowatch.state.json.loads', unexpected_history)
     summaries = store.get_repo_summaries(include_warmed=True)
-    assert summaries['a'] == {key: full[key] for key in ('last_check', 'changed_at', 'package_count')} | {'warmed_count': 1}
+    assert summaries['a'] == {key: full[key] for key in ('last_check', 'changed_at', 'package_count')} | {'warmed_count': 1, 'key_expires_at': None}
     assert summaries['b']['package_count'] == summaries['b']['warmed_count'] == 0
     assert summaries['orphan'] == {'warmed_count': 1}
     assert 'warmed_count' not in store.get_repo_summaries()['a']

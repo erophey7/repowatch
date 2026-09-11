@@ -19,7 +19,7 @@ class ConfigError(Exception):
 @dataclass(frozen=True)
 class RepoConfig:
     id: str
-    type: str  # "pacman" | "apt" | "apk" | "dnf" | "apt-rpm"
+    type: str  # "pacman" | "apt" | "apk" | "dnf" | "apt-rpm" | "xbps"
     upstream: str
     arch: str
     prefetch: bool = True
@@ -52,7 +52,7 @@ class RepoConfig:
     def __post_init__(self) -> None:
         from repowatch.url_templates import expand
         expand(self)
-        if self.type not in {"pacman", "apt", "apk", "dnf", "apt-rpm"}:
+        if self.type not in {"pacman", "apt", "apk", "dnf", "apt-rpm", "xbps"}:
             raise ConfigError(f"{self.id}: unknown type={self.type!r}")
         if self.type == "pacman" and not self.repo_name:
             raise ConfigError(f"{self.id}: repo_name is required for pacman")
@@ -71,6 +71,21 @@ class RepoConfig:
             if self.type == 'apk':
                 if not self.apk_keys_dir:
                     raise ConfigError(f'{self.id}: verify_signature=true requires apk_keys_dir')
+            elif self.type == 'xbps':
+                # Unlike apt/pacman/dnf/apt-rpm, XBPS repos don't publish a
+                # signed index at all (no <arch>-repodata.sig(2) — verified
+                # by hand against repo-default.voidlinux.org). Trust instead
+                # comes from a per-PACKAGE RSA signature sidecar
+                # (<file>.xbps.sig2), checked by the real xbps client at
+                # install time — a different shape of verification (at
+                # warm-time, per package) than anything else here, not
+                # implemented yet (see docs_dev/ROADMAP.md item 21). Refusing
+                # outright avoids a false sense of security, same reasoning
+                # as apk's original GPG rejection before apkverify.py existed.
+                raise ConfigError(
+                    f'{self.id}: verify_signature is not yet supported for xbps '
+                    f'(no signed index is published upstream; see docs_dev/ROADMAP.md item 21)'
+                )
             elif not self.keyring_path:
                 raise ConfigError(f'{self.id}: verify_signature=true requires keyring_path')
 
@@ -283,6 +298,14 @@ class Config:
     # RepoConfig.prefetch_bandwidth_limit /
     # effective_prefetch_bandwidth_limit.
     prefetch_bandwidth_limit: float | None = None
+    # Below how many days left until the soonest-expiring key in a repo's
+    # keyring counts as "expiring soon" — surfaced in /api/repos and
+    # /metrics, and drives a webhook notification the same way repeated
+    # warm/GPG failures do (see watcher.check_repo, notifications.py, kind
+    # "key_expiry"). Only meaningful for repositories with
+    # verify_signature=true and a GPG-based type (apt/pacman/dnf/apt-rpm) —
+    # apk's embedded RSA keys have no expiry concept at all.
+    key_expiry_warning_days: int = 30
 
     def repo_by_id(self, repo_id: str) -> RepoConfig | None:
         return next((r for r in self.repos if r.id == repo_id), None)
@@ -361,6 +384,7 @@ def load_config(path: str | Path) -> Config:
             ),
             notify_webhook_url=(str(raw["notify_webhook_url"]) if raw.get("notify_webhook_url") else None),
             notify_after_failures=int(raw.get("notify_after_failures", 3)),
+            key_expiry_warning_days=int(raw.get("key_expiry_warning_days", 30)),
         )
         if config.nginx.enabled or any(repo.url_template is not None for repo in config.repos):
             from repowatch.nginx import render
