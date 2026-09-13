@@ -76,6 +76,36 @@ def test_prune_warmed_packages_noop_when_nothing_old(tmp_path):
     assert len(store.get_warmed_packages("repo-a")) == 1
 
 
+def test_get_stale_warmed_packages_matches_what_prune_would_delete(tmp_path):
+    """Read-only counterpart to prune_warmed_packages — used by
+    watcher.prune_all to purge the real cache entry before the bookkeeping
+    row disappears (docs_dev/ROADMAP.md item 33). Must select exactly the
+    same rows prune_warmed_packages would delete, not an approximation."""
+    store = StateStore(tmp_path / "state.sqlite3")
+    now = datetime.now(timezone.utc)
+
+    _insert_warmed(store, "repo-a", "old-pkg-1.0", now - timedelta(days=200))
+    _insert_warmed(store, "repo-a", "recent-pkg-1.0", now - timedelta(days=1))
+    _insert_warmed(store, "repo-b", "also-old-1.0", now - timedelta(days=181))
+
+    stale = store.get_stale_warmed_packages(retention_days=180)
+
+    assert sorted(stale) == [
+        ("repo-a", "old-pkg-1.0", "old-pkg-1.0.pkg"),
+        ("repo-b", "also-old-1.0", "also-old-1.0.pkg"),
+    ]
+    # Read-only: nothing actually removed.
+    assert len(store.get_warmed_packages("repo-a")) == 2
+
+
+def test_get_stale_warmed_packages_empty_when_nothing_old(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    now = datetime.now(timezone.utc)
+    _insert_warmed(store, "repo-a", "recent-pkg-1.0", now - timedelta(days=1))
+
+    assert store.get_stale_warmed_packages(retention_days=180) == []
+
+
 def test_prune_events_by_size_keeps_only_n_most_recent_per_repo(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     now = datetime.now(timezone.utc)

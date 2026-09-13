@@ -26,11 +26,15 @@ Endpoints:
     POST /api/repos/<repo_id>/purge   — manual cache purge, step 2: attempt to purge the
                                          operator-selected subset — body {"package_keys": [...]},
                                          response {"results": {key: "purged"|"not_cached"|
-                                         "error (...)"}, "not_found": [...]} (see
-                                         prefetch.purge_selected); 400 if enable_purge is off
-    POST /api/repos/<repo_id>/warmed/remove — drop package(s) from the "warmed" tracking (does
-                                         not touch the actual file in the nginx cache) —
-                                         body {"package_keys": [...]}, also the dashboard's
+                                         "error (...)"}, "not_found": [...]} (see _purge_items —
+                                         prefetch.purge_selected, or cache_probe.purge_selected_raw
+                                         when nginx.enable_cache_probe is on); 400 if enable_purge
+                                         is off
+    POST /api/repos/<repo_id>/warmed/remove — "un-warm" package(s): when nginx.enable_purge is
+                                         on, also evicts the real cache entry (same mechanism as
+                                         .../purge above) before dropping the "warmed" tracking
+                                         row; bookkeeping-only (as before) if enable_purge is
+                                         off — body {"package_keys": [...]}, also the dashboard's
                                          "remove selected" bulk action
     GET /api/repos/<repo_id>/bans     — which package names are banned from auto-warming
     POST /api/repos/<repo_id>/bans    — ban package name(s) from auto-warming — body
@@ -101,8 +105,10 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
+import httpx
 import yaml
 
+from repowatch import cache_probe
 from repowatch.auth import verify_password
 from repowatch.access import (AccessStore, AdminSession, COOKIE_NAME, SESSION_SECONDS,
                               client_context, digest, in_networks)
@@ -458,6 +464,27 @@ def purge_candidates_payload(
     }
 
 
+async def _purge_items(config: Config, repo: RepoConfig, items: dict[str, str]) -> dict[str, str]:
+    """Picks the purge mechanism for the dashboard's two purge-capable
+    handlers (purge_selected_payload, remove_warmed_package_payload): the
+    route-independent /purge-raw location (cache_probe.purge_selected_raw,
+    keyed via nginx.compute_cache_key()) when nginx.enable_cache_probe is
+    on, else the standard per-repo /purge<prefix> location
+    (prefetch.purge_selected) — by direct user request (2026-09-14): "по
+    умолчанию пурж через дашборд работает стандартным механизмом, но если
+    включен cache_probe применяем purge_raw". Same result contract either
+    way ("purged"/"not_cached"/"error (...)" per key), so callers don't
+    need to know which path ran.
+
+    cache_probe's version isn't just an alternate transport for the same
+    outcome — see its own docstring: it catches a real class of cache entry
+    the per-repo path structurally cannot (a file cached under a since-
+    changed nginx.enable_dedup basis)."""
+    if config.nginx.enable_cache_probe:
+        return await cache_probe.purge_selected_raw(config, repo, items)
+    return await purge_selected(config, repo, items)
+
+
 def purge_selected_payload(
     config_path: str | Path,
     store: StateStore,
@@ -473,8 +500,8 @@ def purge_selected_payload(
     prefix by supplying a made-up filename.
 
     On success, also drops the warmed_packages bookkeeping row for every key
-    prefetch.purge_selected confirmed is no longer (or never was) actually
-    cached ("purged"/"not_cached") — that record was only ever useful as a
+    _purge_items() confirmed is no longer (or never was) actually cached
+    ("purged"/"not_cached") — that record was only ever useful as a
     "possibly still cached" signal, and nginx has now given a definitive
     answer either way. Keys reported as "error (...)" are left alone so a
     retry later still finds them as candidates.
@@ -503,10 +530,10 @@ def purge_selected_payload(
     filenames = store.get_warmed_filenames(repo_id, requested_keys)
     not_found = [k for k in requested_keys if k not in filenames]
 
-    # purge_selected is async (see prefetch.py) — bridge sync->async the
-    # same way warm_packages_payload does, for the same reason (this
-    # handler runs in a plain ThreadingHTTPServer thread).
-    results = asyncio.run(purge_selected(current, repo, filenames)) if filenames else {}
+    # _purge_items is async (see above) — bridge sync->async the same way
+    # warm_packages_payload does, for the same reason (this handler runs in
+    # a plain ThreadingHTTPServer thread).
+    results = asyncio.run(_purge_items(current, repo, filenames)) if filenames else {}
     resolved = [key for key, outcome in results.items() if outcome in ("purged", "not_cached")]
     if resolved:
         store.remove_warmed_packages(repo_id, resolved)
@@ -522,9 +549,32 @@ def remove_warmed_package_payload(
     body: dict,
 ) -> tuple[int, dict]:
     """"Remove from warmed" (dashboard, including "remove selected" bulk
-    action) — only deletes the warmed_packages tracking entry (repowatch's
-    own bookkeeping); the actual file in the nginx cache is left untouched
-    (see StateStore.remove_warmed_packages).
+    action).
+
+    When nginx.enable_purge is on, this now ALSO evicts the real cache
+    entry — via the exact same _purge_items() call "Purge selected"
+    already uses — before dropping the bookkeeping row.
+    Previously this only ever touched the warmed_packages tracking row and
+    left the actual cached file alone, which was the precise disconnect
+    docs_dev/ROADMAP.md item 33 flagged: "un-warming" a package that's
+    still physically on disk made it invisible to future stale-scans
+    (find_stale_warmed() needs the row to exist to find the file at all),
+    turning it into a permanent, undiscoverable orphan until nginx's own
+    inactive=180d eventually noticed. Pointed out directly by the user
+    (2026-09-13): the name "Remove from warmed" implies un-caching it, not
+    just editing a database row.
+
+    Matches purge_selected_payload()'s own conservative semantics: the
+    bookkeeping row is only dropped for keys nginx confirms are gone
+    ("purged"/"not_cached") — a key that errored during purge is left
+    tracked so a retry later still finds it, rather than silently losing
+    the one remaining way to find it again.
+
+    Without enable_purge (no purge mechanism exists to call at all), falls
+    back to the original bookkeeping-only behavior — same "opt-in,
+    degrades gracefully" posture as the rest of the purge feature; a
+    config that never enabled purge sees no change here.
+
     body: {"package_keys": ["name-version", ...]}."""
     try:
         current = load_config(config_path)
@@ -536,15 +586,31 @@ def remove_warmed_package_payload(
     if password_error is not None:
         return password_error
 
-    if current.repo_by_id(repo_id) is None:
+    repo = current.repo_by_id(repo_id)
+    if repo is None:
         return 404, {"error": f"unknown repo_id: {repo_id}"}
 
     if not isinstance(body, dict) or not isinstance(body.get("package_keys"), list) or not body["package_keys"]:
         return 400, {"error": 'request body must be {"package_keys": ["name-version", ...]}'}
 
     package_keys = [str(k) for k in body["package_keys"]]
-    removed = store.remove_warmed_packages(repo_id, package_keys)
-    return 200, {"removed": removed}
+
+    if not current.nginx.enable_purge:
+        removed = store.remove_warmed_packages(repo_id, package_keys)
+        return 200, {"removed": removed}
+
+    filenames = store.get_warmed_filenames(repo_id, package_keys)
+    # _purge_items is async (see above) — bridge sync->async the same way
+    # warm_packages_payload/purge_selected_payload do, for the same reason
+    # (this handler runs in a plain ThreadingHTTPServer thread).
+    results = asyncio.run(_purge_items(current, repo, filenames)) if filenames else {}
+    resolved = [key for key, outcome in results.items() if outcome in ("purged", "not_cached")]
+    # A requested key with no filename on record was never really tracked
+    # (nothing to purge) — still let its (already-nonexistent) row drop,
+    # remove_warmed_packages is a no-op for keys that aren't there.
+    not_tracked = [k for k in package_keys if k not in filenames]
+    removed = store.remove_warmed_packages(repo_id, resolved + not_tracked)
+    return 200, {"removed": removed, "purge_results": results}
 
 
 def banned_packages_payload(
@@ -678,18 +744,39 @@ def stats_payload(
 ) -> tuple[int, dict]:
     """GET /api/stats — state_db size/row counts are always cheap and
     included; the nginx package cache directory's size is only walked when
-    include_cache_dir is set (see cache_dir_stats) and only reported when
-    the operator has opted into NginxConfig.cache_dir being visible to
-    repowatch at all (see docs_dev/ROADMAP.md item 12) — otherwise there is
-    no path to walk, and that's a normal, expected configuration, not an
-    error."""
+    include_cache_dir is set (see cache_dir_stats).
+
+    docs_dev/ROADMAP.md item 8: when nginx.enable_cache_probe is on, this
+    prefers cache_probe.cache_dir_size() (the njs-based ground-truth scan)
+    over the os.walk()-based cache_dir_stats() below — it runs inside the
+    nginx worker itself (already the cache's own owner), so it never hits
+    the 0700-subdirectory permission gap cache_dir_stats() has to work
+    around and warn about. That path doesn't need NginxConfig.cache_dir to
+    be set at all (it only needs cache_base_url, always present) — the
+    field is used purely for display if available.
+
+    Without enable_cache_probe, behavior is unchanged: cache_dir_stats()
+    (os.walk()) is used, and it's only reported when the operator has
+    opted into NginxConfig.cache_dir being visible to repowatch at all (see
+    docs_dev/ROADMAP.md item 12) — otherwise there is no path to walk, and
+    that's a normal, expected configuration, not an error.
+    """
     payload = store.get_storage_stats()
     if include_cache_dir:
         try:
             current = load_config(config_path)
         except ConfigError:
             return 500, {"error": "config.yaml is currently invalid"}
-        if not current.nginx.cache_dir:
+        if current.nginx.enable_cache_probe:
+            try:
+                stats = asyncio.run(cache_probe.cache_dir_size(current.cache_base_url))
+            except httpx.HTTPError as exc:
+                payload["cache_dir"] = {"error": f"cache-probe unreachable: {exc}"}
+            else:
+                stats["path"] = current.nginx.cache_dir or current.cache_base_url
+                stats["source"] = "cache_probe"
+                payload["cache_dir"] = stats
+        elif not current.nginx.cache_dir:
             payload["cache_dir"] = None
         else:
             try:

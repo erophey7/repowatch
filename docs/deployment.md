@@ -235,8 +235,8 @@ what's being upgraded in place.
 ### Checking GitHub for a new release (`repowatch self-update`)
 
 ```bash
-repowatch self-update --repo owner/name --check   # just report, don't install
-repowatch self-update --repo owner/name            # install if newer
+repowatch self-update --repo erophey7/repowatch --check   # just report, don't install
+repowatch self-update --repo erophey7/repowatch            # install if newer
 ```
 
 A separate, lighter mechanism from `make upgrade` above: it checks the given

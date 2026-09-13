@@ -143,7 +143,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "stats":
+        import httpx
         from repowatch.api import cache_dir_stats
+        from repowatch import cache_probe
 
         store = StateStore(config.state_db)
         stats = store.get_storage_stats()
@@ -151,7 +153,25 @@ def main(argv: list[str] | None = None) -> int:
         for table, count in stats["tables"].items():
             print(f"  {table}: {count:,} row(s)")
         if args.cache_dir:
-            if not config.nginx.cache_dir:
+            if config.nginx.enable_cache_probe:
+                # docs_dev/ROADMAP.md item 8/27 — the njs-based ground-truth
+                # scan runs inside the nginx worker itself, so it doesn't
+                # need nginx.cache_dir set locally at all and never hits the
+                # 0700-subdirectory permission gap the os.walk() path below
+                # has to warn about; see cache_probe.cache_dir_size().
+                try:
+                    cache = asyncio.run(cache_probe.cache_dir_size(config.cache_base_url))
+                    path = config.nginx.cache_dir or config.cache_base_url
+                    print(f"cache_dir: {path} (via cache-probe) — {cache['size_bytes']:,} bytes, "
+                          f"{cache['file_count']:,} file(s)")
+                    if cache.get("unreadable_keys"):
+                        print(f"  NOTE: {cache['unreadable_keys']:,} file(s) had an unreadable "
+                              "stored key (counted for size, not identifiable individually).",
+                              file=sys.stderr)
+                except httpx.HTTPError as exc:
+                    print(f"cache_dir: cache-probe unreachable: {exc}", file=sys.stderr)
+                    return 1
+            elif not config.nginx.cache_dir:
                 print("cache_dir: not set in config.yaml (nginx.cache_dir) — nothing to walk")
             else:
                 try:
@@ -239,7 +259,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "check-once":
         asyncio.run(check_all(config, store))
-        prune_all(config, store)
+        asyncio.run(prune_all(config, store))
         return 0
 
     if args.command == "serve-status":

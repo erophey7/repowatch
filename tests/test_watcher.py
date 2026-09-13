@@ -2,11 +2,11 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 
 from repowatch import watcher
-from repowatch.config import Config, RepoConfig, StatusServerConfig
+from repowatch.config import Config, NginxConfig, RepoConfig, StatusServerConfig, SyslogListenerConfig
 from repowatch.gpgverify import SignatureError
 from repowatch.parsers.base import IndexHeadResult
 from repowatch.state import RepoSnapshot, StateStore
-from repowatch.watcher import _is_due, check_all, check_repo
+from repowatch.watcher import _is_due, check_all, check_repo, prune_all
 
 
 def _config(**overrides) -> Config:
@@ -361,6 +361,129 @@ def test_check_repo_calls_purge_removed_with_removed_filenames(tmp_path, monkeyp
     assert purge_calls == [("r", {"linux-headers-6.11.2-1": "linux-headers-6.11.2-1-x86_64.pkg.tar.zst"})]
 
 
+# --- auto-unwarm expiry (docs_dev/ROADMAP.md item 33, 2026-09-14) ---
+
+def test_prune_all_skips_warmed_expiry_entirely_when_syslog_listener_disabled(tmp_path):
+    """Without real client-request visibility, warmed_at only ever advances
+    at first warm — ageing rows out (let alone purging them) would be
+    acting on a timer that doesn't mean what it's supposed to mean. See
+    SyslogListenerConfig's own docstring for why enabled defaults to True
+    now specifically to avoid this trap."""
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.record_warmed_package("r", "old-1.0", "old-1.0.apk", True, 200)
+    with store._connect() as conn:
+        conn.execute("UPDATE warmed_packages SET warmed_at = '2020-01-01T00:00:00+00:00'")
+
+    repo = RepoConfig(id="r", type="apk", upstream="https://example.org", arch="x86_64")
+    config = _config(
+        repos=[repo],
+        syslog_listener=SyslogListenerConfig(enabled=False),
+        nginx=NginxConfig(enabled=True, enable_purge=True),
+        warmed_retention_days=1,
+    )
+
+    asyncio.run(prune_all(config, store))
+
+    assert [p["package_key"] for p in store.get_warmed_packages("r")] == ["old-1.0"]
+
+
+def test_prune_all_bookkeeping_only_when_enable_purge_is_off(tmp_path, monkeypatch):
+    """syslog_listener on but nginx.enable_purge off — same as before this
+    feature existed: the stale row is dropped, but nothing must call out
+    to nginx (no purge mechanism to call)."""
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.record_warmed_package("r", "old-1.0", "old-1.0.apk", True, 200)
+    with store._connect() as conn:
+        conn.execute("UPDATE warmed_packages SET warmed_at = '2020-01-01T00:00:00+00:00'")
+
+    repo = RepoConfig(id="r", type="apk", upstream="https://example.org", arch="x86_64")
+    config = _config(
+        repos=[repo],
+        syslog_listener=SyslogListenerConfig(enabled=True),
+        nginx=NginxConfig(enabled=True, enable_purge=False),
+        warmed_retention_days=1,
+    )
+
+    def boom(*a, **kw):
+        raise AssertionError("purge_selected must not be called when enable_purge is off")
+    monkeypatch.setattr(watcher, "purge_selected", boom)
+
+    asyncio.run(prune_all(config, store))
+
+    assert store.get_warmed_packages("r") == []
+
+
+def test_prune_all_purges_stale_warmed_packages_when_enable_purge_is_on(tmp_path, monkeypatch):
+    """Real behavior gap closed 2026-09-14 (same principle as
+    api.remove_warmed_package_payload, 2026-09-13): an automatically-aged-
+    out warmed_packages row should also lose its real cache entry, not
+    just its bookkeeping — otherwise the automatic path recreates the
+    exact invisible-orphan problem item 33 is about, just unattended.
+    Same conservative rule as the manual path: only confirmed-gone keys
+    ("purged"/"not_cached") lose their row, an errored one stays tracked
+    for the next hourly retry."""
+    store = StateStore(tmp_path / "state.sqlite3")
+    for key in ("purged-1.0", "already-gone-1.0", "flaky-1.0", "recent-1.0"):
+        store.record_warmed_package("r", key, f"{key}.apk", True, 200)
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE warmed_packages SET warmed_at = '2020-01-01T00:00:00+00:00' "
+            "WHERE package_key != 'recent-1.0'"
+        )
+
+    repo = RepoConfig(id="r", type="apk", upstream="https://example.org", arch="x86_64")
+    config = _config(
+        repos=[repo],
+        syslog_listener=SyslogListenerConfig(enabled=True),
+        nginx=NginxConfig(enabled=True, enable_purge=True),
+        warmed_retention_days=1,
+    )
+
+    calls = []
+    async def fake_purge_selected(cfg, r, items):
+        calls.append((r.id, items))
+        return {"purged-1.0": "purged", "already-gone-1.0": "not_cached", "flaky-1.0": "error (timeout)"}
+    monkeypatch.setattr(watcher, "purge_selected", fake_purge_selected)
+
+    asyncio.run(prune_all(config, store))
+
+    assert calls == [("r", {
+        "purged-1.0": "purged-1.0.apk",
+        "already-gone-1.0": "already-gone-1.0.apk",
+        "flaky-1.0": "flaky-1.0.apk",
+    })]
+    remaining = {p["package_key"] for p in store.get_warmed_packages("r")}
+    assert remaining == {"flaky-1.0", "recent-1.0"}  # errored + not-yet-stale survive
+
+
+def test_prune_all_drops_bookkeeping_without_purging_for_a_repo_no_longer_in_config(tmp_path, monkeypatch):
+    """A stale warmed_packages row can reference a repo_id that's since
+    been removed from config.yaml entirely — there's no RepoConfig left to
+    purge against (see nginx.compute_cache_key()'s own equivalent case),
+    so the automatic path just drops the bookkeeping, same as it always
+    could for an unreachable repo. Discovering that class of real orphan
+    on disk is cache_probe's full inventory scan's job, not this one."""
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.record_warmed_package("gone-repo", "old-1.0", "old-1.0.apk", True, 200)
+    with store._connect() as conn:
+        conn.execute("UPDATE warmed_packages SET warmed_at = '2020-01-01T00:00:00+00:00'")
+
+    config = _config(
+        repos=[RepoConfig(id="other", type="apk", upstream="https://example.org", arch="x86_64")],
+        syslog_listener=SyslogListenerConfig(enabled=True),
+        nginx=NginxConfig(enabled=True, enable_purge=True),
+        warmed_retention_days=1,
+    )
+
+    def boom(*a, **kw):
+        raise AssertionError("purge_selected must not be called for a repo not in config.repos")
+    monkeypatch.setattr(watcher, "purge_selected", boom)
+
+    asyncio.run(prune_all(config, store))
+
+    assert store.get_warmed_packages("gone-repo") == []
+
+
 def test_run_forever_invokes_check_all_and_prune_all_on_its_own_timer(tmp_path, monkeypatch):
     """Regression for the wiring itself: prune_all/check_all are each
     covered individually elsewhere, but nothing previously exercised that
@@ -384,7 +507,7 @@ def test_run_forever_invokes_check_all_and_prune_all_on_its_own_timer(tmp_path, 
     async def fake_check_all(cfg, st):
         check_all_calls.append(1)
 
-    def fake_prune_all(cfg, st):
+    async def fake_prune_all(cfg, st):
         prune_calls.append(1)
 
     monkeypatch.setattr(watcher, "check_all", fake_check_all)

@@ -456,6 +456,12 @@ def install(layout: Layout, root: Path, wheelhouse: Path) -> None:
             write(path, content.replace(str(venv), str(layout.venv)), stat.S_IMODE(path.stat().st_mode))
         cfg = venv / 'pyvenv.cfg'
         write(cfg, cfg.read_text().replace(str(venv), str(layout.venv)))
+    # NOTE: this pattern-matches literal "/var/lib/repowatch"/"/etc/repowatch"
+    # strings in config/config.example.yaml — see that file's own comment
+    # next to state_db. If someone edits those paths there for local-dev
+    # convenience without updating this, installs would silently end up
+    # with a nonsensical substituted path instead of a real LOCALSTATEDIR/
+    # SYSCONFDIR-derived one.
     config_text = (root / 'config/config.example.yaml').read_text().replace(
         '/var/lib/repowatch', str(layout.state)).replace('/etc/repowatch', str(layout.config.parent))
     write(layout.disk(layout.share / 'config.example.yaml'), config_text)

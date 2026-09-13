@@ -129,11 +129,24 @@ class StatusServerConfig:
 @dataclass(frozen=True)
 class SyslogListenerConfig:
     """Listener for nginx's syslog access_log — the source of "what was
-    requested" for the dashboard. Disabled by default (opt-in): we don't
-    open an extra network port for operators who haven't configured this
-    in nginx."""
+    requested" for the dashboard.
 
-    enabled: bool = False
+    On by default since 2026-09-14 (was opt-in) — the socket itself is
+    loopback-only (`bind` defaults to 127.0.0.1) and nginx.render() emits
+    the matching `access_log syslog:server=...` directive off the SAME
+    flag, so enabling this can never leave the two sides mismatched. The
+    real reason to default it on: without real request visibility, the
+    hourly warmed_packages expiry (StateStore.prune_warmed_packages, see
+    watcher.prune_all) has no way to tell "nobody's asking for this
+    anymore" from "we just don't know" — see watcher.py's own gating of
+    that cleanup on this exact flag. A fresh install with this off would
+    silently get a warmed_at timer that, for any repo without its own
+    prefetch re-touching it, only ever advances once (at first warm) and
+    then age out client-still-wants-it packages 180 days later for no
+    real reason — the opposite of what the retention was meant to do.
+    """
+
+    enabled: bool = True
     bind: str = "127.0.0.1"
     port: int = 1514
 
@@ -182,6 +195,26 @@ class NginxConfig:
     # apt/pacman/dnf packages currently carry a comparable SHA256 (see
     # PackageRef.content_hash) — apk/apt-rpm files never participate.
     enable_dedup: bool = False
+    # docs_dev/ROADMAP.md item 8 (unifies items 23/33) — read-only cache
+    # introspection (nginx.render_probe_js()/render_probe_conf()) via the
+    # third-party ngx_http_js_module (njs), NOT bundled with stock nginx.
+    # Off by default, no effect on existing configs' rendered output when
+    # disabled — same opt-in/degrades-gracefully shape as enable_purge/
+    # enable_dedup. The njs script runs INSIDE the nginx worker (already
+    # running as nginx's own `user`), so it can read proxy_cache_path's
+    # subdirectories (0700, owned by that user) that repowatch's own
+    # unprivileged process cannot — see CLAUDE.md's cache_dir_stats()
+    # permission finding. The operator must separately add
+    # `load_module ".../ngx_http_js_module.so";` to their own main
+    # nginx.conf (a main-context directive, same limitation as
+    # enable_purge's load_module); nginx -t during nginx-apply catches a
+    # missing module and rolls back like any other bad generated config.
+    # When both this and enable_purge are on, render_probe_conf() also
+    # emits a route-independent /purge-raw location (accepts an arbitrary
+    # already-known cache key, not tied to any current repo's route) — the
+    # only way to evict a genuinely orphaned entry whose repo/config no
+    # longer exists to compute a normal per-route purge key for.
+    enable_cache_probe: bool = False
 
     def __post_init__(self) -> None:
         if type(self.enabled) is not bool:
@@ -190,6 +223,8 @@ class NginxConfig:
             raise ConfigError("nginx.enable_purge: must be a bool")
         if type(self.enable_dedup) is not bool:
             raise ConfigError("nginx.enable_dedup: must be a bool")
+        if type(self.enable_cache_probe) is not bool:
+            raise ConfigError("nginx.enable_cache_probe: must be a bool")
         if not isinstance(self.listen, str) or not re.fullmatch(r"(?:[0-9.]+:)?[0-9]{1,5}", self.listen):
             raise ConfigError("nginx.listen: a port or IPv4:port string")
         host, _, port = self.listen.rpartition(":")

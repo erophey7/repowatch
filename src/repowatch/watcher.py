@@ -21,7 +21,7 @@ from repowatch.gpgverify import SignatureError, soonest_key_expiry
 from repowatch.notifications import record_failure_and_maybe_notify, record_success_and_maybe_notify
 from repowatch.parsers import PARSERS
 from repowatch.parsers.base import IndexHeadResult
-from repowatch.prefetch import purge_removed, warm_cache
+from repowatch.prefetch import purge_removed, purge_selected, warm_cache
 from repowatch.state import StateStore
 
 logger = logging.getLogger(__name__)
@@ -187,7 +187,52 @@ async def check_all(config: Config, store: StateStore) -> None:
         await asyncio.gather(*(_run(repo) for repo in due_repos))
 
 
-def prune_all(config: Config, store: StateStore) -> None:
+async def _purge_and_unwarm_stale(
+    config: Config, store: StateStore, stale: list[tuple[str, str, str]]
+) -> None:
+    """Auto-unwarm's purge step (docs_dev/ROADMAP.md item 33) — same
+    principle the user asked for on api.remove_warmed_package_payload
+    (2026-09-13): a warmed_packages row ageing out because nothing's asked
+    for it in warmed_retention_days shouldn't just lose its bookkeeping,
+    it should lose the real cache entry too — otherwise the file becomes
+    an orphan invisible to future stale-scans (the exact problem item 33
+    is about), just via the automatic path instead of a manual click.
+
+    Grouped by repo_id since prefetch.purge_selected() is a per-repo call.
+    Same conservative rule as remove_warmed_package_payload: the
+    bookkeeping row is only dropped for keys nginx confirms are gone
+    ("purged"/"not_cached") — an errored key keeps its (still-stale)
+    warmed_at, so the next hourly prune_all cycle naturally retries it,
+    same as a stuck purge would for any other mechanism here.
+
+    A repo_id no longer in config.repos (removed since the row was
+    written) has no RepoConfig to purge against at all — nothing more this
+    function can do for those, so their bookkeeping just drops. Finding
+    THAT class of orphan is cache_probe's full inventory scan's job (see
+    docs_dev/NGINX.md), not this one.
+    """
+    by_repo: dict[str, dict[str, str]] = {}
+    for repo_id, key, filename in stale:
+        by_repo.setdefault(repo_id, {})[key] = filename
+
+    for repo_id, items in by_repo.items():
+        repo = config.repo_by_id(repo_id)
+        if repo is None:
+            store.remove_warmed_packages(repo_id, list(items))
+            continue
+        results = await purge_selected(config, repo, items)
+        resolved = [key for key, outcome in results.items() if outcome in ("purged", "not_cached")]
+        if resolved:
+            store.remove_warmed_packages(repo_id, resolved)
+        errored = len(items) - len(resolved)
+        if errored:
+            logger.warning(
+                "%s: %d stale warmed package(s) failed to purge, will retry next cycle",
+                repo_id, errored,
+            )
+
+
+async def prune_all(config: Config, store: StateStore) -> None:
     pruned = store.prune_events(config.event_retention_days)
     if pruned:
         logger.debug("cleaned up %d stale repo_events rows", pruned)
@@ -196,9 +241,23 @@ def prune_all(config: Config, store: StateStore) -> None:
     if pruned_requests:
         logger.debug("cleaned up %d stale request_events rows", pruned_requests)
 
-    pruned_warmed = store.prune_warmed_packages(config.warmed_retention_days)
-    if pruned_warmed:
-        logger.debug("cleaned up %d stale warmed_packages rows", pruned_warmed)
+    if not config.syslog_listener.enabled:
+        # Without real client-request visibility, warmed_at only ever
+        # advances at first warm (see StateStore.prune_warmed_packages'
+        # own docstring) — ageing rows out here would silently drop
+        # bookkeeping (and, worse, purge real cache entries below) for
+        # packages real clients might still be actively using, purely
+        # because repowatch has no way to know either way. Skip the whole
+        # warmed_packages retention step entirely rather than guess.
+        logger.debug("syslog_listener disabled — skipping warmed_packages expiry (no request visibility)")
+    elif config.nginx.enable_purge:
+        stale = store.get_stale_warmed_packages(config.warmed_retention_days)
+        if stale:
+            await _purge_and_unwarm_stale(config, store, stale)
+    else:
+        pruned_warmed = store.prune_warmed_packages(config.warmed_retention_days)
+        if pruned_warmed:
+            logger.debug("cleaned up %d stale warmed_packages rows", pruned_warmed)
 
     # Size-based — on top of the time-based cleanup above, only if the
     # operator set a limit.
@@ -260,7 +319,7 @@ async def run_forever(
         await check_all(config, store)
 
         if time.monotonic() - last_prune >= _PRUNE_INTERVAL_SECONDS:
-            prune_all(config, store)
+            await prune_all(config, store)
             last_prune = time.monotonic()
 
         elapsed = time.monotonic() - started

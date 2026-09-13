@@ -534,13 +534,20 @@ function renderStorageStats(stats) {
   } else if (stats.cache_dir.error) {
     html += `<p class="form-msg error">cache_dir: ${esc(stats.cache_dir.error)}</p>`;
   } else {
+    const viaProbe = stats.cache_dir.source === 'cache_probe';
     html += `<p>cache_dir (${esc(stats.cache_dir.path)}): ${bytes(stats.cache_dir.size_bytes)}, ` +
-      `${stats.cache_dir.file_count.toLocaleString()} file(s)</p>`;
+      `${stats.cache_dir.file_count.toLocaleString()} file(s)` +
+      (viaProbe ? ' <span class="dim">(via cache-probe, complete — no permission gaps)</span>' : '') +
+      '</p>';
     if (stats.cache_dir.inaccessible_directories) {
       html += `<p class="form-msg error">Warning: ${stats.cache_dir.inaccessible_directories.toLocaleString()} ` +
         'subdirectory/ies could not be read (permission denied) — the numbers above are an ' +
         'UNDERCOUNT. nginx creates proxy_cache_path\'s levels=1:2 subdirectories 0700, owned by ' +
         'the nginx worker user; the repowatch service user typically can\'t read them at all.</p>';
+    }
+    if (stats.cache_dir.unreadable_keys) {
+      html += `<p class="form-msg error">Note: ${stats.cache_dir.unreadable_keys.toLocaleString()} ` +
+        'file(s) had an unreadable stored key (still counted for size, just not individually identifiable).</p>';
     }
   }
   return html;
@@ -1031,7 +1038,16 @@ async function toggleDetail(tr, repoId) {
       }
       warmedSelection.selected.clear();
       warmedMsg.className = 'form-msg ok';
-      warmedMsg.textContent = `Removed: ${data.removed}`;
+      if (data.purge_results) {
+        const outcomes = Object.values(data.purge_results);
+        const purged = outcomes.filter(o => o === 'purged').length;
+        const notCached = outcomes.filter(o => o === 'not_cached').length;
+        const errors = outcomes.length - purged - notCached;
+        warmedMsg.textContent = `Removed: ${data.removed} (purged: ${purged}, already gone: ${notCached}` +
+          (errors ? `, errors: ${errors}` : '') + ')';
+      } else {
+        warmedMsg.textContent = `Removed: ${data.removed}`;
+      }
       await loadWarmed();
     } catch (err) {
       warmedMsg.className = 'form-msg error';

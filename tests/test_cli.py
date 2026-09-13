@@ -87,6 +87,33 @@ def test_stats_cache_dir_flag_fails_clearly_for_a_missing_directory(tmp_path, ca
     assert "error" in capsys.readouterr().err
 
 
+def test_stats_cache_dir_flag_prefers_cache_probe_when_enabled(tmp_path, capsys):
+    """docs_dev/ROADMAP.md item 8 hooked up to item 27 — with
+    nginx.enable_cache_probe on, `stats --cache-dir` uses the njs-based
+    ground-truth scan instead of os.walk(), even without nginx.cache_dir
+    set locally."""
+    import httpx
+    from unittest.mock import patch
+
+    config_path = _write_config(tmp_path, "nginx:\n  enabled: true\n  enable_cache_probe: true\n")
+
+    def handler(request):
+        if request.url.params.get("dir") == "c/29":
+            return httpx.Response(200, json=[{"file": "f1", "key": "k1", "size": 42}])
+        return httpx.Response(200, json=[])
+
+    real_async_client = httpx.AsyncClient
+    with patch("repowatch.cache_probe.httpx.AsyncClient",
+               lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
+        rc = main(["-c", str(config_path), "stats", "--cache-dir"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "via cache-probe" in out
+    assert "42 bytes" in out
+    assert "1 file(s)" in out
+
+
 def test_check_config_invalid_returns_one(tmp_path, capsys):
     config_path = tmp_path / "config.yaml"
     config_path.write_text("this is not valid yaml: [unclosed")

@@ -1077,13 +1077,41 @@ class StateStore:
         """Delete warmed_packages rows that haven't been updated (warmed_at)
         for longer than retention_days — usually packages long gone from
         upstream: record_snapshot no longer sees them, so warm_cache will
-        never touch or refresh that row again."""
+        never touch or refresh that row again.
+
+        Only meaningful when syslog_listener.enabled is on (see
+        watcher.prune_all, which gates calling this at all) — warmed_at is
+        refreshed on every real client request (see
+        syslog_listener.run_listener) as well as on first warm, so it acts
+        as a rough "still wanted" signal only where that visibility exists.
+        Without it, this would just delete bookkeeping for packages
+        nobody's re-warmed lately for reasons that have nothing to do with
+        whether real clients still want them."""
         cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat(
             timespec="seconds"
         )
         with self._connect() as conn:
             cur = conn.execute("DELETE FROM warmed_packages WHERE warmed_at < ?", (cutoff,))
             return cur.rowcount
+
+    def get_stale_warmed_packages(self, retention_days: int) -> list[tuple[str, str, str]]:
+        """(repo_id, package_key, filename) for every row
+        prune_warmed_packages(retention_days) would delete — read-only, so
+        a caller that also wants to purge the real cache entry first (see
+        watcher.prune_all, when nginx.enable_purge is on) can act on the
+        exact same set before the bookkeeping rows disappear. Same cutoff
+        computation as prune_warmed_packages — kept in sync deliberately,
+        not re-derived independently, since the two must always agree on
+        which rows count as stale."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat(
+            timespec="seconds"
+        )
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT repo_id, package_key, filename FROM warmed_packages WHERE warmed_at < ?",
+                (cutoff,),
+            ).fetchall()
+        return [(repo_id, key, filename) for repo_id, key, filename in rows]
 
     def get_history(self, repo_id: str, limit: int = 20) -> list[dict]:
         with self._connect() as conn:

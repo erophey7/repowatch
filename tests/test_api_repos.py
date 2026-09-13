@@ -435,6 +435,80 @@ def test_remove_warmed_package_requires_a_nonempty_package_keys_list(tmp_path, b
     assert status == 400
 
 
+def test_remove_warmed_package_stays_bookkeeping_only_when_purge_is_off(tmp_path):
+    config_path, store = _setup_purge(tmp_path, enable_purge=False)
+    store.record_warmed_package("alpine-test", "musl-1.2.5-r0", "musl-1.2.5-r0.apk", True, 200)
+
+    status, data = remove_warmed_package_payload(
+        config_path, store, "alpine-test", _session(config_path, "secret123"),
+        {"package_keys": ["musl-1.2.5-r0"]},
+    )
+
+    assert status == 200
+    assert data == {"removed": 1}  # no purge_results — no purge mechanism to call
+    assert store.get_warmed_packages("alpine-test") == []
+
+
+def test_remove_warmed_package_also_purges_when_enable_purge_is_on(tmp_path, monkeypatch):
+    """Real behavior gap pointed out by the user (2026-09-13): "Remove from
+    warmed" only ever edited the warmed_packages bookkeeping row, leaving
+    the real cached file on disk untouched — exactly the disconnect
+    docs_dev/ROADMAP.md item 33 flagged (an unwarmed-but-still-cached file
+    becomes invisible to future stale-scans, since find_stale_warmed()
+    needs the row to find it). Now, when purge is available, un-warming
+    also evicts the real entry via the same prefetch.purge_selected() call
+    "Purge selected" uses — same conservative bookkeeping rule too: only
+    confirmed-gone keys ("purged"/"not_cached") lose their tracking row, an
+    errored one stays trackable for a retry."""
+    config_path, store = _setup_purge(tmp_path)
+    store.record_warmed_package("alpine-test", "purged-1", "purged-1.apk", True, 200)
+    store.record_warmed_package("alpine-test", "already-gone-1", "already-gone-1.apk", True, 200)
+    store.record_warmed_package("alpine-test", "flaky-1", "flaky-1.apk", True, 200)
+
+    async def fake_purge_selected(config, repo, items):
+        assert items == {
+            "purged-1": "purged-1.apk",
+            "already-gone-1": "already-gone-1.apk",
+            "flaky-1": "flaky-1.apk",
+        }
+        return {"purged-1": "purged", "already-gone-1": "not_cached", "flaky-1": "error (timeout)"}
+
+    monkeypatch.setattr("repowatch.api.purge_selected", fake_purge_selected)
+
+    status, data = remove_warmed_package_payload(
+        config_path, store, "alpine-test", _session(config_path, "secret123"),
+        {"package_keys": ["purged-1", "already-gone-1", "flaky-1", "not-actually-warmed"]},
+    )
+
+    assert status == 200
+    assert data["purge_results"] == {"purged-1": "purged", "already-gone-1": "not_cached", "flaky-1": "error (timeout)"}
+    assert data["removed"] == 2  # purged-1, already-gone-1 (+ not-actually-warmed, never tracked)
+    remaining = {p["package_key"] for p in store.get_warmed_packages("alpine-test")}
+    assert remaining == {"flaky-1"}  # only the errored one survives for a retry
+
+
+def test_remove_warmed_package_uses_cache_probe_when_enable_cache_probe_is_on(tmp_path, monkeypatch):
+    """Same mechanism-selection as purge_selected_payload (2026-09-14)."""
+    config_path, store = _setup_purge(tmp_path, enable_cache_probe=True)
+    store.record_warmed_package("alpine-test", "a-1", "a-1.apk", True, 200)
+
+    def boom(*a, **kw):
+        raise AssertionError("prefetch.purge_selected must not be called when enable_cache_probe is on")
+    monkeypatch.setattr("repowatch.api.purge_selected", boom)
+
+    async def fake_purge_selected_raw(config, repo, items):
+        return {"a-1": "purged"}
+    monkeypatch.setattr("repowatch.cache_probe.purge_selected_raw", fake_purge_selected_raw)
+
+    status, data = remove_warmed_package_payload(
+        config_path, store, "alpine-test", _session(config_path, "secret123"), {"package_keys": ["a-1"]},
+    )
+
+    assert status == 200
+    assert data["purge_results"] == {"a-1": "purged"}
+    assert store.get_warmed_packages("alpine-test") == []
+
+
 def test_remove_warmed_package_unknown_repo_404(tmp_path):
     config_path, store = _setup(tmp_path, admin_password="secret123")
 
@@ -558,6 +632,9 @@ def test_metrics_payload_healthy_zero_when_repo_stale(tmp_path):
 
 def test_metrics_payload_extended_gauges(tmp_path):
     config_path, store = _setup(tmp_path)
+    # syslog_listener.enabled defaults to True since 2026-09-14 — turn it
+    # off explicitly to test the "no request gauges" case below.
+    config_path.write_text(config_path.read_text() + "\nsyslog_listener:\n  enabled: false\n")
     _set_last_check(store, "alpine-test", datetime.now(timezone.utc) - timedelta(seconds=1000))
     store.bump_failure("alpine-test", "gpg", "bad signature")
     store.bump_failure("alpine-test", "gpg", "bad signature")
@@ -572,7 +649,7 @@ def test_metrics_payload_extended_gauges(tmp_path):
     assert 'repowatch_repo_banned_packages{repo_id="alpine-test"} 1' in body
     assert 'repowatch_repos_by_type{type="apk"} 1' in body
     assert "repowatch_state_db_bytes " in body
-    # syslog_listener is off by default — no per-repo request gauges emitted.
+    # syslog_listener disabled — no per-repo request gauges emitted.
     assert "repowatch_repo_requests" not in body
 
 
@@ -599,6 +676,9 @@ def test_metrics_payload_key_expiry_gauges(tmp_path):
 
 def test_metrics_payload_includes_request_gauges_only_when_syslog_listener_enabled(tmp_path):
     config_path, store = _setup(tmp_path)
+    # syslog_listener.enabled defaults to True since 2026-09-14 — start
+    # from explicitly off to actually exercise the "disabled" half below.
+    config_path.write_text(config_path.read_text() + "\nsyslog_listener:\n  enabled: false\n")
     with store._connect() as conn:
         conn.execute(
             "INSERT INTO request_events (ts, repo_id, client_ip, method, path, status, cache_status) "
@@ -1188,7 +1268,86 @@ nginx:
     assert "error" in payload["cache_dir"]
 
 
-def _setup_purge(tmp_path, admin_password="secret123", enable_purge=True):
+def test_stats_payload_prefers_cache_probe_when_enabled(tmp_path):
+    """docs_dev/ROADMAP.md item 8 — hooked up to "Calculate cache directory
+    size" (item 27): with nginx.enable_cache_probe on, the njs-based
+    ground-truth scan is used instead of os.walk(), and it works even
+    without nginx.cache_dir set locally (unlike the os.walk() path) since
+    it only needs cache_base_url, which is always present."""
+    import httpx
+    from unittest.mock import patch
+
+    config_path = _write_config(
+        tmp_path,
+        """  - id: alpine-test
+    type: apk
+    upstream: https://example.org/alpine/v3.20/main
+    arch: x86_64
+nginx:
+  enabled: true
+  enable_cache_probe: true
+""",
+    )
+    store = StateStore(load_config(config_path).state_db)
+
+    def handler(request):
+        if request.url.params.get("dir") == "c/29":
+            return httpx.Response(200, json=[
+                {"file": "f1", "key": "k1", "size": 100},
+                {"file": "f2", "key": None, "error": "bad header"},
+            ])
+        return httpx.Response(200, json=[])
+
+    real_async_client = httpx.AsyncClient
+    with patch("repowatch.cache_probe.httpx.AsyncClient",
+               lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
+        status, payload = stats_payload(config_path, store, include_cache_dir=True)
+
+    assert status == 200
+    assert payload["cache_dir"]["source"] == "cache_probe"
+    assert payload["cache_dir"]["size_bytes"] == 100
+    assert payload["cache_dir"]["file_count"] == 2
+    assert payload["cache_dir"]["unreadable_keys"] == 1
+    # No nginx.cache_dir configured — falls back to cache_base_url for display.
+    assert payload["cache_dir"]["path"] == "http://127.0.0.1:8080"
+
+
+def test_stats_payload_reports_cache_probe_unreachable_as_an_error_not_zero(tmp_path):
+    """Same principle as test_stats_payload_surfaces_a_missing_cache_dir_as_
+    an_error_not_zero, for the cache_probe path: if nginx.enable_cache_probe
+    is set but the endpoint can't actually be reached (module not loaded
+    yet, nginx down), every one of the 4096 leaf requests would otherwise
+    fail identically and get silently swallowed by full_inventory() — must
+    not look like "the cache is empty"."""
+    import httpx
+    from unittest.mock import patch
+
+    config_path = _write_config(
+        tmp_path,
+        """  - id: alpine-test
+    type: apk
+    upstream: https://example.org/alpine/v3.20/main
+    arch: x86_64
+nginx:
+  enabled: true
+  enable_cache_probe: true
+""",
+    )
+    store = StateStore(load_config(config_path).state_db)
+
+    def handler(request):
+        raise httpx.ConnectError("refused", request=request)
+
+    real_async_client = httpx.AsyncClient
+    with patch("repowatch.cache_probe.httpx.AsyncClient",
+               lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
+        status, payload = stats_payload(config_path, store, include_cache_dir=True)
+
+    assert status == 200
+    assert "error" in payload["cache_dir"]
+
+
+def _setup_purge(tmp_path, admin_password="secret123", enable_purge=True, enable_cache_probe=False):
     config_path = _write_config(
         tmp_path,
         f"""  - id: alpine-test
@@ -1198,6 +1357,7 @@ def _setup_purge(tmp_path, admin_password="secret123", enable_purge=True):
 nginx:
   enabled: true
   enable_purge: {"true" if enable_purge else "false"}
+  enable_cache_probe: {"true" if enable_cache_probe else "false"}
 """,
         admin_password=admin_password,
     )
@@ -1309,3 +1469,32 @@ def test_purge_selected_payload_purges_and_cleans_up_warmed_bookkeeping(tmp_path
     assert payload["not_found"] == ["not-actually-warmed"]
     remaining = {p["package_key"] for p in store.get_warmed_packages("alpine-test")}
     assert remaining == {"flaky-1"}  # only the errored one survives for a retry
+
+
+def test_purge_selected_payload_uses_cache_probe_when_enable_cache_probe_is_on(tmp_path, monkeypatch):
+    """By direct user request (2026-09-14): "по умолчанию пурж через
+    дашборд работает стандартным механизмом, но если включен cache_probe
+    применяем purge_raw" — with nginx.enable_cache_probe on, "Purge
+    selected" must go through cache_probe.purge_selected_raw() instead of
+    prefetch.purge_selected(), not just fall back to it."""
+    config_path, store = _setup_purge(tmp_path, enable_cache_probe=True)
+    store.record_warmed_package("alpine-test", "a-1", "a-1.apk", True, 200)
+
+    def boom(*a, **kw):
+        raise AssertionError("prefetch.purge_selected must not be called when enable_cache_probe is on")
+    monkeypatch.setattr("repowatch.api.purge_selected", boom)
+
+    calls = []
+    async def fake_purge_selected_raw(config, repo, items):
+        calls.append((repo.id, items))
+        return {"a-1": "purged"}
+    monkeypatch.setattr("repowatch.cache_probe.purge_selected_raw", fake_purge_selected_raw)
+
+    status, payload = purge_selected_payload(
+        config_path, store, "alpine-test", _session(config_path, "secret123"), {"package_keys": ["a-1"]},
+    )
+
+    assert status == 200
+    assert payload["results"] == {"a-1": "purged"}
+    assert calls == [("alpine-test", {"a-1": "a-1.apk"})]
+    assert store.get_warmed_packages("alpine-test") == []

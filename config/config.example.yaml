@@ -8,15 +8,24 @@
 #
 #   cp config/config.example.yaml config/config.yaml
 #
-# The repo ids/paths below line up with the hand-written cache layer in
-# nginx/repo-cache.conf, so the two work together out of the box.
+# The repo ids/paths below line up with the nginx cache layer repowatch
+# generates itself (`repowatch nginx-render`/`nginx-apply`, see
+# docs/configuration.md#nginx) — there's no hand-written nginx config to
+# maintain separately.
 
 # SQLite file for snapshots, history, and warmed-package state.
 # Must be on local disk, not NFS.
+#
+# NOTE FOR CONTRIBUTORS: the literal string "/var/lib/repowatch" here is
+# pattern-matched and substituted by scripts/install.py (see its
+# config_text = ... .replace('/var/lib/repowatch', ...) line) when this
+# file is installed as the real system config — it's not just an example
+# value. Don't change it casually; see README.md's Quick Start below for
+# what to do instead if you're running locally without a system install.
 state_db: /var/lib/repowatch/state.sqlite3
 
 # Where repowatch itself sends warm-up requests — the address of your nginx
-# cache (see nginx/repo-cache.conf), from repowatch's own point of view.
+# cache (see docs/configuration.md#nginx), from repowatch's own point of view.
 cache_base_url: http://127.0.0.1:8080
 
 # How often each repository's index is checked, unless overridden per-repo
@@ -29,6 +38,43 @@ status_server:
   # The dashboard and administrative API stay closed until admin_password_hash
   # is set below (generate it with `repowatch hash-password`) — see
   # docs/access.md.
+
+# Generates and (via `repowatch nginx-apply`, a separate root-run step) can
+# apply a complete nginx cache `server` block for the repos below — see
+# docs/configuration.md#nginx. `listen` matches cache_base_url above so the
+# two already agree; `repowatch nginx-render` alone just prints the config
+# to review, without touching any files or running nginx.
+#
+# `nginx-apply` needs a root-owned policy.json (real cache/log paths, the
+# nginx binary, the site-enabled symlink) that only `make install && sudo
+# make activate` creates — see docs/deployment.md. Until that's done,
+# `nginx.enabled: true` here only affects what `nginx-render` prints; it
+# doesn't start or reconfigure any nginx on its own.
+#
+# Further opt-in features layer on top, each requiring a separate system
+# package/module and each off by default — see docs/configuration.md#nginx:
+# `enable_purge` (active cache eviction, needs `ngx_cache_purge`),
+# `enable_dedup` (cross-repo byte-identical file sharing), `enable_cache_probe`
+# (read-only cache introspection via njs, needs `ngx_http_js_module`).
+nginx:
+  enabled: true
+  listen: '8080'
+
+# Listens for nginx's syslog access_log (loopback UDP) — the source of "what
+# was actually requested" for the dashboard, and the signal that keeps a
+# package's warmed_packages entry from aging out while real clients still
+# want it (see docs/configuration.md). Defaults to true; spelled out here so
+# it isn't easy to miss. If nginx isn't sending its access_log there yet
+# (nginx.enabled generates the matching directive automatically; a
+# hand-written nginx config needs one added manually), this is harmless —
+# just an idle loopback socket.
+syslog_listener:
+  enabled: true
+  bind: 127.0.0.1
+  port: 1514
+  # Point nginx's own `access_log syslog:server=127.0.0.1:1514,...` at this
+  # bind/port (the generator does this automatically when nginx.enabled is
+  # set; a hand-written nginx config needs the directive added by hand).
 
 repos:
   # Arch Linux (pacman) — the [core] repository, official geo-balanced mirror.

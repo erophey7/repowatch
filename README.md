@@ -42,6 +42,10 @@ rest of repowatch runs normally):
   - third-party `ngx_cache_purge` module (Debian/Ubuntu:
     `libnginx-mod-http-cache-purge`; Arch: `nginx-mod-cache_purge`) — only if
     `nginx.enable_purge` is on.
+  - third-party `ngx_http_js_module` (njs) (Debian/Ubuntu:
+    `libnginx-mod-http-js`; Arch: `nginx-mod-njs`) — only if
+    `nginx.enable_cache_probe` is on; see
+    [docs/configuration.md](docs/configuration.md#nginx).
 - `gpgv` — signature verification for apt/pacman/RPM-MD/apt-rpm repositories
   with `verify_signature: true`.
 - `openssl`, or `apk-tools >= 3.0` — signature verification for apk
@@ -69,14 +73,27 @@ make dev
 source .venv/bin/activate
 make test
 cp config/config.example.yaml config/config.yaml
-# edit config.yaml for your repositories/mirrors
+# Edit config.yaml for your repositories/mirrors. Also change state_db: it
+# defaults to /var/lib/repowatch/state.sqlite3, a real system path a normal
+# user can't write to — that value is a placeholder a system install (`make
+# install`) substitutes automatically, not something meant to work as-is
+# for a local trial. For running locally (from this directory), point it
+# somewhere writable instead, e.g. state_db: ./state.sqlite3 — resolved
+# relative to wherever you run `repowatch` from, not to config.yaml itself,
+# so keep running commands from here, or use an absolute path.
 
 repowatch -c config/config.yaml check-config   # validate, no state_db created
+repowatch -c config/config.yaml nginx-render   # print the generated nginx server block (no files touched)
 repowatch -c config/config.yaml check-once     # single pass, no daemon
 repowatch -c config/config.yaml serve-status   # HTTP server with status.json
 repowatch -c config/config.yaml run            # daemon with scheduled checks (systemd-oriented)
 repowatch -c config/config.yaml supervise      # same, for environments without systemd
 ```
+
+`nginx-render` above only prints what a real cache `server` block would look
+like for your `repos[]` — it doesn't write files or touch nginx. Actually
+applying it (`nginx-apply`) needs a root-owned policy that only a system
+install creates; see [Production](#production-system-install) below.
 
 By default the CLI reads `/etc/repowatch/config.yaml`; on a system install,
 `repowatch check-config` or `repowatch run` works without extra flags. For a
@@ -100,9 +117,12 @@ and nginx integration.
 ## Updating
 
 ```bash
-repowatch self-update --repo owner/name --check  # check GitHub Releases; no config.yaml needed
-repowatch self-update --repo owner/name           # install if newer
+repowatch self-update --repo erophey7/repowatch --check  # check GitHub Releases; no config.yaml needed
+repowatch self-update --repo erophey7/repowatch           # install if newer
 ```
+
+`--repo` is always required and always "owner/name" — point it at a fork
+instead if you're tracking one.
 
 A lighter, network-based path that only replaces the installed package
 (does not touch `config.yaml`, `state_db`, or nginx, and does not restart

@@ -190,6 +190,27 @@ repos:
     assert config.effective_prefetch_bandwidth_limit(slow) == 10.0
 
 
+def test_syslog_listener_enabled_defaults_to_true(tmp_path):
+    """Changed from opt-in to on-by-default 2026-09-14 — see
+    SyslogListenerConfig's own docstring: without real request visibility,
+    the hourly warmed_packages expiry (watcher.prune_all) has no way to
+    tell "nobody wants this" from "we just can't see it"."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+state_db: /tmp/repowatch-test.sqlite3
+cache_base_url: http://127.0.0.1:8080
+repos:
+  - id: r
+    type: apk
+    upstream: https://example.org
+    arch: x86_64
+"""
+    )
+    config = load_config(config_path)
+    assert config.syslog_listener.enabled is True
+
+
 def test_check_concurrency_defaults_to_eight(tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(

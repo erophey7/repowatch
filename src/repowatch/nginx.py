@@ -17,7 +17,7 @@ import subprocess
 import tempfile
 from urllib.parse import urlsplit
 
-from repowatch.config import Config, ConfigError, load_config
+from repowatch.config import Config, ConfigError, RepoConfig, load_config
 from repowatch.parsers.base import USER_AGENT
 from repowatch.prefetch import _apt_top_segment, _apt_rpm_top_segment, _local_path, _repo_url_prefix
 from repowatch.state import StateStore
@@ -92,7 +92,9 @@ def _compute_routes(config: Config) -> tuple[str, dict[str, tuple[str, str, str,
 def render(config: Config, *, cache_dir: str = '/var/cache/nginx/repowatch',
            access_log: str = '/var/log/nginx/repo-cache.access.log',
            purge_conf: str = '/etc/nginx/repowatch/purge.conf',
-           dedup_conf: str = '/etc/nginx/repowatch/dedup.map') -> str:
+           dedup_conf: str = '/etc/nginx/repowatch/dedup.map',
+           probe_conf: str = '/etc/nginx/repowatch/probe.conf',
+           probe_js: str = '/etc/nginx/repowatch/probe.js') -> str:
     settings = config.nginx
     _path(cache_dir)
     _path(access_log)
@@ -146,6 +148,13 @@ def render(config: Config, *, cache_dir: str = '/var/cache/nginx/repowatch',
             f'    include {dedup_conf};',
             '}',
         ]
+    if settings.enable_cache_probe:
+        # http-context, like the dedup map{} above — js_import can't live
+        # inside server{} (unlike purge/probe's own location{} blocks, see
+        # render_probe_conf()). The imported module name ("cache_probe")
+        # must match the export name render_probe_js() gives its handlers.
+        _path(probe_js)
+        lines.append(f'js_import cache_probe from {probe_js};')
     lines += [
         'server {', f'    listen {settings.listen};', f'    server_name {settings.server_name};',
         f'    resolver {" ".join(settings.resolvers)} valid=300s ipv6=off;',
@@ -252,6 +261,11 @@ def render(config: Config, *, cache_dir: str = '/var/cache/nginx/repowatch',
         # diff/rollback independent of routing changes in apply().
         _path(purge_conf)
         lines.append(f'    include {purge_conf};')
+    if settings.enable_cache_probe:
+        # See render_probe_conf() — same "own included file, not interleaved
+        # into per-repo routing" reasoning as purge_conf above.
+        _path(probe_conf)
+        lines.append(f'    include {probe_conf};')
     return '\n'.join(lines + ['}', ''])
 
 
@@ -312,6 +326,189 @@ def render_purge(config: Config) -> str:
                 f'        proxy_cache_purge repo_cache "{key_prefix}${{scheme}}{host}{basis}$1";',
                 '    }',
             ]
+        if settings.enable_cache_probe:
+            # Route-independent purge (docs_dev/ROADMAP.md item 8) — accepts
+            # an arbitrary already-known key verbatim, unlike the per-route
+            # locations above. Needed for genuine orphans: a repo that was
+            # removed from config.yaml (or had its dedup/url_template
+            # settings changed) no longer has ANY route this generator can
+            # rebuild a matching /purge<prefix> for, so the normal purge
+            # mechanism above structurally cannot reach it. Discovery
+            # (finding such a stale key at all) is cache_probe.py's
+            # /cache-scan job — this location only ever deletes a key it's
+            # explicitly handed, never searches for one itself. Gated on
+            # BOTH flags: pointless without enable_purge (no module loaded
+            # to do the actual eviction) and without enable_cache_probe
+            # (nothing produces raw keys to feed it).
+            lines += [
+                '    location = /purge-raw {',
+                '        allow 127.0.0.1;',
+                '        deny all;',
+                '        proxy_cache_purge repo_cache $arg_key;',
+                '    }',
+            ]
+    return '\n'.join(lines) + '\n'
+
+
+def compute_cache_key(config: Config, repo: RepoConfig, filename: str) -> str:
+    """The exact literal proxy_cache_key string for one package file — the
+    same value a real request through render()'s content location for this
+    file would produce, computed here as a plain Python string instead of an
+    nginx expression at request time.
+
+    Used by cache_probe.py: to ask /cache-probe whether one SPECIFIC known
+    package is really on disk (a non-destructive complement to
+    prefetch.purge_selected(), which can only tell you by actually deleting
+    the entry — see its own docstring on why a separate non-destructive
+    check was rejected for a live HTTP GET/HEAD, a concern that doesn't
+    apply here since this never touches upstream or proxy_cache at all, only
+    stat()s a file); and to recognize which raw keys /cache-scan reads back
+    from disk belong to a still-configured package, so anything left over is
+    an orphan candidate for docs_dev/ROADMAP.md item 33.
+
+    Reuses _compute_routes() — the same single source of truth render() and
+    render_purge() already draw from — specifically to avoid reintroducing
+    the dedup-basis mismatch bug documented on render_purge() above: this
+    function and that one MUST compute identical keys for the same file.
+    `local`'s scheme component is deliberately hardcoded to "http", not the
+    route's (upstream) scheme — see the same point in render_purge()'s
+    comment: it's nginx's own listening scheme at runtime, and this
+    generator never emits `listen ... ssl`.
+
+    Raises ValueError if `repo` isn't actually part of `config.repos`'
+    current routing (e.g. a stale RepoConfig from before a reload) —
+    callers always pass a repo drawn from the same `config` they pass here.
+    """
+    key_prefix, routes, _kinds = _compute_routes(config)
+    local_path = _local_path(repo, filename)
+    for local_prefix, (_scheme, host, remote_prefix, _ttl) in routes.items():
+        if local_path.startswith(local_prefix):
+            remote_path = remote_prefix + local_path[len(local_prefix):]
+            basis = remote_path if config.nginx.enable_dedup else local_path
+            return f'{key_prefix}http{host}{basis}'
+    raise ValueError(f'{repo.id}: {filename!r} does not match any current nginx route')
+
+
+def _js_string(value: str) -> str:
+    return "'" + value.replace('\\', '\\\\').replace("'", "\\'") + "'"
+
+
+def render_probe_js(config: Config, *, cache_dir: str = '/var/cache/nginx/repowatch') -> str:
+    """njs script body for the /cache-probe and /cache-scan locations
+    (docs_dev/ROADMAP.md item 8, render_probe_conf()) — read-only cache
+    introspection running inside the nginx worker itself (already `user
+    www-data`-equivalent, unlike repowatch's own unprivileged process).
+
+    Deliberately dumb: every byte of policy (which key, what counts as a
+    match, what to do about an orphan) stays in Python, where it's covered
+    by pytest — this only exposes two stateless filesystem primitives,
+    mirroring the "njs computes nothing repowatch doesn't already know how
+    to compute" principle agreed on for this feature. Both handlers were
+    verified by hand against a real nginx 1.24 (Ubuntu, njs 0.8.2) cache
+    directory before this was written — the cache file's on-disk header
+    format is NOT public API, only empirically confirmed for that build:
+    a fixed-size binary header followed by a literal "\\nKEY: <key>\\n" line
+    immediately before the raw HTTP response. extractKey() searches for
+    that marker instead of hardcoding the header's byte length, since the
+    exact offset could differ with e.g. Vary — the marker text itself was
+    what was actually confirmed stable across sample files, not one
+    specific offset.
+
+    Returns just a header comment when nginx.enable_cache_probe is off —
+    render() never emits `js_import` for this file in that case, so nginx
+    never parses it; the same "always safe to write unconditionally"
+    contract as render_purge()/render_dedup().
+    """
+    settings = config.nginx
+    lines = ['// Generated by repowatch; edit YAML parameters, not this file.']
+    if not settings.enable_cache_probe:
+        return '\n'.join(lines) + '\n'
+    lines += [
+        "const fs = require('fs');",
+        f'const CACHE_DIR = {_js_string(cache_dir)};',
+        "const KEY_MARKER = '\\nKEY: ';",
+        '',
+        'function cachePath(hash) {',
+        "    return CACHE_DIR + '/' + hash.slice(-1) + '/' + hash.slice(-3, -1) + '/' + hash;",
+        '}',
+        '',
+        'function probe(r) {',
+        '    const key = r.args.key;',
+        "    if (!key) { r.return(400, 'missing key\\n'); return; }",
+        "    const hash = require('crypto').createHash('md5').update(key).digest('hex');",
+        '    let result;',
+        '    try {',
+        '        const st = fs.statSync(cachePath(hash));',
+        '        result = {exists: true, size: st.size, mtime: st.mtime};',
+        '    } catch (e) {',
+        '        result = {exists: false};',
+        '    }',
+        "    r.headersOut['Content-Type'] = 'application/json';",
+        '    r.return(200, JSON.stringify(result));',
+        '}',
+        '',
+        'function extractKey(buf) {',
+        '    const idx = buf.indexOf(KEY_MARKER);',
+        '    if (idx < 0) return null;',
+        '    const start = idx + KEY_MARKER.length;',
+        "    const nl = buf.indexOf('\\n', start);",
+        '    if (nl < 0) return null;',
+        '    return buf.slice(start, nl).toString();',
+        '}',
+        '',
+        'function scan(r) {',
+        '    const dir = r.args.dir;',
+        # Validated against the fixed levels=1:2 shape (nginx.py's
+        # proxy_cache_path) — also closes off path traversal via `dir`,
+        # even though this location is loopback-only (defense in depth,
+        # same posture as _uri()/_path() elsewhere in this module).
+        "    if (!/^[0-9a-f]\\/[0-9a-f]{2}$/.test(dir || '')) { r.return(400, 'bad dir\\n'); return; }",
+        "    const dirPath = CACHE_DIR + '/' + dir;",
+        '    let entries = [];',
+        '    try { entries = fs.readdirSync(dirPath); } catch (e) { entries = []; }',
+        '    const results = entries.map((name) => {',
+        '        try {',
+        "            const full = dirPath + '/' + name;",
+        '            const buf = fs.readFileSync(full);',
+        '            const st = fs.statSync(full);',
+        '            return {file: name, key: extractKey(buf), size: st.size, mtime: st.mtime};',
+        '        } catch (e) {',
+        '            return {file: name, error: String(e)};',
+        '        }',
+        '    });',
+        "    r.headersOut['Content-Type'] = 'application/json';",
+        '    r.return(200, JSON.stringify(results));',
+        '}',
+        '',
+        'export default {probe, scan};',
+    ]
+    return '\n'.join(lines) + '\n'
+
+
+def render_probe_conf(config: Config) -> str:
+    """Locations for /cache-probe and /cache-scan (see render_probe_js()),
+    generated separately from render() and pulled into the server block via
+    a single `include` line there — same pattern as render_purge().
+
+    Returns just a header comment when nginx.enable_cache_probe is off,
+    same "always safe to call/write unconditionally" contract as
+    render_purge()/render_dedup().
+    """
+    settings = config.nginx
+    lines = ['# Generated by repowatch; edit YAML parameters, not this file.']
+    if settings.enable_cache_probe:
+        lines += [
+            '    location = /cache-probe {',
+            '        allow 127.0.0.1;',
+            '        deny all;',
+            '        js_content cache_probe.probe;',
+            '    }',
+            '    location = /cache-scan {',
+            '        allow 127.0.0.1;',
+            '        deny all;',
+            '        js_content cache_probe.scan;',
+            '    }',
+        ]
     return '\n'.join(lines) + '\n'
 
 
@@ -408,6 +605,10 @@ def apply(config_path: str, policy_path: str, *, force: bool = False, use_system
     previous_purge = directory / 'previous-purge.conf'
     dedup_path = directory / 'dedup.map'
     previous_dedup = directory / 'previous-dedup.map'
+    probe_conf_path = directory / 'probe.conf'
+    previous_probe_conf = directory / 'previous-probe.conf'
+    probe_js_path = directory / 'probe.js'
+    previous_probe_js = directory / 'previous-probe.js'
     status = directory / 'status.json'
     link = Path(policy['site_link'])
     if not link.is_symlink() or link.resolve() != active.resolve():
@@ -426,28 +627,39 @@ def apply(config_path: str, policy_path: str, *, force: bool = False, use_system
                 f"CACHE_DIR=... make install && sudo make activate."
             )
         candidate = render(config, cache_dir=policy['cache_dir'], access_log=policy['access_log'],
-                            purge_conf=str(purge_path), dedup_conf=str(dedup_path))
-        # render_purge()/render_dedup() are written unconditionally (empty/
-        # comment-only when their flag is off) — render() only ever
-        # `include`s them when the corresponding flag is on, so an idle file
-        # on disk changes nothing; this avoids conditionally creating/
-        # deleting a file across toggles.
+                            purge_conf=str(purge_path), dedup_conf=str(dedup_path),
+                            probe_conf=str(probe_conf_path), probe_js=str(probe_js_path))
+        # render_purge()/render_dedup()/render_probe_conf()/render_probe_js()
+        # are written unconditionally (empty/comment-only when their flag is
+        # off) — render() only ever `include`s/`js_import`s them when the
+        # corresponding flag is on, so an idle file on disk changes nothing;
+        # this avoids conditionally creating/deleting a file across toggles.
         purge_candidate = render_purge(config)
         # find_duplicate_files() is a real query over repo_packages — only
         # run it when dedup is actually on, so leaving it off costs nothing
         # extra on every apply cycle (this timer runs every 15s).
         dedup_rows = StateStore(config.state_db).find_duplicate_files() if config.nginx.enable_dedup else []
         dedup_candidate = render_dedup(config, resolve_dedup_pairs(config, dedup_rows))
-        digest = hashlib.sha256((candidate + purge_candidate + dedup_candidate).encode()).hexdigest()
+        probe_conf_candidate = render_probe_conf(config)
+        probe_js_candidate = render_probe_js(config, cache_dir=policy['cache_dir'])
+        digest = hashlib.sha256((
+            candidate + purge_candidate + dedup_candidate + probe_conf_candidate + probe_js_candidate
+        ).encode()).hexdigest()
         old = active.read_text() if active.exists() else None
         old_purge = purge_path.read_text() if purge_path.exists() else None
         old_dedup = dedup_path.read_text() if dedup_path.exists() else None
-        if old == candidate and old_purge == purge_candidate and old_dedup == dedup_candidate and not force:
+        old_probe_conf = probe_conf_path.read_text() if probe_conf_path.exists() else None
+        old_probe_js = probe_js_path.read_text() if probe_js_path.exists() else None
+        if (old == candidate and old_purge == purge_candidate and old_dedup == dedup_candidate
+                and old_probe_conf == probe_conf_candidate and old_probe_js == probe_js_candidate
+                and not force):
             return False
         nginx = policy['nginx_binary']
         command = [nginx, '-t', '-c', policy['nginx_conf']]
         _write(purge_path, purge_candidate)
         _write(dedup_path, dedup_candidate)
+        _write(probe_conf_path, probe_conf_candidate)
+        _write(probe_js_path, probe_js_candidate)
         _write(active, candidate)
         try:
             subprocess.run(command, check=True, capture_output=True, text=True, timeout=30)
@@ -462,6 +674,14 @@ def apply(config_path: str, policy_path: str, *, force: bool = False, use_system
                 dedup_path.unlink(missing_ok=True)
             else:
                 _write(dedup_path, old_dedup)
+            if old_probe_conf is None:
+                probe_conf_path.unlink(missing_ok=True)
+            else:
+                _write(probe_conf_path, old_probe_conf)
+            if old_probe_js is None:
+                probe_js_path.unlink(missing_ok=True)
+            else:
+                _write(probe_js_path, old_probe_js)
             if old is None:
                 active.unlink(missing_ok=True)
             else:
@@ -481,5 +701,9 @@ def apply(config_path: str, policy_path: str, *, force: bool = False, use_system
             _write(previous_purge, old_purge)
         if old_dedup is not None:
             _write(previous_dedup, old_dedup)
+        if old_probe_conf is not None:
+            _write(previous_probe_conf, old_probe_conf)
+        if old_probe_js is not None:
+            _write(previous_probe_js, old_probe_js)
         _write(status, json.dumps({'ok': True, 'active': digest}) + '\n')
         return True
