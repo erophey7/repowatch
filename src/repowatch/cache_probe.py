@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import httpx
 
@@ -55,6 +55,20 @@ class ScanEntry:
     size: int | None = None
     mtime: str | None = None
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class Inventory:
+    entries: list[ScanEntry]
+    # Leaves whose /cache-scan request itself failed (timeout, connection
+    # error, non-2xx) — NOT counted among `entries`, so the caller can tell
+    # "the cache is genuinely small" from "part of the scan didn't respond".
+    # See cache_dir_size()'s own docstring: without this, a transient
+    # failure on even one of the 4096 leaves would silently produce an
+    # undercount with zero indication — the exact pitfall
+    # api.cache_dir_stats()'s `inaccessible_directories` already exists to
+    # make visible for the unrelated os.walk() permission-gap case.
+    failed_leaves: int = 0
 
 
 async def probe(client: httpx.AsyncClient, base_url: str, key: str) -> ProbeResult:
@@ -97,7 +111,7 @@ async def scan_leaf(client: httpx.AsyncClient, base_url: str, leaf: str) -> list
     ]
 
 
-async def full_inventory(base_url: str, *, concurrency: int = 8) -> list[ScanEntry]:
+async def full_inventory(base_url: str, *, concurrency: int = 8) -> Inventory:
     """The complete real inventory of what nginx's cache actually holds —
     drives scan_leaf() over all 4096 possible leaf directories concurrently
     (bounded by `concurrency`), so no stateful cursor is needed on either
@@ -111,24 +125,31 @@ async def full_inventory(base_url: str, *, concurrency: int = 8) -> list[ScanEnt
 
     A leaf directory that doesn't exist yet (most of them, on a small cache)
     comes back as an empty list from scan_leaf(), not an error — only a real
-    HTTP failure for that one leaf is logged and skipped, so one bad request
-    doesn't abort the whole inventory.
+    HTTP failure for that one leaf is logged, counted in the returned
+    Inventory.failed_leaves, and skipped, so one bad request doesn't abort
+    the whole scan — but also doesn't silently disappear from the result
+    (real bug found during a documentation-accuracy pass, 2026-09-14: an
+    earlier version of this function just logged and dropped a failed leaf
+    with no way for the caller to know the scan was incomplete).
     """
     semaphore = asyncio.Semaphore(concurrency)
     results: list[ScanEntry] = []
+    failed_leaves = 0
 
     async def _run(client: httpx.AsyncClient, leaf: str) -> None:
+        nonlocal failed_leaves
         async with semaphore:
             try:
                 entries = await scan_leaf(client, base_url, leaf)
             except httpx.HTTPError as exc:
                 logger.warning("cache-scan failed for leaf %s: %s", leaf, exc)
+                failed_leaves += 1
                 return
         results.extend(entries)
 
     async with httpx.AsyncClient() as client:
         await asyncio.gather(*(_run(client, leaf) for leaf in LEAF_DIRS))
-    return results
+    return Inventory(entries=results, failed_leaves=failed_leaves)
 
 
 async def cache_dir_size(base_url: str, *, concurrency: int = 8) -> dict:
@@ -137,9 +158,19 @@ async def cache_dir_size(base_url: str, *, concurrency: int = 8) -> dict:
     infrastructure) — the accurate counterpart to api.cache_dir_stats()'s
     os.walk(), for when nginx.enable_cache_probe is on. Unlike that
     os.walk(), this runs inside the nginx worker itself (already the
-    cache's own owner), so it never hits the 0700-subdirectory permission
-    gap documented there — no `inaccessible_directories` possible, the
-    count is always complete.
+    cache's own owner), so it never hits the 0700-subdirectory PERMISSION
+    gap documented there.
+
+    That's a different thing from being unconditionally complete, though —
+    a single leaf's /cache-scan request can still fail on its own (timeout,
+    a transient njs/nginx hiccup) independent of any permission issue. When
+    that happens the result carries `incomplete_leaves`, the same visible
+    "this number might be an undercount" signal `inaccessible_directories`
+    gives the os.walk() path, for the same reason: silently returning a
+    smaller number than reality is worse than a wrong number you can see is
+    wrong (real gap found and closed during a documentation-accuracy pass,
+    2026-09-14 — an earlier version of this docstring claimed the count
+    was "always complete", which the code didn't actually guarantee).
 
     Same expensive/on-demand-only posture as cache_dir_stats() and
     full_inventory() itself: only call this from an explicit operator
@@ -149,10 +180,9 @@ async def cache_dir_size(base_url: str, *, concurrency: int = 8) -> dict:
     Files whose key couldn't be read (scan()'s `error` field set — a rare,
     real possibility, e.g. a file mid-write) are still counted for size
     (the stat() succeeded even if the key line didn't parse) but flagged
-    via `unreadable_keys`, mirroring cache_dir_stats()'s
-    `inaccessible_directories` as a visible "this number might be an
-    undercount of METADATA, not necessarily of bytes" signal — distinct
-    from a permission gap, which this approach doesn't have.
+    via `unreadable_keys` — a METADATA gap (this file's identity), distinct
+    from `incomplete_leaves` (a whole leaf's files, size included, missing
+    entirely).
     """
     async with httpx.AsyncClient() as client:
         # Fails loudly (propagates) if /cache-scan isn't actually reachable
@@ -160,19 +190,21 @@ async def cache_dir_size(base_url: str, *, concurrency: int = 8) -> dict:
         # background nginx-apply timer hasn't reconciled it yet, or the njs
         # module failed to load. Without this check, every one of the 4096
         # leaf requests full_inventory() makes below would fail identically
-        # and get silently swallowed there (by design, so one bad leaf
-        # doesn't abort the whole scan) — indistinguishable from "the cache
-        # is genuinely empty", the exact pitfall api.cache_dir_stats()
-        # already guards against for os.walk() with its own explicit
-        # is-a-directory check.
+        # and get counted as failed leaves rather than raised — indistinguishable
+        # from "the cache is genuinely empty" if a caller only checks
+        # size_bytes without also checking incomplete_leaves, the exact
+        # pitfall api.cache_dir_stats() already guards against for
+        # os.walk() with its own explicit is-a-directory check.
         await scan_leaf(client, base_url, "0/00")
 
-    entries = await full_inventory(base_url, concurrency=concurrency)
-    total_bytes = sum(e.size or 0 for e in entries)
-    result = {"size_bytes": total_bytes, "file_count": len(entries)}
-    unreadable = sum(1 for e in entries if e.key is None)
+    inventory = await full_inventory(base_url, concurrency=concurrency)
+    total_bytes = sum(e.size or 0 for e in inventory.entries)
+    result = {"size_bytes": total_bytes, "file_count": len(inventory.entries)}
+    unreadable = sum(1 for e in inventory.entries if e.key is None)
     if unreadable:
         result["unreadable_keys"] = unreadable
+    if inventory.failed_leaves:
+        result["incomplete_leaves"] = inventory.failed_leaves
     return result
 
 
@@ -227,16 +259,14 @@ async def purge_selected_raw(config: Config, repo: RepoConfig, items: dict[str, 
     Goes through the route-independent /purge-raw location (see
     nginx.render_purge()) instead of the per-repo /purge<prefix> one, using
     nginx.compute_cache_key() to build each item's exact literal key in
-    Python — no location/regex match needed on the nginx side at all. This
-    isn't just a style choice: prefetch.purge_selected()'s per-route purge
-    always computes the key under the repo's CURRENT nginx.enable_dedup
-    basis, so a file that predates a dedup toggle (real production case
-    found 2026-09-13 — most of a 3804-entry "zombie" batch turned out to be
-    exactly this) reports "not_cached" and is never actually evicted, even
-    though it's still sitting on disk. compute_cache_key() is exactly the
-    same function that lets cache_probe's scan classify those entries
-    correctly, so purging through the same path keeps both sides
-    consistent — no separate basis-guessing logic duplicated here.
+    Python — no location/regex match needed on the nginx side at all.
+
+    Purges both distinct keys obtained with dedup enabled and disabled:
+    a file can survive under the old key after a toggle, even when another
+    copy has already been cached under the current key. An error from
+    either request takes precedence over successful deletion or absence,
+    so callers retain warmed bookkeeping until a later retry confirms
+    both copies are gone. Identical keys require only one request.
 
     Callers gate on enable_cache_probe themselves (same convention as the
     rest of this module) — this function does not check the flag.
@@ -245,11 +275,17 @@ async def purge_selected_raw(config: Config, repo: RepoConfig, items: dict[str, 
         return {}
     semaphore = asyncio.Semaphore(config.prefetch_concurrency)
     results: dict[str, str] = {}
+    alt_config = replace(config, nginx=replace(config.nginx, enable_dedup=not config.nginx.enable_dedup))
 
     async def _run(client: httpx.AsyncClient, key: str, filename: str) -> None:
-        cache_key = compute_cache_key(config, repo, filename)
-        async with semaphore:
-            results[key] = await purge_raw(client, config.cache_base_url, cache_key)
+        keys = dict.fromkeys((compute_cache_key(config, repo, filename),
+                              compute_cache_key(alt_config, repo, filename)))
+        outcomes = []
+        for cache_key in keys:
+            async with semaphore:
+                outcomes.append(await purge_raw(client, config.cache_base_url, cache_key))
+        errors = [outcome for outcome in outcomes if outcome not in ("purged", "not_cached")]
+        results[key] = errors[0] if errors else ("purged" if "purged" in outcomes else "not_cached")
 
     async with httpx.AsyncClient() as client:
         await asyncio.gather(*(_run(client, key, filename) for key, filename in items.items()))

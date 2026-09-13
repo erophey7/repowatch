@@ -537,7 +537,7 @@ function renderStorageStats(stats) {
     const viaProbe = stats.cache_dir.source === 'cache_probe';
     html += `<p>cache_dir (${esc(stats.cache_dir.path)}): ${bytes(stats.cache_dir.size_bytes)}, ` +
       `${stats.cache_dir.file_count.toLocaleString()} file(s)` +
-      (viaProbe ? ' <span class="dim">(via cache-probe, complete — no permission gaps)</span>' : '') +
+      (viaProbe ? ' <span class="dim">(via cache-probe, no permission gaps)</span>' : '') +
       '</p>';
     if (stats.cache_dir.inaccessible_directories) {
       html += `<p class="form-msg error">Warning: ${stats.cache_dir.inaccessible_directories.toLocaleString()} ` +
@@ -548,6 +548,11 @@ function renderStorageStats(stats) {
     if (stats.cache_dir.unreadable_keys) {
       html += `<p class="form-msg error">Note: ${stats.cache_dir.unreadable_keys.toLocaleString()} ` +
         'file(s) had an unreadable stored key (still counted for size, just not individually identifiable).</p>';
+    }
+    if (stats.cache_dir.incomplete_leaves) {
+      html += `<p class="form-msg error">Warning: ${stats.cache_dir.incomplete_leaves.toLocaleString()} ` +
+        'of 4096 cache directories could not be scanned (transient failure) — the numbers above ' +
+        'are an UNDERCOUNT.</p>';
     }
   }
   return html;

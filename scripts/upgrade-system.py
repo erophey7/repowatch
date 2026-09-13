@@ -47,6 +47,53 @@ def service_state():
     return result
 
 
+def plan(layout, wheelhouse):
+    """Read-only preconditions for `make upgrade-plan` (no `--apply`) —
+    added 2026-09-14 after a documentation-accuracy review found the docs
+    claimed this ran "the same validation upgrade --apply would", when the
+    actual code did nothing beyond printing the resolved manifest paths:
+    exit 0 even with a missing config.yaml, missing venv, and missing
+    wheelhouse (reproduced by hand before this existed).
+
+    This is still NOT the full validation --apply performs — it doesn't
+    build a candidate venv or actually resolve the new release's
+    dependencies, since that needs real disk I/O this dry-run mode
+    shouldn't require. It's a genuine, if cheaper, set of checks: does the
+    config this upgrade would use actually load in the CURRENTLY installed
+    venv, does that venv exist at all, does the wheelhouse have exactly one
+    application wheel, and are the services --apply requires to already be
+    running actually running. Returns a list of problem strings — empty
+    means these preconditions look fine, not that the upgrade is
+    guaranteed to succeed.
+    """
+    problems = []
+    python = layout.venv / 'bin/python'
+    if not python.is_file():
+        problems.append(f'installed venv not found: {layout.venv}')
+    elif not layout.config.is_file():
+        problems.append(f'config.yaml not found: {layout.config}')
+    else:
+        try:
+            probe(python, layout.config)
+        except (subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+            problems.append(f'config.yaml does not load in the installed venv: {exc}')
+    app = list(wheelhouse.glob('repowatch-*.whl')) if wheelhouse.is_dir() else []
+    if len(app) != 1:
+        problems.append(f'wheelhouse must contain exactly one repowatch-*.whl, found {len(app)}: {wheelhouse}')
+    if layout.with_nginx and not shutil.which('nginx'):
+        problems.append('nginx not found on PATH but with_nginx is set')
+    try:
+        states = service_state()
+    except ValueError as exc:
+        problems.append(str(exc))
+    else:
+        if not states.get('repowatch.service', {}).get('active'):
+            problems.append('repowatch.service is not active — upgrade --apply requires it running first')
+        if layout.with_nginx and not states.get('nginx.service', {}).get('active'):
+            problems.append('nginx.service is not active — upgrade --apply requires it running first')
+    return problems
+
+
 def stop():
     # Stop schedules first; then drain even a oneshot that fired after inspection.
     loaded = [u for u in UNITS if subprocess.run(['systemctl', 'show', '-p', 'LoadState', '--value', u], capture_output=True, text=True).stdout.strip() not in ('not-found', '')]
@@ -260,6 +307,13 @@ def main():
             def interrupted(signum, frame): raise KeyboardInterrupt(f'signal {signum}')
             signal.signal(signal.SIGTERM, interrupted)
             upgrade(layout, args.source.resolve(), args.wheelhouse.resolve())
+    else:
+        problems = plan(layout, args.wheelhouse.resolve())
+        if problems:
+            for problem in problems:
+                print(f'PROBLEM {problem}')
+            sys.exit(1)
+        print('PLAN_OK')
 
 
 if __name__ == '__main__':

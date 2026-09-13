@@ -28,15 +28,16 @@ example config and edit it (see the main README's Quick start).
 | `check_interval` | int (seconds) | `300` | How often each repository's index is checked, unless overridden per-repository (see `repos[].check_interval`). |
 | `check_concurrency` | int | `8` | How many repositories to check at once per scheduler tick. Repositories are checked concurrently, not one at a time — a slow/hung upstream for one repo won't delay checking the others. |
 | `prefetch_concurrency` | int | `8` | How many files to warm in parallel per warm-up run. |
-| `prefetch_bandwidth_limit` | float (bytes/sec) or `null` | `null` | Global cap on total warm-up bandwidth, across all concurrently warming files — not a requests/sec limit (file sizes vary from a few hundred bytes to hundreds of megabytes). `null` means no limit. Overridable per-repository, see `repos[].prefetch_bandwidth_limit`. |
+| `prefetch_bandwidth_limit` | float (bytes/sec) or `null` | `null` | Cap on total warm-up bandwidth across all files warming CONCURRENTLY WITHIN ONE REPOSITORY'S warm-up run — not a requests/sec limit (file sizes vary from a few hundred bytes to hundreds of megabytes), and not a true global cap: each repository's `warm_cache()` run gets its own independent limiter instance, so N repositories warming at the same time can together use up to N × this value. `null` means no limit. Overridable per-repository, see `repos[].prefetch_bandwidth_limit`. |
 | `event_retention_days` | int | `90` | How many days to keep the per-repository change log (`repo_events` — what changed and when). |
 | `request_retention_days` | int | `7` | How many days to keep the log of real client requests (only populated if `syslog_listener.enabled`). |
 | `warmed_retention_days` | int | `180` | How many days to keep a `warmed_packages` row that hasn't been updated. Deliberately much longer than `event_retention_days`: this is "last known warm state", not an event log, and a package can legitimately go unwarmed for months if its version doesn't change. A real client request refreshes the timer (see `syslog_listener` below); this whole cleanup is skipped entirely when `syslog_listener.enabled` is off, since without it there's no way to tell "nobody wants this" from "we can't see it". When `nginx.enable_purge` is also on, an expired row's real cache entry is purged too, not just the bookkeeping row. |
 | `event_max_rows_per_repo` | int or `null` | `null` | Size-based cap on `repo_events`, per repository, on top of the day-based retention above. Use when traffic is high enough that day-based retention alone doesn't bound growth. `null` = no cap. |
 | `request_max_rows` | int or `null` | `null` | Size-based cap on `request_events`, global (not per-repository — some rows aren't attributable to one repository). `null` = no cap. |
 | `admin_password_hash` | string or `null` | `null` | PBKDF2 hash of the dashboard admin password. Generate it with `repowatch hash-password` — see [Setting the admin password](#setting-the-admin-password). Until this is set, the dashboard and administrative API are closed. |
-| `notify_webhook_url` | URL or `null` | `null` | Webhook for notifications about repeated warm-up/signature-verification failures — a generic JSON POST, compatible with Slack/Mattermost/Discord incoming webhooks. Treat this as a secret (the URL itself is a bearer token): it is **not** exposed through `GET /api/config` or the dashboard, only editable by hand in `config.yaml`. |
+| `notify_webhook_url` | URL or `null` | `null` | Webhook for notifications about repeated warm-up/signature-verification failures — a generic JSON POST with a `text` field, the format Slack and Mattermost incoming webhooks read directly. **Discord's own webhook endpoint does not read `text` at all** (it expects `content`) — point this at Discord's separate Slack-compatible endpoint instead, `https://discord.com/api/webhooks/<id>/<token>/slack`, not the plain webhook URL Discord's UI gives you by default. Treat this as a secret (the URL itself is a bearer token): it is **not** exposed through `GET /api/config` or the dashboard, only editable by hand in `config.yaml`. |
 | `notify_after_failures` | int | `3` | How many *consecutive* failures (per repository, per failure kind — signature verification or warm-up) before sending a notification. Fires once at the threshold and once on recovery, not on every failure. |
+| `key_expiry_warning_days` | int | `30` | Warning window before the earliest expiry in a GPG keyring, for repositories with `verify_signature: true`. Requires the full `gpg` binary; without it expiry is unknown, while `gpgv` verification continues normally. Exposed in the dashboard and the `repowatch_repo_key_expiring_soon` / `repowatch_repo_key_expires_at_timestamp_seconds` metrics. Webhook notification uses `kind="key_expiry"` and fires after `notify_after_failures` consecutive checks within the window (third by default), then once on recovery after a delivered warning. Does not apply to apk or xbps. |
 | `status_server` | mapping | — | See [`status_server`](#status_server). |
 | `syslog_listener` | mapping | — | See [`syslog_listener`](#syslog_listener). |
 | `nginx` | mapping | — | See [`nginx`](#nginx). |
@@ -59,8 +60,8 @@ and adding a new one; there's no rename.
 | `repo_name` | string | — (required for `pacman`) | pacman | e.g. `core`, `extra`, `community`. |
 | `distribution` | string | — (required for `apt`) | apt | e.g. `bookworm`, `jammy`, `noble-updates`. |
 | `component` | string | — (required for `apt`, `apt-rpm`) | apt, apt-rpm | e.g. `main`, `contrib`, `non-free`. For `apt-rpm` it must match `[A-Za-z0-9_-]+` (e.g. `classic`, `checkinstall`). |
-| `verify_signature` | bool | `false` | apt, pacman, dnf, apk | Enables GPG (or, for apk, RSA) verification of the index before it's parsed. See per-type key fields below. |
-| `keyring_path` | path or `null` | `null` | apt, pacman, dnf | Path to an **exported keyring** (`gpg --export ... > keyring.gpg`), not a `.asc`/armored key file. Required when `verify_signature: true` for these types. |
+| `verify_signature` | bool | `false` | apt, pacman, dnf, apt-rpm, apk | Enables GPG (or, for apk, RSA) verification of the index before it's parsed. See per-type key fields below. |
+| `keyring_path` | path or `null` | `null` | apt, pacman, dnf, apt-rpm | Path to an **exported keyring** (`gpg --export ... > keyring.gpg`), not a `.asc`/armored key file. Required when `verify_signature: true` for these types. |
 | `apk_signature_backend` | `openssl` \| `apk-tools` | `openssl` | apk | Which system tool performs the embedded-RSA signature check (apk uses its own scheme, not OpenPGP — `keyring_path`/`gpgv` don't apply to it). |
 | `apk_keys_dir` | path or `null` | `null` | apk | Directory of trusted apk public keys (the same format/layout as `/etc/apk/keys`). Required when `verify_signature: true` for apk. |
 | `check_interval` | int (seconds) or `null` | `null` | all | Per-repository override of the top-level `check_interval`. `null` means "use the global value". |
@@ -86,8 +87,10 @@ and adding a new one; there's no rename.
   `release` is checked with `gpgv`. Binary RPM headers inside the package
   list are read directly (no RPM database, no package installation);
   SHA256/BLAKE2b checksums are verified against the release file.
-- **apk**: a different, non-GPG signature scheme (an RSA/RSA256 signature
-  embedded as a second gzip member inside `APKINDEX.tar.gz`). Verified via
+- **apk**: a different, non-GPG signature scheme (`abuild-sign` prepends the
+  RSA/RSA256 signature as its OWN gzip member before the real, still-compressed
+  index — so `APKINDEX.tar.gz` is two concatenated gzip streams, signature
+  first, index second). Verified via
   the system `openssl` binary, or via `apk-tools >= 3.0` if you set
   `apk_signature_backend: apk-tools`. There is no plain-OpenPGP option for
   apk — `keyring_path` is not used here.
@@ -101,7 +104,18 @@ and adding a new one; there's no rename.
 
 A repository with `verify_signature: true` and a missing/wrong keyring or
 key is not silently skipped — the check fails, the last good snapshot is
-kept, and the failure is counted for `notify_after_failures`/`/healthz`.
+kept, and the failure is counted for `notify_after_failures` (a webhook
+fires once the consecutive-failure threshold is reached). `/healthz`
+reflects it too, but indirectly and only in one specific case: it flags a
+repository whose *last known-good* check has gone stale relative to its
+`check_interval` — a repository that has NEVER had a single successful
+check (failing from the very first cycle) has no "last known-good"
+timestamp to compare against at all, and is therefore not reported as
+stale by `/healthz` (see `_repo_staleness()`'s own docstring: "not
+considered stale — that's an expected state, not a failure", the same rule
+that also covers a brand-new repository nobody's checked yet). For
+persistent from-the-start failures, `notify_after_failures` is the signal
+that actually fires — don't rely on `/healthz` alone to catch that case.
 
 ## `url_template` / `url_variables`
 
@@ -151,8 +165,8 @@ exposes `status.json`, the dashboard, and the administrative API.
 | `bind` | string | `0.0.0.0` | Listen address. |
 | `port` | int | `8085` | Listen port. |
 | `tls_cert_path` / `tls_key_path` | path or `null` | `null` | Both set (PEM cert and key) to enable built-in TLS, or both left `null` for plain HTTP. Setting only one is an error. Loaded once at startup — rotating a certificate needs a restart, which is why these two fields aren't in the dashboard-editable set (see below). A reverse proxy handling TLS termination is generally the recommended setup; built-in TLS exists for simple single-host deployments. |
-| `allow_insecure_http` | bool | `false` | Must be explicitly set to allow serving the admin login/session and Bearer-token status API over plain, unencrypted HTTP. Without it (and without TLS configured), authenticated routes refuse to serve over HTTP. This is an explicit operator opt-in, not something inferred from a `Forwarded`/`X-Forwarded-Proto` header. |
-| `guest_read_only` | bool | `false` | When `true`, the dashboard and a fixed set of read-only routes (status, packages, history, request stats) are served to anyone, without login — everything that changes state still requires an authenticated admin session. Does not affect `/api/config`, `/api/tokens`, or `/metrics`, which have their own rules (see below). |
+| `allow_insecure_http` | bool | `false` | Permits credentials over otherwise disallowed plain HTTP. By default, credentials are accepted on TLS connections, through a configured trusted proxy reporting HTTPS, or on direct loopback connections without forwarding headers. See [access.md](access.md#tls-and-allow_insecure_http). |
+| `guest_read_only` | bool | `false` | When `true`, the dashboard and a fixed set of read-only routes (status, packages, history, request stats, and the SAFE subset of `GET /api/config` — never secrets like `admin_password_hash`) are served to anyone, without login — everything that changes state still requires an authenticated admin session. Does not affect `/api/tokens` (the list of issued host tokens stays admin-only) or `/metrics`, which have their own separate rules (see below). |
 | `token_repo_restrictions` | bool | `false` | Enables scoping host tokens (see below) to a specific set of repository IDs. Tokens issued before this is enabled (or issued without a scope) are unrestricted — this only lets you *start* restricting new tokens, it doesn't retroactively narrow old ones. |
 | `trusted_proxies` | list of IP/CIDR | `[]` | Which peers' `X-Forwarded-For`-style headers are trusted for determining the real client IP (used by `metrics_allowed_networks` and request logging). The chain is parsed right-to-left; a peer not in this list can't spoof another client's IP. |
 | `metrics_allowed_networks` | list of IP/CIDR | `["127.0.0.1/32", "::1/128"]` | Which client networks may fetch `GET /metrics`. Loopback-only by default; widen it (e.g. to your monitoring subnet) if Prometheus scrapes from elsewhere. |
@@ -216,10 +230,10 @@ config actually serves them.
 | `cache_key_version` | string | `""` | Bump this (any short string) to invalidate all cached objects by changing the cache key prefix, without clearing the disk cache by hand. |
 | `index_ttl` | int (seconds) | `300` | `proxy_cache_valid` for mutable index/metadata files (the whole point of active watching is that these go stale quickly). |
 | `package_ttl` | int (seconds) | `15552000` (180 days) | `proxy_cache_valid` for immutable package files, addressed by exact version/checksum. |
-| `cache_dir` | path or `null` | `null` | **Read-only/informational** — the actual cache directory nginx writes to is set once, at install time, in the root-owned `policy.json` (see `CACHE_DIR` in [deployment.md](deployment.md)), not here. Setting this makes the path visible in `config.yaml` instead of hidden inside a file the service user can't read; `nginx-apply` cross-checks it against `policy.json` and refuses to apply on a mismatch, so it can't silently go stale. To actually change the cache directory: `CACHE_DIR=... make install && sudo make activate`. Setting it also unlocks the cache directory's size in `repowatch stats --cache-dir` and the dashboard's Storage panel ("Calculate cache directory size") — without it there is no path to walk, so that number is simply omitted rather than guessed at or defaulted to zero. **A real permissions caveat, found on a live deployment**: nginx creates `proxy_cache_path`'s `levels=1:2` subdirectories `0700`, owned by the nginx worker user (e.g. `www-data`) — regardless of the top-level `cache_dir`'s own mode. The repowatch service user is a deliberately different, unprivileged account (see "Ключевые решения" in CLAUDE.md), so on most real installs it can list the top-level directory but cannot descend into any of the hashed subdirectories at all. When that happens the reported size is a real undercount, but it is never silently wrong: the result includes `inaccessible_directories` (CLI prints a `WARNING`, the dashboard shows it in red) whenever this happens, so a permission wall doesn't read as "the cache is empty". There is no supported way to make this fully accurate without either running the walk as `root`/the nginx user (against the privilege-separation this project deliberately keeps) or granting broader read access to the cache tree yourself. |
-| `enable_purge` | bool | `false` | Actively evict a package's cache entry the moment it disappears from the upstream index, instead of waiting for `inactive`/`max_size` to notice on their own. Requires the third-party `ngx_cache_purge` nginx module (Debian/Ubuntu: `libnginx-mod-http-cache-purge`; Arch: `nginx-mod-cache_purge`) — **not** the nginx-plus `proxy_cache_purge on` API, and not a real `PURGE` HTTP method (nginx core rejects unknown methods outright); the generator instead adds a dedicated, loopback-only `GET /purge<prefix>/...` location per repository. You must separately add `load_module ".../ngx_http_cache_purge_module.so";` to your own main `nginx.conf` — that's a main-context directive the generated file (which lives inside `http{}`/`sites-enabled`) can't emit itself. Without the module loaded, `nginx -t` fails clearly during `nginx-apply` and the usual atomic rollback applies — it doesn't silently do nothing. When it's on, the dashboard's per-repository panel also gets a "Cache purge (stale warmed entries)" section: "Scan for stale entries" computes candidates from repowatch's own records only (no nginx/network call), then "Purge selected" is the only point that actually asks nginx — its 200/404 response IS the "was this cached" answer, so there's no separate non-destructive pre-check (a live HEAD/GET probe against the same cache key real traffic uses has a real correctness cost/risk — see `docs_dev/ROADMAP.md` item 32 for the full reasoning). If `enable_cache_probe` is *also* on, "Purge selected" and un-warming go through that instead — see its own row below. |
+| `cache_dir` | path or `null` | `null` | **Read-only/informational** — the actual cache directory nginx writes to is set once, at install time, in the root-owned `policy.json` (see `CACHE_DIR` in [deployment.md](deployment.md)), not here. Setting this makes the path visible in `config.yaml` instead of hidden inside a file the service user can't read; `nginx-apply` cross-checks it against `policy.json` and refuses to apply on a mismatch, so it can't silently go stale. To actually change the cache directory: `sudo make install CACHE_DIR=... && sudo make activate` (stop the repowatch services/timers first). Setting it also unlocks the cache directory's size in `repowatch stats --cache-dir` and the dashboard's Storage panel ("Calculate cache directory size") — without it there is no path to walk, so that number is simply omitted rather than guessed at or defaulted to zero. **A real permissions caveat, found on a live deployment**: nginx creates `proxy_cache_path`'s `levels=1:2` subdirectories `0700`, owned by the nginx worker user (e.g. `www-data`) — regardless of the top-level `cache_dir`'s own mode. repowatch deliberately runs as a separate, unprivileged service user (not the nginx worker's), so on most real installs it can list the top-level directory but cannot descend into any of the hashed subdirectories at all. When that happens the reported size is a real undercount, but it is never silently wrong: the result includes `inaccessible_directories` (CLI prints a `WARNING`, the dashboard shows it in red) whenever this happens, so a permission wall doesn't read as "the cache is empty". Turning on `enable_cache_probe` below sidesteps this permission gap entirely (the scan runs inside the nginx worker itself, not as the repowatch service user) — see its own row for what that trades off instead. |
+| `enable_purge` | bool | `false` | Actively evict a package's cache entry the moment it disappears from the upstream index, instead of waiting for `inactive`/`max_size` to notice on their own. Requires the third-party `ngx_cache_purge` nginx module (Debian/Ubuntu: `libnginx-mod-http-cache-purge`; Arch: `nginx-mod-cache_purge`) — **not** the nginx-plus `proxy_cache_purge on` API, and not a real `PURGE` HTTP method (nginx core rejects unknown methods outright); the generator instead adds a dedicated, loopback-only `GET /purge<prefix>/...` location per repository. You must separately add `load_module ".../ngx_http_cache_purge_module.so";` to your own main `nginx.conf` — that's a main-context directive the generated file (which lives inside `http{}`/`sites-enabled`) can't emit itself. Without the module loaded, `nginx -t` fails clearly during `nginx-apply` and the usual atomic rollback applies — it doesn't silently do nothing. When it's on, the dashboard's per-repository panel also gets a "Cache purge (stale warmed entries)" section: "Scan for stale entries" computes candidates from repowatch's own records only (no nginx/network call), then "Purge selected" is the only point that actually asks nginx — its 200/404 response IS the "was this cached" answer, so there's no separate non-destructive pre-check (a normal HEAD/GET on a cache miss can fetch and populate the object, so it is not a read-only existence check; nginx normally converts HEAD to GET for caching via [proxy_cache_convert_head](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_cache_convert_head)). If `enable_cache_probe` is *also* on, "Purge selected" and un-warming go through that instead — see its own row below. |
 | `enable_dedup` | bool | `false` | When two DIFFERENT repositories publish the byte-identical file (e.g. the same binary package shipped by both Debian and Ubuntu), serve and cache it once instead of twice. Detected from a per-package SHA256 that apt/pacman/dnf/xbps indexes already publish — apk and apt-rpm packages never participate (see below). No extra download or storage of file content is needed; only the already-parsed index metadata is compared. |
-| `enable_cache_probe` | bool | `false` | Read-only cache introspection running *inside the nginx worker itself*, via the third-party `ngx_http_js_module` (njs) — Debian/Ubuntu: `libnginx-mod-http-js`; Arch: `nginx-mod-njs`. Same `load_module` caveat as `enable_purge` (a main-context directive the generated file can't emit itself). Solves a real permission problem: repowatch's own unprivileged process cannot read `proxy_cache_path`'s `0700`-owned subdirectories (see `cache_dir`'s own caveat above), but nginx's worker already owns them — so a small njs script running there can. Adds two loopback-only endpoints (`/cache-probe?key=...`: does this exact package's cache entry exist right now — a genuine non-destructive check, unlike asking via purge; `/cache-scan?dir=<a>/<bb>`: list one of the 4096 fixed leaf directories nginx's cache tree always has, together with each file's real on-disk key) and, when `enable_purge` is *also* on, one more: `/purge-raw?key=...` — evicts an arbitrary already-known key regardless of whether any current repository route still exists for it (the only way to clean up a repository removed from `config.yaml` whose files are still on disk). Two concrete effects on other features when this is on: the dashboard's "Calculate cache directory size" / `repowatch stats --cache-dir` use this instead of `os.walk()` — no `cache_dir` needed, no permission undercount, always the true size; and the dashboard's "Purge selected" and "Remove from warmed" buttons switch from the per-repository `/purge<prefix>` location to `/purge-raw`, which also catches a real class of file the per-repository path structurally cannot — one cached under an `enable_dedup` basis that's since changed. This switch is dashboard-only: the *automatic* hourly `warmed_retention_days` expiry (see above) always purges through the per-repository location regardless of this setting. |
+| `enable_cache_probe` | bool | `false` | Read-only cache introspection running *inside the nginx worker itself*, via the third-party `ngx_http_js_module` (njs) — Debian/Ubuntu: `libnginx-mod-http-js`; Arch: `nginx-mod-njs`. Same `load_module` caveat as `enable_purge` (a main-context directive the generated file can't emit itself). Solves a real permission problem: repowatch's own unprivileged process cannot read `proxy_cache_path`'s `0700`-owned subdirectories (see `cache_dir`'s own caveat above), but nginx's worker already owns them — so a small njs script running there can. Adds two loopback-only endpoints (`/cache-probe?key=...`: does this exact package's cache entry exist right now — a genuine non-destructive check, unlike asking via purge; `/cache-scan?dir=<a>/<bb>`: list one of the 4096 fixed leaf directories nginx's cache tree always has, together with each file's real on-disk key) and, when `enable_purge` is *also* on, one more: `/purge-raw?key=...` — evicts an arbitrary already-known key regardless of whether any current repository route still exists for it (the only way to clean up a repository removed from `config.yaml` whose files are still on disk). Two concrete effects on other features when this is on: the dashboard's "Calculate cache directory size" / `repowatch stats --cache-dir` use this instead of `os.walk()` — no `cache_dir` needed, no permission undercount (though a single leaf directory can still fail to respond on its own, e.g. a transient timeout; when that happens the result carries `incomplete_leaves`, the same "you can see it's an undercount" signal `inaccessible_directories` gives the os.walk() path, not silence); and the dashboard's "Purge selected" and "Remove from warmed" buttons switch from the per-repository `/purge<prefix>` location to `/purge-raw`, checking both distinct keys obtained with `enable_dedup` on and off. This removes both old and current copies after a dedup toggle; an error for either key preserves the warmed record for retry. Identical keys are requested only once. Changes to upstream, URL templates or `cache_key_version` require identifying the actual old keys separately. This switch is dashboard-only: the *automatic* hourly `warmed_retention_days` expiry (see above) always purges through the per-repository location regardless of this setting. |
 
 **Purge locations live in a separate included file.** When `enable_purge` is
 on, the generated `active.conf` doesn't inline the purge locations among the
@@ -256,19 +270,29 @@ shows an empty map, since it deliberately never opens the database. Index
 files (`Packages.gz`, `.db.tar.gz`, `repodata/*`, etc.) never participate —
 each repository's own index must always reflect its own real state.
 
-**Why `resolvers` is IPv4-only:** upstream resolution happens once via
-`nginx -t`/generation-time DNS, not a live `resolver` directive per request,
-and mixing that with dynamic re-resolution isn't something plain nginx
-supports well without nginx Plus. If your network has no IPv6 route but an
+**Why `resolvers` is IPv4-only:** the generated config uses a genuinely
+*live* `resolver ... valid=300s ipv6=off;` directive together with a
+variable-based `proxy_pass` (`proxy_pass https://$some_var;`, not a literal
+hostname) — that combination is what makes nginx actually consult
+`resolver` and re-resolve the upstream hostname periodically at runtime,
+rather than once at startup/reload via the system resolver, which is what
+a literal `proxy_pass https://hostname;` would do instead. Plain
+open-source nginx handles this on its own. Since nginx 1.27.3, dynamic
+resolution with a named `upstream {}` block is also available without
+nginx Plus (see the [upstream server documentation](https://nginx.org/en/docs/http/ngx_http_upstream_module.html#server)).
+The generator uses variable-based `proxy_pass` and does not configure
+upstream keepalive. The `ipv6=off` half of the
+directive is the actual point: if your network has no IPv6 route but an
 upstream mirror's hostname also resolves to an AAAA record, an IPv6-capable
-setup can produce real `Network is unreachable` errors on warm-up — IPv4-only
-resolution sidesteps that at the cost of not using IPv6 upstream peers even
-when they'd work.
+setup can produce real `Network is unreachable` errors on warm-up — this
+sidesteps that at the cost of not using IPv6 upstream peers even when
+they'd work.
 
 If you're hand-writing nginx config instead of using the generator, run
-`repowatch nginx-render -c config.yaml` to print what the generator would
-produce for your own `repos[]` — a concrete starting point for the location
-blocks you'd need to write by hand.
+`repowatch -c config.yaml nginx-render` (`-c`/`--config` is a top-level
+flag and must come before the subcommand, not after) to print what the
+generator would produce for your own `repos[]` — a concrete starting point
+for the location blocks you'd need to write by hand.
 
 ## Fields editable from the dashboard
 
@@ -279,18 +303,34 @@ included only if changing it takes effect immediately (no restart needed):
 `check_interval`, `event_retention_days`, `request_retention_days`,
 `warmed_retention_days`, `event_max_rows_per_repo`, `request_max_rows`,
 `prefetch_concurrency`, `check_concurrency`, `prefetch_bandwidth_limit`,
-`cache_base_url`, `public_cache_url`, `notify_after_failures`.
+`cache_base_url`, `public_cache_url`, `notify_after_failures`,
+`key_expiry_warning_days`.
 
-Notably **not** editable from the dashboard (edit `config.yaml` by hand and
-restart instead):
+Notably **not** editable from the dashboard (edit `config.yaml` by hand;
+restart requirements depend on the field):
 
 - `admin_password_hash` — secret, only ever written via
   `repowatch set-password`/`hash-password`, never round-tripped through the
   API.
 - `notify_webhook_url` — secret (the URL is itself a bearer token).
-- `state_db`, `status_server`, `syslog_listener`, `nginx` — read once at
-  process startup; editing them through the dashboard would silently not
-  take effect until a restart, which is worse than not offering the option.
+- `state_db` — the SQLite connection path is fixed at process startup;
+  changing it needs a restart.
+- `syslog_listener` — the UDP socket itself is bound once at startup;
+  changing `enabled`/`bind`/`port` needs a restart to actually rebind it.
+- `nginx` — not restart-bound, but not instant either: it's reconciled by
+  the separate root-owned `nginx-apply` mechanism (a timer, by default
+  every 15s — see [deployment.md](deployment.md)), not the main process,
+  and not on every dashboard request.
+- `status_server` — this ONE actually IS re-read live: every request calls
+  `load_config()` fresh, so `guest_read_only`, `trusted_proxies`,
+  `token_repo_restrictions`, and `metrics_allowed_networks` all take effect
+  on the very next request after a hand-edit to `config.yaml`, no restart
+  needed. It's still not dashboard-editable — these are the settings that
+  decide who gets ADMIN access at all, so changing them isn't something the
+  dashboard's own (already-admin-gated) API exposes, restart or not.
+  `bind`, `port`, `tls_cert_path` and `tls_key_path` require a restart:
+  the listening socket and TLS context are created once at startup
+  (see [access.md](access.md)).
 
 Repositories themselves (`repos[]`) are managed separately, through
 `POST /api/repos` (add), `POST /api/repos/<id>` (edit — full replacement,

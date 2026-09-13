@@ -13,9 +13,16 @@ import hmac
 import os
 
 _ALGORITHM = "pbkdf2_sha256"
-# OWASP (2023+) baseline for PBKDF2-HMAC-SHA256 — not lowered, this password
-# guards write access to the dashboard
-_DEFAULT_ITERATIONS = 260_000
+# OWASP Password Storage Cheat Sheet's current PBKDF2-HMAC-SHA256
+# recommendation (checked 2026-09-14 against the live page — an earlier
+# value here, 260_000, was a stale reference to a prior revision of that
+# same guidance, not lowered for performance) — this password guards write
+# access to the dashboard. The hash format embeds its own iteration count
+# (see module docstring), so raising this default doesn't invalidate
+# admin_password_hash values already in a config.yaml — they keep
+# verifying at whatever count they were created with; only a fresh
+# `repowatch hash-password` picks up the new default.
+_DEFAULT_ITERATIONS = 600_000
 
 
 def hash_password(password: str, iterations: int = _DEFAULT_ITERATIONS) -> str:

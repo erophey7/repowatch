@@ -46,6 +46,8 @@ rest of repowatch runs normally):
     `libnginx-mod-http-js`; Arch: `nginx-mod-njs`) — only if
     `nginx.enable_cache_probe` is on; see
     [docs/configuration.md](docs/configuration.md#nginx).
+- `gpg` — optional key-expiry warnings for GPG-signed repositories;
+  signature verification itself only needs `gpgv`.
 - `gpgv` — signature verification for apt/pacman/RPM-MD/apt-rpm repositories
   with `verify_signature: true`.
 - `openssl`, or `apk-tools >= 3.0` — signature verification for apk
@@ -103,7 +105,7 @@ different file, pass `-c`/`--config` before the subcommand, as above.
 
 ```bash
 make check                                    # environment diagnostics only
-make install PREFIX=/usr/local
+sudo make install PREFIX=/usr/local
 sudo make activate                            # enables and starts services
 ```
 
@@ -124,7 +126,7 @@ repowatch self-update --repo erophey7/repowatch           # install if newer
 `--repo` is always required and always "owner/name" — point it at a fork
 instead if you're tracking one.
 
-A lighter, network-based path that only replaces the installed package
+A network-based path that reinstalls repowatch and resolves its Python dependencies
 (does not touch `config.yaml`, `state_db`, or nginx, and does not restart
 the service for you). For an offline, systemd-managed system install with
 automatic backup/rollback on failure, use `make upgrade-plan`/`make upgrade`

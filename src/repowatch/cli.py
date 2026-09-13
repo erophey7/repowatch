@@ -168,6 +168,10 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"  NOTE: {cache['unreadable_keys']:,} file(s) had an unreadable "
                               "stored key (counted for size, not identifiable individually).",
                               file=sys.stderr)
+                    if cache.get("incomplete_leaves"):
+                        print(f"  WARNING: {cache['incomplete_leaves']:,} of 4096 cache directories "
+                              "could not be scanned (transient failure) — the numbers above are an "
+                              "UNDERCOUNT.", file=sys.stderr)
                 except httpx.HTTPError as exc:
                     print(f"cache_dir: cache-probe unreachable: {exc}", file=sys.stderr)
                     return 1

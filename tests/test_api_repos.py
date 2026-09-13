@@ -1498,3 +1498,37 @@ def test_purge_selected_payload_uses_cache_probe_when_enable_cache_probe_is_on(t
     assert payload["results"] == {"a-1": "purged"}
     assert calls == [("alpine-test", {"a-1": "a-1.apk"})]
     assert store.get_warmed_packages("alpine-test") == []
+
+
+@pytest.mark.parametrize('action', [purge_selected_payload, remove_warmed_package_payload])
+def test_raw_purge_failure_keeps_warmed_record_until_both_keys_confirmed(tmp_path, monkeypatch, action):
+    import httpx
+    config_path = _write_config(tmp_path, '''  - id: core
+    type: pacman
+    upstream: https://mirror.test/core/os/x86_64
+    repo_name: core
+    arch: x86_64
+nginx:
+  enabled: true
+  enable_purge: true
+  enable_cache_probe: true
+  enable_dedup: true
+''', admin_password='secret123')
+    store = StateStore(load_config(config_path).state_db)
+    store.record_warmed_package('core', 'foo', 'foo.pkg.tar.zst', True, 200)
+    responses = iter([404, 503, 404, 200])
+    def handler(request):
+        return httpx.Response(next(responses))
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr('repowatch.cache_probe.httpx.AsyncClient',
+                        lambda **kw: real_client(transport=httpx.MockTransport(handler)))
+    session = _session(config_path, 'secret123')
+    status, payload = action(config_path, store, 'core', session, {'package_keys': ['foo']})
+    result_field = 'results' if action is purge_selected_payload else 'purge_results'
+    assert status == 200
+    assert payload[result_field]['foo'] == 'error (HTTP 503)'
+    assert [row['package_key'] for row in store.get_warmed_packages('core')] == ['foo']
+    status, payload = action(config_path, store, 'core', session, {'package_keys': ['foo']})
+    assert status == 200
+    assert payload[result_field]['foo'] == 'purged'
+    assert store.get_warmed_packages('core') == []

@@ -4,11 +4,18 @@ repowatch's HTTP server (`repowatch run` / `serve-status`) exposes three
 different kinds of access, each with its own credential:
 
 1. **The dashboard and its administrative API** — a single admin password.
-2. **`status.json` and the read-only history/packages API**, meant for
-   automated clients (hosts polling before `pacman -Syu`/`apt update`/`apk
-   update`) — per-host bearer tokens.
-3. **An optional, fully anonymous read-only mode** — for internal networks
-   where even a shared token is more friction than you want.
+2. **`status.json` only** (the global one and `/status/<repo_id>.json`),
+   meant for automated clients (hosts polling before `pacman -Syu`/`apt
+   update`/`apk update`) — per-host bearer tokens. History, packages, and
+   everything else the dashboard shows are administrative data, gated by
+   the admin session in (1), not by a bearer token — a host token cannot
+   read them (verified: `/status.json` returns `200`, `/status/<id>/history`
+   and `/api/repos/<id>/packages` return `401` for the same token).
+3. **An optional, fully anonymous read-only mode** (`guest_read_only`) —
+   for internal networks where even a shared token is more friction than
+   you want. This is what actually opens history/packages/warmed/bans for
+   unauthenticated reading, independent of bearer tokens entirely — see
+   [Guest read-only mode](#guest-read-only-mode) below.
 
 There's no framework underneath this — it's `http.server` plus a small
 amount of hand-written session/token/CSRF logic (`auth.py`, `access.py`).
@@ -27,9 +34,12 @@ implementation.
 ## Admin login
 
 There is exactly one administrator password, hashed with PBKDF2-HMAC-SHA256
-(260,000 iterations — the current OWASP baseline) and stored as
+(600,000 iterations, matching OWASP's current Password Storage Cheat Sheet
+recommendation for that algorithm as of this writing, for newly generated
+hashes) and stored as
 `admin_password_hash` in `config.yaml`. The plaintext password itself is
-never stored anywhere. Set it with:
+never stored anywhere. Existing hashes retain their original iteration count
+until the password is set again. Set it with:
 
 ```bash
 repowatch hash-password      # prints a hash to paste into config.yaml
@@ -56,9 +66,16 @@ another tab from silently POSTing to the dashboard using the ambient
 session cookie. `POST` requests are additionally checked for same-origin
 (`Origin`/`Sec-Fetch-Site`) as a second, independent layer.
 
-**Login itself requires HTTPS** (or `allow_insecure_http`, see below) —
-credentials and CSRF tokens aren't meaningfully protected on plain HTTP
-regardless of what happens after.
+**Login itself requires HTTPS** — either terminated by the server itself,
+by a `trusted_proxies`-listed reverse proxy declaring `X-Forwarded-Proto:
+https`, or by `allow_insecure_http` as an explicit opt-out (see
+[TLS](#tls-and-allow_insecure_http) for all three) — with one standing
+exception: a connection arriving *directly* on loopback (no forwarding
+headers, not through a proxy) is always allowed to use credentials over
+plain HTTP, on the reasoning that the server can be certain there's no
+untrusted network hop between it and itself. That's what lets
+`curl http://127.0.0.1:.../api/auth/login` work out of the box on the same
+host repowatch runs on, without setting anything.
 
 ## Host tokens (`status.json` clients)
 
@@ -77,7 +94,8 @@ or its API:
   against SQLite — never cached in a running process — so a revoked token
   stops working immediately, not "after the next restart".
 - A client authenticates with a standard `Authorization: Bearer <token>`
-  header against `status.json` and the per-repository history endpoint.
+  header against `status.json` (the global one and `/status/<repo_id>.json`)
+  — that's the only thing a bearer token unlocks; see below.
 
 **Scoping tokens to specific repositories.** By default a token can read
 status for every repository. If you want a host to only be able to see
@@ -91,10 +109,15 @@ token gets a `403` for a repository outside its list, and its
 `GET /status.json` response is filtered down to only the repositories it's
 allowed to see, rather than erroring.
 
-Note what host tokens *don't* grant: they're read-only against the status
-API specifically. They cannot log into the dashboard, trigger a warm-up, add
-a repository, or change any config — those all require the admin session
-and CSRF token above.
+Note what host tokens *don't* grant: they unlock `status.json` specifically
+and nothing else — not the per-repository history endpoint
+(`/status/<repo_id>/history`), not `/api/repos/<repo_id>/packages`, not
+`warmed`/`bans`, none of it. Those are administrative reads and require
+either the admin session below or `guest_read_only` (see [Guest read-only
+mode](#guest-read-only-mode)) — a bearer token gets neither. Tokens also
+cannot log into the dashboard, trigger a warm-up, add a repository, or
+change any config — those all require the admin session and CSRF token
+above.
 
 ## Versioned status API (`/api/v1/...`)
 
@@ -158,23 +181,41 @@ anyone who can reach the port — it's the explicit tradeoff you're making.
 The built-in server can terminate TLS itself
 (`status_server.tls_cert_path`/`tls_key_path` in `config.yaml`, see
 [configuration.md](configuration.md)) or you can put a reverse proxy in
-front of it and leave those unset. Either way, by default, anything
-credentialed — admin login/session, CSRF, and Bearer-token status requests —
-**refuses to work over plain, unencrypted HTTP**: the server has no way to
-tell "this is HTTP because there's a TLS-terminating reverse proxy in front
-of me" from "this is HTTP because there's nothing protecting these
-credentials on the wire" without you telling it, so it defaults to refusing.
+front of it and leave those unset. Either way, anything credentialed —
+admin login/session, CSRF, and Bearer-token status requests — is refused
+over a connection the server can't otherwise vouch for. Concretely, one of
+the following three has to be true:
 
-`status_server.allow_insecure_http: true` is the explicit opt-out — set it
-if you deliberately want to run over plain HTTP (e.g. a loopback-only setup,
-or a network you already trust end-to-end). It's a conscious tradeoff you
-make, not something inferred from a `X-Forwarded-Proto` header sent by an
-unconfigured, arbitrary peer — see the next section for why that header
-alone isn't trusted.
+1. The connection to repowatch itself uses TLS. For a proxy this requires
+   an HTTPS backend connection to the built-in TLS server; terminating TLS
+   at the proxy and forwarding plain HTTP instead uses rule 2.
+2. It arrives through a **`trusted_proxies`-listed** peer that declares
+   `X-Forwarded-Proto: https` — this is real, live-checked support for a
+   TLS-terminating reverse proxy, not something you need
+   `allow_insecure_http` for. An UNLISTED peer's `X-Forwarded-Proto` header
+   is never trusted for this (see the next section for why).
+3. It arrives **directly on loopback** — no forwarding headers, not routed
+   through any proxy. The server can be certain there's no untrusted
+   network hop between it and itself in this specific case, so this is
+   always allowed regardless of `allow_insecure_http`. This is what lets
+   `curl http://127.0.0.1:.../api/auth/login` work on the same host
+   out of the box, with nothing configured.
 
-`GET /login`, `GET /healthz`, and the dashboard's static HTML shell are
-reachable over plain HTTP regardless (there's nothing secret in them);
-it's credential-bearing requests specifically that are gated.
+If none of those three hold — a REMOTE, un-proxied, plain-HTTP
+connection — `status_server.allow_insecure_http: true` is the explicit
+opt-out: set it if you deliberately want to run that way (e.g. a
+network you already trust end-to-end without TLS). Passwords and tokens
+travel unencrypted on the wire whenever this is what's actually in effect
+— it's a conscious tradeoff you're opting into, not a default.
+
+`GET /login` (the login page itself, not the dashboard) and `GET /healthz`
+are reachable over plain HTTP unconditionally, from anywhere (there's
+nothing secret in either). `GET /`/`GET /dashboard` are NOT unconditionally
+reachable, though: without an admin session (or a satisfied
+`guest_read_only`), they respond with a `303` redirect to `/login` rather
+than serving the dashboard's actual HTML — so "the dashboard's static HTML
+shell is public" isn't quite accurate; what's public is the separate login
+page you get redirected to.
 
 ## Reverse proxies and `trusted_proxies`
 

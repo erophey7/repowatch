@@ -45,9 +45,16 @@ disk or the network beyond reading local files.
 
 ```bash
 make check                                    # diagnostics only, safe to run any time
-make install PREFIX=/usr/local                # builds wheels, lays down files — no services touched
+sudo make install PREFIX=/usr/local           # builds wheels, lays down files — no services touched
 sudo make activate                            # creates the system user, enables and starts services
 ```
+
+`sudo` is required for `make install` itself with the defaults shown above
+— `PREFIX=/usr/local`, `SYSCONFDIR=/etc`, `LOCALSTATEDIR=/var` are all
+real system paths a normal user can't write to. It's only optional if
+every one of those is overridden to somewhere you already own (e.g. for
+local testing, or packaging into a `DESTDIR` — see
+[Packaging](#packaging-destdir)).
 
 `make install` is intentionally inert with respect to any *running* system:
 it builds/installs into a venv under `PREFIX`, writes the CLI wrapper,
@@ -76,7 +83,11 @@ Re-running `make install` against an already-installed layout is safe (it
 detects and preserves an existing `config.yaml` rather than overwriting it),
 but changing `PREFIX`/`SYSCONFDIR`/`LOCALSTATEDIR` after the fact is refused
 by `make check` — that's a data-migration decision the installer won't make
-silently on your behalf.
+silently on your behalf. "Safe" here means it won't corrupt anything, not
+that it always proceeds: the same preflight also refuses outright if any
+repowatch service or timer is currently active — stop them first (or use
+`make upgrade` below, which handles the stop/start itself as part of one
+transaction) rather than reinstalling underneath a running process.
 
 ## What `make activate` does
 
@@ -158,7 +169,7 @@ and the failure surfaces in that unit's systemd logs
 
 If you're not using the generator (`WITH_NGINX=0`, or `nginx.enabled: false`
 in `config.yaml`), none of this applies — write and manage your own nginx
-config. `repowatch nginx-render -c config.yaml` prints a concrete example for
+config. `repowatch -c config.yaml nginx-render` prints a concrete example for
 your own `repos[]` (the caching approach: `proxy_cache`, short TTL on mutable
 index files, long TTL on immutable package files, IPv4-only upstream
 resolution — see [configuration.md](configuration.md#nginx) for why).
@@ -207,14 +218,27 @@ sudo make upgrade  MANIFEST=/usr/local/share/repowatch/install.json WHEELHOUSE=b
 This is an **offline** upgrade path — it expects a pre-built wheelhouse with
 target-compatible dependencies already present (`make wheel` on a matching
 environment, or copied over ahead of time); it never reaches out to the
-network itself. `upgrade-plan` runs the same validation `upgrade --apply`
-would, without stopping anything or writing anything, so you can check it
-will actually work before scheduling downtime.
+network itself.
+
+`upgrade-plan` loads the install manifest, resolves
+`PREFIX`/`SYSCONFDIR`/`LOCALSTATEDIR`/etc. against it, and prints exactly
+what `upgrade --apply` would operate on — then runs a set of cheap, read-only
+checks: does `config.yaml` load in the *currently installed* venv, does that
+venv exist, does the wheelhouse contain exactly one `repowatch-*.whl`, and are
+`repowatch.service`/`nginx.service` already active (both required before
+`--apply` will proceed). It exits non-zero and prints each failing check as a
+`PROBLEM` line if any of these don't hold. This is still **not** a full
+rehearsal of the upgrade — it does NOT build the *candidate* venv from the
+wheelhouse, does NOT install the new release's dependencies, and can't catch
+an incompatibility that only shows up once the candidate is actually built
+(that only happens inside step 2 below, with `--apply`). Use it to catch a
+wrong `MANIFEST`/`WHEELHOUSE` path, a missing/misnamed wheel, or services
+that aren't up yet, before you commit to the real upgrade.
 
 `make upgrade` (root required):
 
-1. Refuses to run unless the current installation is active and healthy
-   (services up, `make check` passing) and unless `state_db` lives outside
+1. Refuses to run unless the current installation has the required active services
+   and passes installation preflight and unless `state_db` lives outside
    the installation/config directories being replaced.
 2. Builds a *candidate* venv in a temp directory and validates it against
    the current `config.yaml` *before* touching the running service — an
@@ -223,10 +247,18 @@ will actually work before scheduling downtime.
    online backup of `state_db` into a timestamped directory under
    `state_db`'s `backups/`, installs the new version, re-activates
    (including nginx re-render/reload if applicable), and runs a smoke check.
-4. **On any failure at any point**, it restores the snapshotted files and
-   database from that same backup directory and resumes the services in
-   their prior enabled/active state — you aren't left with a half-upgraded
-   installation.
+4. **On most failures**, it restores the snapshotted files and database from
+   that same backup directory and resumes the services in their prior
+   enabled/active state, rather than leaving you with a half-upgraded
+   installation. Two caveats worth knowing: the smoke check tolerates a `503`
+   from `/healthz` as a pass (it only confirms the service answers with valid
+   JSON, not that every repository is healthy), so a post-upgrade instance
+   that's technically up but degraded won't trigger a rollback on that basis
+   alone; and the rollback step itself isn't wrapped in its own exception
+   handling — if restoring files, restoring the database, or reloading nginx
+   during rollback fails, that failure propagates instead of being silently
+   swallowed, but it also means rollback isn't unconditionally guaranteed to
+   finish cleanly on every kind of failure.
 
 It refuses to run against a `DESTDIR`-staged layout or with `WITH_SYSTEMD=0`
 — this specific automated path assumes a systemd-managed installation is
@@ -257,9 +289,11 @@ whoever could replace one could replace both. If that stronger guarantee
 matters for your deployment, use the offline `make upgrade` path above (with
 a wheelhouse you built and reviewed yourself) instead.
 
-`self-update` only replaces the installed package — it does not restart
-`repowatch` for you. Restart it afterwards the same way you normally would
-(`systemctl restart repowatch`, or restart your `supervise` process).
+`self-update` reinstalls repowatch and resolves its Python dependencies via
+`pip install --upgrade --force-reinstall`. Dependency versions can change
+even when the release has not raised its minimum requirements. It leaves
+`config.yaml`, `state_db`, and nginx untouched. It does not restart the
+service: restart it afterwards using your usual supervisor.
 
 ## Running without systemd
 
@@ -294,8 +328,8 @@ never needs elevated privileges (see
 [nginx cache and auto-reconciliation](#nginx-cache-and-auto-reconciliation)
 and [Hardening notes](#hardening-notes) above) — that split exists because
 systemd can supervise two independently-privileged units against one
-`config.yaml`. Without systemd there's no equivalent OS-level mechanism, so
-`supervise --nginx` requires the **whole process** to run as root (it
+`config.yaml`. The combined `supervise --nginx` command performs both jobs in one process,
+so it requires the **whole process** to run as root (it
 refuses to start otherwise, same check `nginx-apply` already makes) — there
 is no way to keep the rest of `supervise` unprivileged while it also
 reconciles nginx in-process.

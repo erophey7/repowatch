@@ -125,9 +125,10 @@ def test_full_inventory_queries_every_leaf_directory_and_flattens_results():
                    lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
             return await cache_probe.full_inventory('http://127.0.0.1:8080', concurrency=16)
 
-    results = asyncio.run(run())
+    result = asyncio.run(run())
     assert sorted(seen_dirs) == sorted(cache_probe.LEAF_DIRS)
-    assert results == [cache_probe.ScanEntry(leaf='c/29', file='f1', key='k1', size=1, mtime='t')]
+    assert result.entries == [cache_probe.ScanEntry(leaf='c/29', file='f1', key='k1', size=1, mtime='t')]
+    assert result.failed_leaves == 0
 
 
 def test_full_inventory_respects_the_concurrency_limit(monkeypatch):
@@ -172,8 +173,12 @@ def test_full_inventory_one_leaf_failure_does_not_abort_the_rest():
                    lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
             return await cache_probe.full_inventory('http://127.0.0.1:8080', concurrency=32)
 
-    results = asyncio.run(run())  # must not raise
-    assert len(results) == 4095  # every leaf except the one that failed
+    result = asyncio.run(run())  # must not raise
+    assert len(result.entries) == 4095  # every leaf except the one that failed
+    # Real bug found during a documentation-accuracy pass (2026-09-14): a
+    # failed leaf used to just vanish with no way for a caller to know the
+    # scan was incomplete — must be visible, not just silently dropped.
+    assert result.failed_leaves == 1
 
 
 def test_cache_dir_size_sums_bytes_and_flags_unreadable_keys(monkeypatch):
@@ -195,6 +200,32 @@ def test_cache_dir_size_sums_bytes_and_flags_unreadable_keys(monkeypatch):
 
     result = asyncio.run(run())
     assert result == {'size_bytes': 150, 'file_count': 3, 'unreadable_keys': 1}
+
+
+def test_cache_dir_size_flags_incomplete_leaves_instead_of_silently_undercounting(monkeypatch):
+    """Real gap found during a documentation-accuracy pass (2026-09-14): the
+    docstring claimed "always the true size, no inaccessible_directories
+    possible" — but a single leaf that fails mid-scan (independent of the
+    initial connectivity check, which only catches TOTAL unreachability)
+    used to just disappear with no trace in the result. Must be visible,
+    the same principle as os.walk()'s inaccessible_directories."""
+    monkeypatch.setattr(cache_probe, 'LEAF_DIRS', ['0/00', '0/01', '0/02'])
+
+    def handler(request):
+        if request.url.params.get('dir') == '0/00':
+            return httpx.Response(200, json=[])  # connectivity pre-check
+        if request.url.params.get('dir') == '0/01':
+            raise httpx.ConnectError('refused', request=request)
+        return httpx.Response(200, json=[{'file': 'a', 'key': 'ka', 'size': 100}])
+
+    real_async_client = httpx.AsyncClient
+    async def run():
+        with patch('repowatch.cache_probe.httpx.AsyncClient',
+                   lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
+            return await cache_probe.cache_dir_size('http://127.0.0.1:8080', concurrency=4)
+
+    result = asyncio.run(run())
+    assert result == {'size_bytes': 100, 'file_count': 1, 'incomplete_leaves': 1}
 
 
 def test_cache_dir_size_propagates_a_connection_failure_instead_of_reporting_zero():
@@ -316,10 +347,72 @@ def test_purge_selected_raw_computes_the_key_via_compute_cache_key_and_purges_ea
 
     results = asyncio.run(run())
     assert results == {'bash-1-1': 'purged', 'zlib-1-1': 'not_cached'}
+    # Both distinct keys are checked even when the current copy was purged.
     assert sorted(seen_keys) == sorted([
         'httpmirror.test/arch/core/os/x86_64/bash-1-1-x86_64.pkg.tar.zst',
+        'httpmirror.test/core/os/x86_64/bash-1-1-x86_64.pkg.tar.zst',
         'httpmirror.test/arch/core/os/x86_64/zlib-1-1-x86_64.pkg.tar.zst',
+        'httpmirror.test/core/os/x86_64/zlib-1-1-x86_64.pkg.tar.zst',
     ])
+
+
+def test_purge_selected_raw_falls_back_to_the_alternate_dedup_basis_on_a_miss():
+    """Real bug found during a documentation-accuracy pass (2026-09-14): the
+    first version of this function only ever tried the CURRENT
+    nginx.enable_dedup basis — functionally identical to
+    prefetch.purge_selected()'s per-route purge, so it did NOT actually
+    catch the real production case that motivated building it: a file
+    cached before a dedup toggle sits under the OTHER basis. This is the
+    regression test for the fix — the mock only accepts the pre-dedup
+    (local, "/arch/core/...") key; the primary current-basis (dedup on,
+    "/core/...") attempt must miss and correctly fall through to it."""
+    repo = RepoConfig('core', 'pacman', 'https://mirror.test/core/os/x86_64', 'x86_64', repo_name='core')
+    config = _config([repo], enable_purge=True, enable_cache_probe=True, enable_dedup=True)
+    seen_keys = []
+
+    def handler(request):
+        key = request.url.raw_path.decode().split('key=', 1)[1]
+        seen_keys.append(key)
+        if key == 'httpmirror.test/arch/core/os/x86_64/bash-1-1-x86_64.pkg.tar.zst':
+            return httpx.Response(200)
+        return httpx.Response(404)
+
+    real_async_client = httpx.AsyncClient
+    async def run():
+        with patch('repowatch.cache_probe.httpx.AsyncClient',
+                   lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
+            return await cache_probe.purge_selected_raw(config, repo, {'bash-1-1': 'bash-1-1-x86_64.pkg.tar.zst'})
+
+    results = asyncio.run(run())
+    assert results == {'bash-1-1': 'purged'}
+    assert seen_keys == [
+        'httpmirror.test/core/os/x86_64/bash-1-1-x86_64.pkg.tar.zst',       # current (dedup-on) basis, misses
+        'httpmirror.test/arch/core/os/x86_64/bash-1-1-x86_64.pkg.tar.zst',  # alternate basis, hits
+    ]
+
+
+def test_purge_selected_raw_does_not_retry_when_current_and_alt_keys_are_identical():
+    """local == remote for this apt fixture's default upstream — toggling
+    enable_dedup produces the SAME key, so a genuine miss must stay
+    "not_cached" after exactly one request, not a wasted identical retry."""
+    repo = RepoConfig('debian', 'apt', 'http://deb.debian.org/debian', 'amd64',
+                       distribution='bookworm', component='main')
+    config = _config([repo], enable_purge=True, enable_cache_probe=True)
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(404)
+
+    real_async_client = httpx.AsyncClient
+    async def run():
+        with patch('repowatch.cache_probe.httpx.AsyncClient',
+                   lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
+            return await cache_probe.purge_selected_raw(config, repo, {'a-1': 'pool/main/a/a.deb'})
+
+    results = asyncio.run(run())
+    assert results == {'a-1': 'not_cached'}
+    assert len(calls) == 1
 
 
 def test_purge_selected_raw_empty_items_is_a_noop():
@@ -336,3 +429,28 @@ def test_purge_selected_raw_empty_items_is_a_noop():
             return await cache_probe.purge_selected_raw(config, repo, {})
 
     assert asyncio.run(run()) == {}
+
+
+@pytest.mark.parametrize("first,second,expected", [
+    (200, 200, "purged"),
+    (200, 404, "purged"),
+    (404, 200, "purged"),
+    (404, 404, "not_cached"),
+    (404, 503, "error (HTTP 503)"),
+    (200, 503, "error (HTTP 503)"),
+    (503, 200, "error (HTTP 503)"),
+])
+def test_purge_both_copies_and_preserve_any_failure(first, second, expected):
+    repo = RepoConfig('core', 'pacman', 'https://mirror.test/core/os/x86_64', 'x86_64', repo_name='core')
+    config = _config([repo], enable_purge=True, enable_cache_probe=True, enable_dedup=True)
+    codes = iter([first, second])
+    seen = []
+    def handler(request):
+        seen.append(str(request.url))
+        return httpx.Response(next(codes))
+    real_client = httpx.AsyncClient
+    with patch('repowatch.cache_probe.httpx.AsyncClient',
+               lambda **kw: real_client(transport=httpx.MockTransport(handler))):
+        result = asyncio.run(cache_probe.purge_selected_raw(config, repo, {'foo': 'foo.pkg.tar.zst'}))
+    assert result == {'foo': expected}
+    assert len(seen) == len(set(seen)) == 2
