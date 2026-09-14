@@ -1,0 +1,26 @@
+PACKAGES.TXT;  fixture
+
+Total size of all packages (compressed):  1 MB
+Total size of all packages (uncompressed):  2 MB
+
+PACKAGE NAME:  my-editor-2.0-x86_64-1_slack15.0.txz
+PACKAGE LOCATION:  ./patches/packages
+PACKAGE SIZE (compressed):  1 K
+PACKAGE DESCRIPTION:
+my-editor: An editor
+my-editor:
+
+PACKAGE NAME:  docs-1.0-noarch-2.tgz
+PACKAGE LOCATION:  ./slackware64/a
+PACKAGE DESCRIPTION:
+docs: Documentation
+
+PACKAGE NAME:  firmware-1.0-fw-1.txz
+PACKAGE LOCATION:  ./slackware64/a
+PACKAGE DESCRIPTION:
+firmware: Firmware
+
+PACKAGE NAME:  other-1.0-i586-1.txz
+PACKAGE LOCATION:  ./slackware/a
+PACKAGE DESCRIPTION:
+other: Another architecture

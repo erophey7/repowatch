@@ -91,7 +91,7 @@ test('dashboard filters warmed packages by search and selects all matching packa
         else if (url.pathname === '/api/repos') data = [repo];
         else if (url.pathname.endsWith('/summary')) data = {by_client_ip: [], by_path: [], by_repo: [], timeline: [], cache_hit_stats: []};
         else if (url.pathname.endsWith('/warm') && options.method === 'POST') {
-          data = {warmed: JSON.parse(options.body).package_keys, not_found: []};
+          data = {warmed: ['pkg-a-1'], skipped: ['pkg-a-2'], failed: ['pkg-a-3'], not_found: []};
         } else if (url.pathname.endsWith('/packages')) {
           const q = url.searchParams.get('q');
           const cursor = url.searchParams.get('cursor');
@@ -151,6 +151,8 @@ test('dashboard filters warmed packages by search and selects all matching packa
     // second page's package too — proven by what Warm actually submits.
     doc.querySelector('[data-slot="warm-btn"]').click();
     await delay(20);
+    assert.match(doc.querySelector('[data-slot="warm-msg"]').textContent, /Warmed: 1, skipped: 1, failed: 1/);
+    assert(doc.querySelector('[data-slot="warm-msg"]').classList.contains('error'));
     const warmCall = calls.find(c => c.url.pathname.endsWith('/warm') && c.options.method === 'POST');
     assert.deepEqual(JSON.parse(warmCall.options.body).package_keys.sort(), ['pkg-a-1', 'pkg-a-2', 'pkg-a-3']);
 
@@ -608,3 +610,86 @@ test('Nix repository editor preserves source, outputs and signature policy', asy
     }
   } finally {dom.window.close();}
 });
+
+test('bandwidth schedule editor saves windows and timezone', async () => {
+  let submitted;
+  const settings = {prefetch_bandwidth_limit: 5000, prefetch_bandwidth_timezone: 'UTC',
+    prefetch_bandwidth_schedule: [{days: ['mon','fri'], start: '23:00', end: '06:00', limit: 10000}]};
+  const dom = new JSDOM(html, {url: 'http://localhost/', runScripts: 'dangerously',
+    beforeParse(w) {
+      w.fetch = async (raw, options = {}) => {
+        const url = new URL(raw, 'http://localhost');
+        let data = [];
+        if (url.pathname === '/api/auth/session') data = {role: 'admin', csrf_token: 'csrf'};
+        else if (url.pathname === '/api/config') {
+          if (options.method === 'POST') submitted = JSON.parse(options.body);
+          data = submitted || settings;
+        } else if (url.pathname.endsWith('/summary')) {
+          data = {by_client_ip: [], by_path: [], by_repo: [], timeline: [], cache_hit_stats: []};
+        }
+        return {ok: true, json: async () => data};
+      };
+    }});
+  try {
+    await delay(30);
+    const doc = dom.window.document;
+    doc.getElementById('toggle-settings-form').click();
+    await delay(30);
+    assert.equal(doc.querySelectorAll('.bandwidth-window').length, 1);
+    doc.getElementById('s-bandwidth-timezone').value = 'Asia/Vladivostok';
+    doc.getElementById('s-bandwidth-add').click();
+    const row = doc.querySelectorAll('.bandwidth-window')[1];
+    row.querySelector('[data-field="days"]').value = 'sun';
+    row.querySelector('[data-field="limit"]').value = '';
+    doc.getElementById('settings-form').dispatchEvent(new dom.window.Event('submit', {bubbles:true,cancelable:true}));
+    await delay(30);
+    assert.equal(submitted.prefetch_bandwidth_timezone, 'Asia/Vladivostok');
+    assert.deepEqual(submitted.prefetch_bandwidth_schedule, [settings.prefetch_bandwidth_schedule[0],
+      {days:['sun'],start:'00:00',end:'24:00',limit:null}]);
+    doc.querySelector('.bandwidth-window button').click();
+    assert.equal(doc.querySelectorAll('.bandwidth-window').length, 1);
+  } finally {dom.window.close();}
+});
+
+for (const [type, component] of [['gentoo', null], ['slackware', 'patches'], ['slackware', null]]) {
+  test(`${type} editor preserves component ${component} and signature controls`, async () => {
+    let submitted;
+    const cfg = {id: 'binpkg', type, upstream: 'https://example.org/repo', arch: 'x86_64',
+      component, verify_signature: type === 'slackware', keyring_path: '/keys.gpg',
+      prefetch_whitelist: ['linux-*', 'app-editors/*'], prefetch_blacklist: ['*-debug']};
+    const repo = {...cfg, config: cfg};
+    const dom = new JSDOM(html, {url: 'http://localhost/', runScripts: 'dangerously',
+      beforeParse(w) {
+        w.HTMLElement.prototype.scrollIntoView = () => {};
+        w.fetch = async (raw, options = {}) => {
+          const path = new URL(raw, 'http://localhost').pathname;
+          let data = [];
+          if (path === '/api/auth/session') data = {role: 'admin', csrf_token: 'csrf'};
+          else if (path === '/api/repos') data = [repo];
+          else if (path === '/api/repos/binpkg' && options.method === 'POST') {
+            submitted = JSON.parse(options.body); data = {};
+          } else if (path.endsWith('/summary')) data = {by_client_ip: [], by_path: [], by_repo: [], timeline: [], cache_hit_stats: []};
+          return {ok: true, json: async () => data};
+        };
+      }});
+    try {
+      await delay(30);
+      dom.window.openEditForm(repo);
+      const doc = dom.window.document;
+      assert.equal(doc.getElementById('f-verify-signature-field').hidden, type === 'gentoo');
+      assert.equal(doc.getElementById('f-component').closest('.field').hidden, type !== 'slackware');
+      assert.equal(doc.getElementById('f-prefetch-whitelist').value, 'linux-*\napp-editors/*');
+      assert.equal(doc.getElementById('f-prefetch-blacklist').value, '*-debug');
+      doc.getElementById('f-prefetch-blacklist').value = '';
+      doc.getElementById('add-form').dispatchEvent(new dom.window.Event('submit', {bubbles: true, cancelable: true}));
+      await delay(30);
+      assert.equal(submitted.type, type);
+      assert.deepEqual(submitted.prefetch_whitelist, ['linux-*', 'app-editors/*']);
+      assert.deepEqual(submitted.prefetch_blacklist, []);
+      if (type === 'slackware') {
+        assert.equal(submitted.component, component);
+        assert.equal(submitted.keyring_path, '/keys.gpg');
+      } else assert.notEqual(submitted.verify_signature, true);
+    } finally {dom.window.close();}
+  });
+}

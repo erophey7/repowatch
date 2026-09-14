@@ -563,7 +563,8 @@ def test_signed_unchanged_indexes_are_reverified_after_trust_changes(tmp_path, m
     from unittest.mock import AsyncMock
     for kind, extra in [('pacman', {'repo_name': 'core'}),
                         ('apt', {'distribution': 'stable', 'component': 'main'}),
-                        ('dnf', {}), ('apt-rpm', {'component': 'classic'})]:
+                        ('dnf', {}), ('apt-rpm', {'component': 'classic'}),
+                        ('slackware', {'component': 'patches'})]:
         store = StateStore(tmp_path / f'{kind}.sqlite3')
         repo = RepoConfig('r', kind, 'https://example.org/repo', 'x86_64',
                           verify_signature=True, keyring_path='/missing/keyring', **extra)

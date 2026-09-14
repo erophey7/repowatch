@@ -32,6 +32,20 @@ cache_base_url: http://127.0.0.1:8080
 # (repos[].check_interval).
 check_interval: 300
 
+# One shared warm-body budget across repositories and manual/automatic runs.
+# Repository limits are additional ceilings. Rates are bytes/sec; null is unlimited.
+prefetch_bandwidth_limit: null
+prefetch_bandwidth_timezone: UTC
+prefetch_bandwidth_schedule: []
+# Example: limit daytime warming to 5 MiB/s and use 50 MiB/s overnight.
+# prefetch_bandwidth_limit: 5242880
+# prefetch_bandwidth_timezone: Asia/Vladivostok
+# prefetch_bandwidth_schedule:
+#   - days: [mon, tue, wed, thu, fri, sat, sun]
+#     start: "20:00"
+#     end: "09:00"
+#     limit: 52428800
+
 status_server:
   bind: 0.0.0.0
   port: 8085
@@ -114,3 +128,36 @@ repos:
   #   nix_public_keys:
   #     - "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
   #   prefetch: true
+
+  # Gentoo and Slackware examples: docs/gentoo-slackware.md.
+  # Select a compatible Gentoo profile/CPU binhost; Portage verifies GPKG signatures.
+  # - id: gentoo-amd64
+  #   type: gentoo
+  #   upstream: https://distfiles.gentoo.org/releases/amd64/binpackages/23.0/x86-64
+  #   arch: amd64
+  #   prefetch: false
+  # Slackware components share a release root and, here, a local cache prefix.
+  # Provision a trusted exported keyring before enabling verification.
+  # - id: slackware64-15
+  #   type: slackware
+  #   upstream: https://mirrors.kernel.org/slackware/slackware64-15.0
+  #   arch: x86_64
+  #   url_template: /slackware/15.0
+  #   prefetch: false
+  #   verify_signature: true
+  #   keyring_path: /etc/repowatch/keys/slackware.gpg
+  # - id: slackware64-15-patches
+  #   type: slackware
+  #   upstream: https://mirrors.kernel.org/slackware/slackware64-15.0
+  #   arch: x86_64
+  #   component: patches
+  #   url_template: /slackware/15.0
+  #   prefetch: false
+  #   verify_signature: true
+  #   keyring_path: /etc/repowatch/keys/slackware.gpg
+
+  # Optional per-repository warming lists (one or more quoted name globs).
+  # Empty whitelist allows all; blacklist and existing exact bans take priority.
+  # These fields also apply to manual warming. See docs/warming-policy.md.
+  #   prefetch_whitelist: ["linux-*", "bash"]
+  #   prefetch_blacklist: ["*-debug", "*-doc"]

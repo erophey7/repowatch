@@ -5,6 +5,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+import re
+
 import httpx
 
 from repowatch.config import RepoConfig
@@ -141,3 +143,11 @@ class IndexParser(ABC):
         resp = await client.get(url, headers={"User-Agent": USER_AGENT}, timeout=self.timeout)
         resp.raise_for_status()
         return resp.content
+
+
+def safe_package_path(value: str) -> str:
+    """Accept repository-relative paths without URL syntax or traversal."""
+    if (not re.fullmatch(r'[A-Za-z0-9_+./~-]+', value)
+            or any(p in ('', '.', '..') for p in value.split('/'))):
+        raise ValueError(f'unsafe package path: {value!r}')
+    return value

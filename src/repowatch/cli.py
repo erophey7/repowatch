@@ -154,6 +154,7 @@ def main(argv: list[str] | None = None) -> int:
         from repowatch import cache_probe
 
         store = StateStore(config.state_db)
+        store.bandwidth.bind(args.config)
         stats = store.get_storage_stats()
         print(f"state_db: {config.state_db} ({stats['state_db_bytes']:,} bytes)")
         for table, count in stats["tables"].items():
@@ -269,6 +270,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     store = StateStore(config.state_db)
+    store.bandwidth.bind(args.config)
 
     if args.command == "check-once":
         asyncio.run(check_all(config, store))

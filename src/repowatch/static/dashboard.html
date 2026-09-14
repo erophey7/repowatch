@@ -97,7 +97,7 @@
   #add-form h3 { margin: 0 0 12px; font-size: 13px; }
   .field { margin-bottom: 10px; display: flex; flex-direction: column; gap: 4px; }
   .field label { font-size: 12px; color: var(--text-dim); }
-  .field input[type=text], .field input[type=password], .field select {
+  .field input[type=text], .field input[type=password], .field select, .field textarea {
     font: inherit; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--border);
     background: var(--bg); color: var(--text);
   }
@@ -252,6 +252,8 @@
         <option value="dnf">dnf / rpm</option>
         <option value="xbps">xbps (Void Linux)</option>
         <option value="nix">Nix</option>
+        <option value="gentoo">Gentoo binpkg</option>
+        <option value="slackware">Slackware</option>
       </select>
     </div>
 
@@ -314,14 +316,25 @@
       <input type="text" id="f-distribution" placeholder="bookworm">
     </div>
 
-    <div class="field" data-for="apt apt-rpm" hidden>
-      <label for="f-component">component (apt / apt-rpm)</label>
+    <div class="field" data-for="apt apt-rpm slackware" hidden>
+      <label for="f-component">component (apt / apt-rpm / Slackware; optional for Slackware)</label>
       <input type="text" id="f-component" placeholder="main">
     </div>
 
     <div class="field checkbox">
       <input type="checkbox" id="f-prefetch" checked>
       <label for="f-prefetch">warm the cache (prefetch)</label>
+    </div>
+
+    <div class="field">
+      <label for="f-prefetch-whitelist">Warming whitelist</label>
+      <textarea id="f-prefetch-whitelist" rows="3" placeholder="linux-*"></textarea>
+      <span class="field-hint">One package-name glob per line. Empty allows all names.</span>
+    </div>
+    <div class="field">
+      <label for="f-prefetch-blacklist">Warming blacklist</label>
+      <textarea id="f-prefetch-blacklist" rows="3" placeholder="*-debug"></textarea>
+      <span class="field-hint">Blacklist and exact bans override the whitelist, including manual warming. For Nix, match attribute:output; allowed roots keep all dependencies.</span>
     </div>
 
     <div class="field checkbox" id="f-verify-signature-field">
@@ -343,8 +356,8 @@
     </div>
 
     <div class="field">
-      <label for="f-prefetch-bandwidth-limit">prefetch_bandwidth_limit (bytes/sec, optional)</label>
-      <input type="text" id="f-prefetch-bandwidth-limit" placeholder="default — the global value (or no limit)">
+      <label for="f-prefetch-bandwidth-limit">Repository warm limit (bytes/sec, optional)</label>
+      <input type="text" id="f-prefetch-bandwidth-limit" placeholder="empty — shared budget only">
     </div>
 
     <div class="form-actions">
@@ -396,9 +409,20 @@
       <input type="text" id="s-check-concurrency">
     </div>
     <div class="field">
-      <label for="s-prefetch-bandwidth-limit">prefetch_bandwidth_limit (bytes/sec, empty — no limit)</label>
+      <label for="s-prefetch-bandwidth-limit">Shared warm limit (bytes/sec, empty — unlimited)</label>
       <input type="text" id="s-prefetch-bandwidth-limit">
     </div>
+    <div class="field">
+      <label for="s-bandwidth-timezone">Schedule timezone</label>
+      <input type="text" id="s-bandwidth-timezone" placeholder="UTC">
+    </div>
+    <fieldset>
+      <legend>Warm bandwidth schedule</legend>
+      <p>Windows replace the shared limit. Outside them, the shared limit above applies.
+      Overnight windows belong to their starting day. End time may be 24:00.</p>
+      <div id="s-bandwidth-windows"></div>
+      <button type="button" id="s-bandwidth-add">Add time window</button>
+    </fieldset>
     <div class="field">
       <label for="s-cache-base-url">cache_base_url</label>
       <input type="text" id="s-cache-base-url">
@@ -500,6 +524,7 @@ const sessionReady = nativeFetch('/api/auth/session').then(async response => {
   $toggleSettingsFormBtn.textContent = isLoggedIn ? '⚙ Settings' : '⚙ View settings';
   document.querySelectorAll('#settings-form input').forEach(input => { input.readOnly = !isLoggedIn; });
   document.querySelector('#settings-form button[type="submit"]').hidden = !isLoggedIn;
+  document.getElementById('s-bandwidth-add').hidden = !isLoggedIn;
   document.getElementById('cancel-settings-form').textContent = isLoggedIn ? 'Cancel' : 'Close';
 });
 const fetch = async function(url, options = {}) {
@@ -1324,8 +1349,10 @@ async function toggleDetail(tr, repoId) {
         return;
       }
       warmMsg.textContent = `Warmed: ${data.warmed.length}` +
+        (data.skipped?.length ? `, skipped: ${data.skipped.length}` : '') +
+        (data.failed?.length ? `, failed: ${data.failed.length}` : '') +
         (data.not_found.length ? `, not found: ${data.not_found.length}` : '');
-      warmMsg.className = 'form-msg ok';
+      warmMsg.className = data.failed?.length ? 'form-msg error' : 'form-msg ok';
       await loadWarmed();
     } catch (err) {
       warmMsg.textContent = `Network error: ${err.message}`;
@@ -1427,6 +1454,8 @@ function openEditForm(repo) {
   document.getElementById('f-distribution').value = cfg.distribution ?? '';
   document.getElementById('f-component').value = cfg.component ?? '';
   document.getElementById('f-prefetch').checked = cfg.prefetch ?? repo.prefetch;
+  document.getElementById('f-prefetch-whitelist').value = (cfg.prefetch_whitelist || []).join('\n');
+  document.getElementById('f-prefetch-blacklist').value = (cfg.prefetch_blacklist || []).join('\n');
   $verifySignature.checked = cfg.verify_signature ?? false;
   document.getElementById('f-keyring-path').value = cfg.keyring_path ?? '';
   document.getElementById('f-apk-keys').value = cfg.apk_keys_dir ?? '';
@@ -1471,12 +1500,12 @@ function updateConditionalFields() {
   });
   const verifyField = document.getElementById('f-verify-signature-field');
   const keyringField = document.getElementById('f-keyring-path-field');
-  // xbps repos don't publish a signed index at all — the server rejects
+  // XBPS and Gentoo use package-level signatures; the server rejects
   // verify_signature=true outright (see config.py) — so the checkbox isn't
   // just hidden but force-unchecked, otherwise a stale "checked" state
   // from a previously selected type would submit a doomed request.
-  verifyField.hidden = type === 'xbps';
-  if (type === 'xbps') $verifySignature.checked = false;
+  verifyField.hidden = type === 'xbps' || type === 'gentoo';
+  if (type === 'xbps' || type === 'gentoo') $verifySignature.checked = false;
   keyringField.hidden = type === 'apk' || type === 'xbps' || type === 'nix' || !$verifySignature.checked;
 }
 $typeSelect.addEventListener('change', updateConditionalFields);
@@ -1496,12 +1525,14 @@ $addForm.addEventListener('submit', async (ev) => {
     url_template: document.getElementById('f-url-template').value.trim() || null,
     arch: document.getElementById('f-arch').value.trim(),
     prefetch: document.getElementById('f-prefetch').checked,
+    prefetch_whitelist: document.getElementById('f-prefetch-whitelist').value.split(/\r?\n/).map(s => s.trim()).filter(Boolean),
+    prefetch_blacklist: document.getElementById('f-prefetch-blacklist').value.split(/\r?\n/).map(s => s.trim()).filter(Boolean),
   };
   if (type === 'pacman') {
     body.repo_name = document.getElementById('f-repo-name').value.trim();
   } else if (type === 'apt') {
     body.distribution = document.getElementById('f-distribution').value.trim();
-    body.component = document.getElementById('f-component').value.trim();
+    body.component = document.getElementById('f-component').value.trim() || null;
   }
 
   if (type === 'nix') {
@@ -1512,7 +1543,7 @@ $addForm.addEventListener('submit', async (ev) => {
     body.nix_max_paths = Number(document.getElementById('f-nix-max-paths').value);
   }
 
-  if (type === 'apt-rpm') body.component = document.getElementById('f-component').value.trim();
+  if (type === 'apt-rpm' || type === 'slackware') body.component = document.getElementById('f-component').value.trim() || null;
 
   const checkInterval = document.getElementById('f-check-interval').value.trim();
   if (checkInterval) body.check_interval = Number(checkInterval);
@@ -1572,11 +1603,40 @@ const SETTINGS_FIELDS = {
   'prefetch_concurrency': 's-prefetch-concurrency',
   'check_concurrency': 's-check-concurrency',
   'prefetch_bandwidth_limit': 's-prefetch-bandwidth-limit',
+  'prefetch_bandwidth_timezone': 's-bandwidth-timezone',
   'cache_base_url': 's-cache-base-url',
   'public_cache_url': 's-public-cache-url',
   'notify_after_failures': 's-notify-after-failures',
   'key_expiry_warning_days': 's-key-expiry-warning-days',
 };
+
+function addBandwidthWindow(window = {}) {
+  const row = document.createElement('div');
+  row.className = 'bandwidth-window';
+  const fields = [
+    ['days', 'Days (mon,tue,wed,thu,fri,sat,sun)', (window.days || ['mon','tue','wed','thu','fri','sat','sun']).join(',')],
+    ['start', 'Start (HH:MM)', window.start || '00:00'],
+    ['end', 'End (HH:MM)', window.end || '24:00'],
+    ['limit', 'Bytes/sec (empty = unlimited)', window.limit ?? ''],
+  ];
+  for (const [name, title, value] of fields) {
+    const label = document.createElement('label');
+    label.textContent = title + ' ';
+    const input = document.createElement('input');
+    input.type = 'text'; input.dataset.field = name; input.value = value; input.readOnly = !isLoggedIn;
+    label.append(input); row.append(label);
+  }
+  const remove = document.createElement('button');
+  remove.type = 'button'; remove.textContent = 'Remove window'; remove.hidden = !isLoggedIn;
+  remove.addEventListener('click', () => row.remove());
+  row.append(remove);
+  document.getElementById('s-bandwidth-windows').append(row);
+}
+function showBandwidthSchedule(windows) {
+  document.getElementById('s-bandwidth-windows').replaceChildren();
+  for (const window of windows || []) addBandwidthWindow(window);
+}
+document.getElementById('s-bandwidth-add').addEventListener('click', () => addBandwidthWindow());
 
 async function openSettingsForm() {
   $settingsMsg.textContent = 'Loading…';
@@ -1587,8 +1647,9 @@ async function openSettingsForm() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
     for (const [field, elId] of Object.entries(SETTINGS_FIELDS)) {
-      document.getElementById(elId).value = data[field] ?? '';
+      document.getElementById(elId).value = data[field] ?? (field === 'prefetch_bandwidth_timezone' ? 'UTC' : '');
     }
+    showBandwidthSchedule(data.prefetch_bandwidth_schedule);
     $settingsMsg.textContent = '';
   } catch (err) {
     $settingsMsg.textContent = `Load error: ${err.message}`;
@@ -1615,6 +1676,15 @@ $settingsForm.addEventListener('submit', async (ev) => {
   }
 
   try {
+    body.prefetch_bandwidth_schedule = [...document.querySelectorAll('.bandwidth-window')].map(row => {
+      const value = name => row.querySelector(`[data-field="${name}"]`).value.trim();
+      const rate = value('limit');
+      if (rate && (!Number.isFinite(Number(rate)) || Number(rate) <= 0)) {
+        throw new Error('Bandwidth limits must be positive numbers or empty');
+      }
+      return {days: value('days').split(',').map(s => s.trim()).filter(Boolean),
+              start: value('start'), end: value('end'), limit: rate ? Number(rate) : null};
+    });
     const res = await fetch('/api/config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1629,8 +1699,9 @@ $settingsForm.addEventListener('submit', async (ev) => {
     $settingsMsg.textContent = 'Saved';
     $settingsMsg.className = 'form-msg ok';
     for (const [field, elId] of Object.entries(SETTINGS_FIELDS)) {
-      document.getElementById(elId).value = data[field] ?? '';
+      document.getElementById(elId).value = data[field] ?? (field === 'prefetch_bandwidth_timezone' ? 'UTC' : '');
     }
+    showBandwidthSchedule(data.prefetch_bandwidth_schedule);
     loadRepos(); // check_interval may have changed — refresh the "interval" column
   } catch (err) {
     $settingsMsg.textContent = `Network error: ${err.message}`;

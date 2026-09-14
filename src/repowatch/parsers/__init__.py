@@ -1,3 +1,5 @@
+from repowatch.parsers.gentoo import GentooParser
+from repowatch.parsers.slackware import SlackwareParser
 from repowatch.parsers.base import IndexParser
 from repowatch.parsers.apk import ApkParser
 from repowatch.parsers.apt import AptParser
@@ -14,7 +16,9 @@ PARSERS: dict[str, type[IndexParser]] = {
     "dnf": DnfParser,
     "apt-rpm": AptRpmParser,
     "xbps": XbpsParser,
+    "gentoo": GentooParser,
+    "slackware": SlackwareParser,
     "nix": NixParser,
 }
 
-__all__ = ["IndexParser", "AptParser", "PacmanParser", "ApkParser", "DnfParser", "AptRpmParser", "XbpsParser", "NixParser", "PARSERS"]
+__all__ = ["IndexParser", "AptParser", "PacmanParser", "ApkParser", "DnfParser", "AptRpmParser", "XbpsParser", "NixParser", "GentooParser", "SlackwareParser", "PARSERS"]

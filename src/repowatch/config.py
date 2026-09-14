@@ -19,7 +19,7 @@ class ConfigError(Exception):
 @dataclass(frozen=True)
 class RepoConfig:
     id: str
-    type: str  # "pacman" | "apt" | "apk" | "dnf" | "apt-rpm" | "xbps" | "nix"
+    type: str  # "pacman" | "apt" | "apk" | "dnf" | "apt-rpm" | "xbps" | "nix" | "gentoo" | "slackware"
     upstream: str
     arch: str
     prefetch: bool = True
@@ -35,9 +35,8 @@ class RepoConfig:
     apk_signature_backend: str = 'openssl'
     apk_keys_dir: str | None = None
     keyring_path: str | None = None    # exported keyring (not .asc!), see README
-    # per-repo overrides of global Config settings — None means "use the
-    # global value", see Config.effective_check_interval/
-    # effective_prefetch_bandwidth_limit
+    # The interval overrides the global default. Bandwidth is an additional
+    # per-repository ceiling inside the shared global budget; None adds no cap.
     check_interval: int | None = None
     prefetch_bandwidth_limit: float | None = None  # bytes/sec, not requests/sec
     # Free-text label for manual grouping in the dashboard (see
@@ -57,10 +56,24 @@ class RepoConfig:
     nix_timeout: int = 600
     nix_max_paths: int = 500000
 
+    prefetch_whitelist: list[str] = field(default_factory=list)
+    prefetch_blacklist: list[str] = field(default_factory=list)
+
     def __post_init__(self) -> None:
+        from repowatch.warming_policy import validate_patterns
+        for name in ('prefetch_whitelist', 'prefetch_blacklist'):
+            try:
+                validate_patterns(name, getattr(self, name))
+            except ValueError as exc:
+                raise ConfigError(f'{self.id}: {exc}') from exc
+        from repowatch.bandwidth import validate_limit
+        try:
+            validate_limit(self.prefetch_bandwidth_limit)
+        except ValueError as exc:
+            raise ConfigError(f'{self.id}: {exc}') from exc
         from repowatch.url_templates import expand
         expand(self)
-        if self.type not in {"pacman", "apt", "apk", "dnf", "apt-rpm", "xbps", "nix"}:
+        if self.type not in {"pacman", "apt", "apk", "dnf", "apt-rpm", "xbps", "nix", "gentoo", "slackware"}:
             raise ConfigError(f"{self.id}: unknown type={self.type!r}")
         if self.type == 'nix':
             from urllib.parse import urlsplit
@@ -93,6 +106,10 @@ class RepoConfig:
                 raise ConfigError(f"{self.id}: apt-rpm requires a safe component (e.g. classic)")
             if not isinstance(self.arch, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", self.arch):
                 raise ConfigError(f"{self.id}: apt-rpm requires arch")
+        if self.type == 'slackware' and self.component not in (None, 'patches', 'extra', 'pasture', 'testing'):
+            raise ConfigError(f'{self.id}: slackware component must be patches, extra, pasture, testing or omitted')
+        if self.type == 'gentoo' and self.verify_signature:
+            raise ConfigError(f'{self.id}: verify_signature is unsupported for gentoo; GPKG signatures must be checked by Portage')
         if self.apk_signature_backend not in ('openssl', 'apk-tools'):
             raise ConfigError(f'{self.id}: apk_signature_backend must be openssl or apk-tools')
         if self.apk_keys_dir is not None and (not isinstance(self.apk_keys_dir, str) or not self.apk_keys_dir.strip()):
@@ -362,10 +379,11 @@ class Config:
     # orders of magnitude, from a few hundred bytes for a pacman .desc to
     # hundreds of megabytes for a debian .deb, so a requests/sec limit
     # wouldn't protect the actual bandwidth to upstream/the local nginx).
-    # None means no limit. Overridable per-repo, see
-    # RepoConfig.prefetch_bandwidth_limit /
-    # effective_prefetch_bandwidth_limit.
+    # None means no global limit. Per-repo limits are additional ceilings;
+    # they cannot override or bypass this shared process-wide budget.
     prefetch_bandwidth_limit: float | None = None
+    prefetch_bandwidth_timezone: str = 'UTC'
+    prefetch_bandwidth_schedule: list[dict] = field(default_factory=list)
     # Below how many days left until the soonest-expiring key in a repo's
     # keyring counts as "expiring soon" — surfaced in /api/repos and
     # /metrics, and drives a webhook notification the same way repeated
@@ -374,6 +392,14 @@ class Config:
     # verify_signature=true and a GPG-based type (apt/pacman/dnf/apt-rpm) —
     # apk's embedded RSA keys have no expiry concept at all.
     key_expiry_warning_days: int = 30
+
+    def __post_init__(self) -> None:
+        from repowatch.bandwidth import validate_limit, validate_schedule
+        try:
+            validate_limit(self.prefetch_bandwidth_limit)
+            validate_schedule(self.prefetch_bandwidth_schedule, self.prefetch_bandwidth_timezone)
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
 
     def repo_by_id(self, repo_id: str) -> RepoConfig | None:
         return next((r for r in self.repos if r.id == repo_id), None)
@@ -389,10 +415,10 @@ class Config:
         return repo.check_interval if repo.check_interval is not None else self.check_interval
 
     def effective_prefetch_bandwidth_limit(self, repo: RepoConfig) -> float | None:
-        """Bytes/sec, not requests/sec — see prefetch_bandwidth_limit above."""
-        if repo.prefetch_bandwidth_limit is not None:
-            return repo.prefetch_bandwidth_limit
-        return self.prefetch_bandwidth_limit
+        """Current per-repo ceiling; the global budget is also shared with others."""
+        from repowatch.bandwidth import scheduled_limit
+        limits = [limit for limit in (scheduled_limit(self), repo.prefetch_bandwidth_limit) if limit is not None]
+        return min(limits) if limits else None
 
 
 def load_config(path: str | Path) -> Config:
@@ -447,9 +473,9 @@ def load_config(path: str | Path) -> Config:
             prefetch_concurrency=int(raw.get("prefetch_concurrency", 8)),
             check_concurrency=int(raw.get("check_concurrency", 8)),
             public_cache_url=(str(raw["public_cache_url"]).rstrip("/") if raw.get("public_cache_url") else None),
-            prefetch_bandwidth_limit=(
-                float(raw["prefetch_bandwidth_limit"]) if raw.get("prefetch_bandwidth_limit") else None
-            ),
+            prefetch_bandwidth_limit=raw.get('prefetch_bandwidth_limit'),
+            prefetch_bandwidth_timezone=raw.get('prefetch_bandwidth_timezone', 'UTC'),
+            prefetch_bandwidth_schedule=raw.get('prefetch_bandwidth_schedule', []),
             notify_webhook_url=(str(raw["notify_webhook_url"]) if raw.get("notify_webhook_url") else None),
             notify_after_failures=int(raw.get("notify_after_failures", 3)),
             key_expiry_warning_days=int(raw.get("key_expiry_warning_days", 30)),

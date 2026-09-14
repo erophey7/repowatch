@@ -431,13 +431,20 @@ def warm_packages_payload(
     to_warm = {k: known_packages[k] for k in requested_keys if k in known_packages}
     not_found = [k for k in requested_keys if k not in known_packages]
 
+    outcomes: dict[str, bool] = {}
     if to_warm:
+        store.bandwidth.bind(config_path)
         # warm_cache is now async (see prefetch.py) — this handler itself
         # runs in a plain ThreadingHTTPServer thread with no event loop of
         # its own, so we bridge sync->async with a fresh one-off loop.
-        asyncio.run(warm_cache(current, repo, store, to_warm, force=True))
+        outcomes = asyncio.run(warm_cache(current, repo, store, to_warm, force=True))
 
-    return 200, {"warmed": sorted(to_warm), "not_found": not_found}
+    return 200, {
+        "warmed": sorted(key for key, ok in outcomes.items() if ok),
+        "failed": sorted(key for key, ok in outcomes.items() if not ok),
+        "skipped": sorted(set(to_warm) - outcomes.keys()),
+        "not_found": not_found,
+    }
 
 
 def purge_candidates_payload(
@@ -848,6 +855,8 @@ SAFE_CONFIG_FIELDS: dict[str, Callable[[Any], Any]] = {
     "prefetch_concurrency": _cast_int,
     "check_concurrency": _cast_int,
     "prefetch_bandwidth_limit": _cast_optional_float,
+    "prefetch_bandwidth_timezone": str,
+    "prefetch_bandwidth_schedule": lambda value: json.loads(value) if isinstance(value, str) else value,
     "cache_base_url": _cast_url,
     "public_cache_url": _cast_optional_url,
     "notify_after_failures": _cast_int,
@@ -906,9 +915,12 @@ def update_safe_config_payload(
 
     try:
         atomic_config(path, yaml.safe_dump(raw, sort_keys=False, allow_unicode=True))
+    except ConfigError as exc:
+        return 400, {"error": f"result fails validation: {exc}"}
+    try:
         reloaded = load_config(path)
     except ConfigError as exc:
-        return 500, {"error": f"result fails validation: {exc}"}
+        return 500, {"error": f"configuration could not be reloaded: {exc}"}
 
     logger.info("global settings changed via API: %s", sorted(casted))
     return 200, {field: getattr(reloaded, field) for field in SAFE_CONFIG_FIELDS}
@@ -1588,6 +1600,7 @@ def make_handler(
 
 
 def serve(config: Config, store: StateStore, config_path: str | Path) -> None:
+    store.bandwidth.bind(config_path)
     handler_cls = make_handler(config, store, config_path)
     addr = (config.status_server.bind, config.status_server.port)
     context = None

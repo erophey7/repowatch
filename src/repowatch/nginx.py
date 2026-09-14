@@ -178,9 +178,10 @@ def render(config: Config, *, cache_dir: str = '/var/cache/nginx/repowatch',
         # All mutable metadata (including signatures and apt translations) get short TTL.
         patterns = (r'[^/]+\.(db|files)(\.tar\.(gz|xz|zst))?(\.sig)?$',
                     r'dists/', r'APKINDEX\.tar\.gz$', r'repodata/', r'base/', r'[^/]+-repodata$',
-                    r'(nix-cache-info|[^/]+\.narinfo)$')
+                    r'(nix-cache-info|[^/]+\.narinfo)$', r'Packages(\.gz)?$',
+                    r'(.*\/)?(PACKAGES\.TXT|CHECKSUMS\.md5|FILELIST\.TXT|ChangeLog\.txt|MANIFEST|GPG-KEY)(\.(gz|bz2))?(\.asc)?$')
         kind = kinds[local]
-        pattern = patterns[('pacman', 'apt', 'apk', 'dnf', 'apt-rpm', 'xbps', 'nix').index(kind)]
+        pattern = patterns[('pacman', 'apt', 'apk', 'dnf', 'apt-rpm', 'xbps', 'nix', 'gentoo', 'slackware').index(kind)]
         for index in (True, False):
             location = f'~ ^{re.escape(local)}{pattern}' if index else local
             lines += [f'    location {location} {{']

@@ -277,7 +277,7 @@ def test_warm_packages_payload_warms_only_known_keys(tmp_path):
         )
     )
 
-    with patch("repowatch.api.warm_cache") as mock_warm_cache:
+    with patch("repowatch.api.warm_cache", return_value={"musl-1.2.5-r0": True}) as mock_warm_cache:
         status, data = warm_packages_payload(
             config_path, store, "alpine-test", _session(config_path, "secret123"),
             {"package_keys": ["musl-1.2.5-r0", "does-not-exist-1.0-r0"]},
@@ -1574,3 +1574,60 @@ nginx:
     assert seen.count(canonical_key) == 1
     assert payload[field]['foo-1'] == ('purged' if canonical_status == 200 else 'error (HTTP 503)')
     assert bool(store.get_warmed_packages('b')) == (canonical_status != 200)
+
+
+def test_bandwidth_schedule_round_trip_and_invalid_update_is_atomic(tmp_path):
+    config_path, store = _setup(tmp_path, admin_password='secret123')
+    session = _session(config_path, 'secret123')
+    schedule = [{'days': ['mon', 'tue'], 'start': '23:00', 'end': '06:00', 'limit': 50000000}]
+    status, data = update_safe_config_payload(config_path, session, {
+        'prefetch_bandwidth_timezone': 'Asia/Vladivostok',
+        'prefetch_bandwidth_schedule': schedule, 'prefetch_bandwidth_limit': 5000000})
+    assert status == 200
+    assert data['prefetch_bandwidth_schedule'] == schedule
+    assert load_config(config_path).prefetch_bandwidth_timezone == 'Asia/Vladivostok'
+    original = config_path.read_bytes()
+    status, data = update_safe_config_payload(config_path, session, {
+        'prefetch_bandwidth_schedule': schedule + schedule})
+    assert status == 400 and 'overlap' in data['error']
+    assert config_path.read_bytes() == original
+
+
+def test_repo_warming_lists_roundtrip_and_invalid_update_is_atomic(tmp_path):
+    config_path, store = _setup(tmp_path, admin_password='secret123')
+    session = _session(config_path, 'secret123')
+    body = {**NEW_REPO_BODY, 'prefetch_whitelist': ['linux-*'], 'prefetch_blacklist': ['*-debug']}
+    assert add_repo_payload(config_path, session, body)[0] == 201
+    r = load_config(config_path).repo_by_id(body['id'])
+    assert r.prefetch_whitelist == ['linux-*'] and r.prefetch_blacklist == ['*-debug']
+    listed = next(r for r in repos_list_payload(config_path, store)[1] if r['id'] == body['id'])
+    assert listed['config']['prefetch_whitelist'] == ['linux-*']
+    before = config_path.read_bytes()
+    assert update_repo_payload(config_path, session, body['id'], {**body, 'prefetch_blacklist': '*'})[0] == 400
+    assert config_path.read_bytes() == before
+    assert update_repo_payload(config_path, session, body['id'], {**body, 'prefetch_whitelist': [], 'prefetch_blacklist': []})[0] == 200
+    assert load_config(config_path).repo_by_id(body['id']).prefetch_whitelist == []
+
+
+def test_manual_warm_reports_success_failure_and_policy_skip(tmp_path):
+    from unittest.mock import AsyncMock
+    config_path, store = _setup(tmp_path, admin_password='secret123')
+    files = {'ok-1': 'ok.apk', 'bad-1': 'bad.apk', 'skip-1': 'skip.apk'}
+    store.record_snapshot(RepoSnapshot('alpine-test', files, {k: k[:-2] for k in files}))
+    store.ban_package('alpine-test', 'skip')
+    with patch('repowatch.prefetch._warm_one', new=AsyncMock(side_effect=[(True, 200), (False, 503)])):
+        status, data = warm_packages_payload(config_path, store, 'alpine-test',
+            _session(config_path, 'secret123'), {'package_keys': list(files) + ['unknown-1']})
+    assert status == 200
+    assert data == {'warmed': ['ok-1'], 'failed': ['bad-1'], 'skipped': ['skip-1'], 'not_found': ['unknown-1']}
+
+
+def test_manual_warm_with_only_excluded_packages_reports_no_success(tmp_path):
+    config_path, store = _setup(tmp_path, admin_password='secret123')
+    store.record_snapshot(RepoSnapshot('alpine-test', {'skip-1': 'skip.apk'}, {'skip-1': 'skip'}))
+    store.ban_package('alpine-test', 'skip')
+    with patch('repowatch.prefetch._warm_one') as fetch:
+        status, data = warm_packages_payload(config_path, store, 'alpine-test',
+            _session(config_path, 'secret123'), {'package_keys': ['skip-1', 'skip-1']})
+    assert status == 200 and data['warmed'] == [] and data['skipped'] == ['skip-1']
+    fetch.assert_not_called()

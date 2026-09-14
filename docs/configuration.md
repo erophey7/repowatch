@@ -9,6 +9,7 @@ This file documents every field. For a working starting point, copy an
 example config and edit it (see the main README's Quick start).
 
 - [Top-level fields](#top-level-fields)
+- [Bandwidth schedules](#bandwidth-schedules)
 - [`repos[]`](#repos)
 - [`url_template` / `url_variables`](#url_template--url_variables)
 - [`status_server`](#status_server)
@@ -28,7 +29,9 @@ example config and edit it (see the main README's Quick start).
 | `check_interval` | int (seconds) | `300` | How often each repository's index is checked, unless overridden per-repository (see `repos[].check_interval`). |
 | `check_concurrency` | int | `8` | How many repositories to check at once per scheduler tick. Repositories are checked concurrently, not one at a time — a slow/hung upstream for one repo won't delay checking the others. |
 | `prefetch_concurrency` | int | `8` | How many files to warm in parallel per warm-up run. |
-| `prefetch_bandwidth_limit` | float (bytes/sec) or `null` | `null` | Cap on total warm-up bandwidth across all files warming CONCURRENTLY WITHIN ONE REPOSITORY'S warm-up run — not a requests/sec limit (file sizes vary from a few hundred bytes to hundreds of megabytes), and not a true global cap: each repository's `warm_cache()` run gets its own independent limiter instance, so N repositories warming at the same time can together use up to N × this value. `null` means no limit. Overridable per-repository, see `repos[].prefetch_bandwidth_limit`. |
+| `prefetch_bandwidth_limit` | positive float (bytes/sec) or `null` | `null` | Shared warm-body read budget for the whole application process, including all repositories and manual/Nix warming. `null` means unlimited globally. See [Bandwidth schedules](#bandwidth-schedules). |
+| `prefetch_bandwidth_timezone` | IANA timezone name | `UTC` | Timezone for schedule windows. Non-UTC zones require system timezone data; no Python timezone package is added. |
+| `prefetch_bandwidth_schedule` | list of windows | `[]` | Non-overlapping weekly windows replacing the global limit, each with `start`, `end`, `limit`, and optional `days`. |
 | `event_retention_days` | int | `90` | How many days to keep the per-repository change log (`repo_events` — what changed and when). |
 | `request_retention_days` | int | `7` | How many days to keep the log of real client requests (only populated if `syslog_listener.enabled`). |
 | `warmed_retention_days` | int | `180` | How many days to keep a `warmed_packages` row that hasn't been updated. Deliberately much longer than `event_retention_days`: this is "last known warm state", not an event log, and a package can legitimately go unwarmed for months if its version doesn't change. A real client request refreshes the timer (see `syslog_listener` below); this whole cleanup is skipped entirely when `syslog_listener.enabled` is off, since without it there's no way to tell "nobody wants this" from "we can't see it". When `nginx.enable_purge` is also on, an expired row's real cache entry is purged too, not just the bookkeeping row. |
@@ -43,6 +46,54 @@ example config and edit it (see the main README's Quick start).
 | `nginx` | mapping | — | See [`nginx`](#nginx). |
 | `repos` | list | — (required, non-empty) | See [`repos[]`](#repos). |
 
+## Bandwidth schedules
+
+```yaml
+# Outside schedule windows, share 5 MiB/s across all warm operations.
+prefetch_bandwidth_limit: 5242880
+prefetch_bandwidth_timezone: Asia/Vladivostok
+prefetch_bandwidth_schedule:
+  - days: [mon, tue, wed, thu, fri, sat, sun]
+    start: "20:00"
+    end: "09:00"
+    limit: 52428800  # 50 MiB/s overnight; null would remove the global cap.
+```
+
+Days use `mon` through `sun`; omitted days mean every day. Windows include
+`start` and exclude `end`. An overnight window belongs to its starting day:
+Friday 20:00–09:00 includes Saturday morning. `00:00`–`24:00` means the full
+day. Equal start/end times and overlapping windows (including week wrap) are
+rejected. All rates are positive finite bytes/sec or `null`; zero is not a
+pause setting. Outside windows the top-level limit applies. Per-repository
+limits remain additional ceilings even in an unlimited global window.
+
+Rules use the named zone's local wall clock. During a daylight-saving fall
+back, both occurrences of a repeated local time use the same matching rule;
+skipped spring-forward times have no duration. UTC works without an external
+timezone database. Edit windows and timezone in dashboard settings or YAML.
+
+The running application observes policy edits within approximately one
+second, including ongoing warms; invalid edits retain the last valid policy.
+Schedule boundaries are evaluated while waiting, without restarting downloads.
+Waiters are served in rotation, with up to 100 ms of rate credit retained.
+Manual operations, simultaneous warm runs of the same repository, automatic
+checks and Nix artifact warming use the same budget in `run`/`supervise`.
+A separate `check-once` or `serve-status` process has its own budget; this
+mechanism does not coordinate multiple application processes or hosts.
+
+This paces response-body consumption by repowatch. HTTP/socket/nginx buffering
+can allow bursts and upstream fetching ahead of consumption, so this is not
+an exact WAN traffic shaper. Client downloads, index checks, Nix source
+resolution and direct closure-metadata discovery are outside this budget.
+Successful and failed artifact downloads both spend bytes already consumed;
+cancellation removes outstanding work without reserving future bandwidth.
+
+**Migration:** previously the global value was a default independently used
+by each warm run, and a repository value replaced it. It is now one shared
+budget plus optional repository ceilings, so concurrent warming may become
+slower with the same configuration. Use `null` for unlimited speed; old zero
+values must be replaced with `null`.
+
 ## `repos[]`
 
 Each entry describes one repository to watch and cache. `id` is permanent —
@@ -53,15 +104,17 @@ and adding a new one; there's no rename.
 | Field | Type | Default | Applies to | Notes |
 |---|---|---|---|---|
 | `id` | string | — (required) | all | Stable identifier. Immutable in practice — see above. |
-| `type` | `pacman` \| `apt` \| `apk` \| `dnf` \| `apt-rpm` \| `xbps` \| `nix` | — (required) | all | Selects the index parser. `dnf` covers any RPM-MD repository (Rocky, Fedora, openSUSE, …), not just Fedora/DNF-branded ones. `apt-rpm` is for ALT Linux-style apt-over-RPM repositories, not RPM-MD. `xbps` is Void Linux; it requires the system `zstd` binary (see the README) and does not support `verify_signature`. |
+| `type` | `pacman` \| `apt` \| `apk` \| `dnf` \| `apt-rpm` \| `xbps` \| `nix` \| `gentoo` \| `slackware` | — (required) | all | Selects the index parser. `dnf` covers any RPM-MD repository (Rocky, Fedora, openSUSE, …), not just Fedora/DNF-branded ones. `apt-rpm` is for ALT Linux-style apt-over-RPM repositories, not RPM-MD. `xbps` is Void Linux; it requires the system `zstd` binary (see the README) and does not support `verify_signature`. |
 | `upstream` | URL | — (required) | all | The real upstream mirror address. repowatch's own index checks go straight here; warm-up requests go through `cache_base_url` instead (see architecture note in the README). |
 | `arch` | string | — (required) | all | Target architecture (Nix uses `x86_64-linux` or `aarch64-linux`; otherwise `x86_64`, `amd64`, `i686`, `noarch`, …). One `RepoConfig` = one architecture; to mirror multiple architectures of the same repository, add multiple entries (see `group` below for grouping them visually). |
 | `prefetch` | bool | `true` | all | Whether repowatch actively warms new packages into the cache. Set `false` for repositories you only want indexed/tracked in `status.json` without eagerly pulling every new package (useful for very large or rarely-used repos). |
+| `prefetch_whitelist` | list of globs | `[]` | all | Warm only matching package names; empty allows all. See [warming lists](warming-policy.md). |
+| `prefetch_blacklist` | list of globs | `[]` | all | Exclude matching names, overriding the whitelist. Exact bans also win. Applies to automatic and manual warming; Nix filters roots, not their dependencies. |
 | `repo_name` | string | — (required for `pacman`) | pacman | e.g. `core`, `extra`, `community`. |
 | `distribution` | string | — (required for `apt`) | apt | e.g. `bookworm`, `jammy`, `noble-updates`. |
-| `component` | string | — (required for `apt`, `apt-rpm`) | apt, apt-rpm | e.g. `main`, `contrib`, `non-free`. For `apt-rpm` it must match `[A-Za-z0-9_-]+` (e.g. `classic`, `checkinstall`). |
-| `verify_signature` | bool | `false` | apt, pacman, dnf, apt-rpm, apk, nix | Enables index signature verification, or Nix closure metadata signature verification during warming. See per-type key fields below. |
-| `keyring_path` | path or `null` | `null` | apt, pacman, dnf, apt-rpm | Path to an **exported keyring** (`gpg --export ... > keyring.gpg`), not a `.asc`/armored key file. Required when `verify_signature: true` for these types. |
+| `component` | string | — (required for `apt`, `apt-rpm`) | apt, apt-rpm, slackware | e.g. `main`, `contrib`, `non-free`. For `apt-rpm` it must match `[A-Za-z0-9_-]+` (e.g. `classic`, `checkinstall`). Slackware: omit for the main index, or use `patches`, `extra`, `pasture`, `testing`; keep upstream at the release root. |
+| `verify_signature` | bool | `false` | apt, pacman, dnf, apt-rpm, apk, nix, slackware | Enables index signature verification, or Nix closure metadata signature verification during warming. See per-type key fields below. |
+| `keyring_path` | path or `null` | `null` | apt, pacman, dnf, apt-rpm, slackware | Path to an **exported keyring** (`gpg --export ... > keyring.gpg`), not a `.asc`/armored key file. Required when `verify_signature: true` for these types. |
 | `apk_signature_backend` | `openssl` \| `apk-tools` | `openssl` | apk | Which system tool performs the embedded-RSA signature check (apk uses its own scheme, not OpenPGP — `keyring_path`/`gpgv` don't apply to it). |
 | `apk_keys_dir` | path or `null` | `null` | apk | Directory of trusted apk public keys (the same format/layout as `/etc/apk/keys`). Required when `verify_signature: true` for apk. |
 | `nix_source` | HTTP(S) URL or `null` | `null` | nix | Required source tarball containing a Nix expression, normally a nixpkgs channel. See [Nix repositories](nix.md). |
@@ -70,12 +123,20 @@ and adding a new one; there's no rename.
 | `nix_timeout` | positive int (seconds) | `600` | nix | Timeout for each CLI invocation, including source resolution and signature batches. |
 | `nix_max_paths` | positive int | `500000` | nix | Maximum catalog outputs and maximum store paths in any one dependency closure. |
 | `check_interval` | int (seconds) or `null` | `null` | all | Per-repository override of the top-level `check_interval`. `null` means "use the global value". |
-| `prefetch_bandwidth_limit` | float (bytes/sec) or `null` | `null` | all | Per-repository override of the top-level `prefetch_bandwidth_limit`. `null` means "use the global value" (which may itself be unlimited). |
+| `prefetch_bandwidth_limit` | positive float (bytes/sec) or `null` | `null` | all | Additional shared ceiling for all concurrent warm operations of this repository. It cannot bypass the global budget; `null` adds no repository ceiling. |
 | `group` | string or `null` | `null` | all | Free-text label for grouping repositories in the dashboard into collapsible sections. Purely cosmetic — no validation, any string is allowed, and it isn't tied to `type`/distribution automatically. Repositories without a group show up under "Ungrouped". |
 | `url_template` | string or `null` | `null` | all | Custom local URL layout — see [`url_template` / `url_variables`](#url_template--url_variables). |
 | `url_variables` | mapping (string → string) | `{}` | all | Extra substitution values for `url_template`. |
 
 ### Signature verification: what's actually checked
+
+- **Gentoo**: `verify_signature: true` is rejected. GPKG signatures are
+  inside package containers and must be verified by Portage; repowatch only
+  parses the unsigned `Packages` catalog.
+- **Slackware**: `gpgv` verifies `CHECKSUMS.md5.asc`, then the exact selected
+  `PACKAGES.TXT` bytes are checked against that signed manifest. This inherits
+  MD5's collision weakness; it does not verify package signatures while warming.
+  See [Gentoo and Slackware](gentoo-slackware.md) for setup and limitations.
 
 - **Nix**: while warming, Nix CLI verifies the downloaded `.narinfo` signatures
   against `nix_public_keys`, including dependency metadata. Signatures cover
@@ -258,7 +319,7 @@ config actually serves them.
 | `package_ttl` | int (seconds) | `15552000` (180 days) | `proxy_cache_valid` for immutable package files, addressed by exact version/checksum. |
 | `cache_dir` | path or `null` | `null` | **Read-only/informational** — the actual cache directory nginx writes to is set once, at install time, in the root-owned `policy.json` (see `CACHE_DIR` in [deployment.md](deployment.md)), not here. Setting this makes the path visible in `config.yaml` instead of hidden inside a file the service user can't read; `nginx-apply` cross-checks it against `policy.json` and refuses to apply on a mismatch, so it can't silently go stale. To actually change the cache directory: `sudo make install CACHE_DIR=... && sudo make activate` (stop the repowatch services/timers first). Setting it also unlocks the cache directory's size in `repowatch stats --cache-dir` and the dashboard's Storage panel ("Calculate cache directory size") — without it there is no path to walk, so that number is simply omitted rather than guessed at or defaulted to zero. **A real permissions caveat, found on a live deployment**: nginx creates `proxy_cache_path`'s `levels=1:2` subdirectories `0700`, owned by the nginx worker user (e.g. `www-data`) — regardless of the top-level `cache_dir`'s own mode. repowatch deliberately runs as a separate, unprivileged service user (not the nginx worker's), so on most real installs it can list the top-level directory but cannot descend into any of the hashed subdirectories at all. When that happens the reported size is a real undercount, but it is never silently wrong: the result includes `inaccessible_directories` (CLI prints a `WARNING`, the dashboard shows it in red) whenever this happens, so a permission wall doesn't read as "the cache is empty". Turning on `enable_cache_probe` below sidesteps this permission gap entirely (the scan runs inside the nginx worker itself, not as the repowatch service user) — see its own row for what that trades off instead. |
 | `enable_purge` | bool | `false` | Actively evict a package's cache entry the moment it disappears from the upstream index, instead of waiting for `inactive`/`max_size` to notice on their own. Requires the third-party `ngx_cache_purge` nginx module (Debian/Ubuntu: `libnginx-mod-http-cache-purge`; Arch: `nginx-mod-cache_purge`) — **not** the nginx-plus `proxy_cache_purge on` API, and not a real `PURGE` HTTP method (nginx core rejects unknown methods outright); the generator instead adds a dedicated, loopback-only `GET /purge<prefix>/...` location per repository. You must separately add `load_module ".../ngx_http_cache_purge_module.so";` to your own main `nginx.conf` — that's a main-context directive the generated file (which lives inside `http{}`/`sites-enabled`) can't emit itself. Without the module loaded, `nginx -t` fails clearly during `nginx-apply` and the usual atomic rollback applies — it doesn't silently do nothing. When it's on, the dashboard's per-repository panel also gets a "Cache purge (stale warmed entries)" section: "Scan for stale entries" computes candidates from repowatch's own records only (no nginx/network call), then "Purge selected" is the only point that actually asks nginx — its 200/404 response IS the "was this cached" answer, so there's no separate non-destructive pre-check (a normal HEAD/GET on a cache miss can fetch and populate the object, so it is not a read-only existence check; nginx normally converts HEAD to GET for caching via [proxy_cache_convert_head](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_cache_convert_head)). If `enable_cache_probe` is *also* on, "Purge selected" and un-warming go through that instead — see its own row below. |
-| `enable_dedup` | bool | `false` | When two DIFFERENT repositories publish the byte-identical file (e.g. the same binary package shipped by both Debian and Ubuntu), serve and cache it once instead of twice. Detected from a per-package SHA256 that apt/pacman/dnf/xbps indexes already publish — apk and apt-rpm packages never participate (see below). No extra download or storage of file content is needed; only the already-parsed index metadata is compared. |
+| `enable_dedup` | bool | `false` | When two DIFFERENT repositories publish the byte-identical file (e.g. the same binary package shipped by both Debian and Ubuntu), serve and cache it once instead of twice. Detected from a per-package SHA256 that apt/pacman/dnf/xbps indexes (and Gentoo indexes that advertise SHA256) publish — apk and apt-rpm packages never participate (see below). No extra download or storage of file content is needed; only the already-parsed index metadata is compared. |
 | `enable_cache_probe` | bool | `false` | Read-only cache introspection running *inside the nginx worker itself*, via the third-party `ngx_http_js_module` (njs) — Debian/Ubuntu: `libnginx-mod-http-js`; Arch: `nginx-mod-njs`. Same `load_module` caveat as `enable_purge` (a main-context directive the generated file can't emit itself). Solves a real permission problem: repowatch's own unprivileged process cannot read `proxy_cache_path`'s `0700`-owned subdirectories (see `cache_dir`'s own caveat above), but nginx's worker already owns them — so a small njs script running there can. Adds two loopback-only endpoints (`/cache-probe?key=...`: does this exact package's cache entry exist right now — a genuine non-destructive check, unlike asking via purge; `/cache-scan?dir=<a>/<bb>`: list one of the 4096 fixed leaf directories nginx's cache tree always has, together with each file's real on-disk key) and, when `enable_purge` is *also* on, one more: `/purge-raw?key=...` — evicts an arbitrary already-known key regardless of whether any current repository route still exists for it (the only way to clean up a repository removed from `config.yaml` whose files are still on disk). Two concrete effects on other features when this is on: the dashboard's "Calculate cache directory size" / `repowatch stats --cache-dir` use this instead of `os.walk()` — no `cache_dir` needed, no permission undercount (though a single leaf directory can still fail to respond on its own, e.g. a transient timeout; directory I/O errors also return HTTP 500 rather than an empty list; when a scan is partial the result carries `incomplete_leaves`, the same "you can see it's an undercount" signal `inaccessible_directories` gives the os.walk() path, not silence); and the dashboard's "Purge selected" and "Remove from warmed" buttons switch from the per-repository `/purge<prefix>` location to `/purge-raw`, checking both distinct keys obtained with `enable_dedup` on and off. This removes both old and current copies after a dedup toggle; an error for either key preserves the warmed record for retry. Identical keys are requested only once. With dedup enabled, manual purge also checks the canonical key resolved from the current package database, using the same duplicate groups as nginx-apply. Evicting that shared copy affects every repository using it; their next request can populate it again. This describes the current mapping after nginx reconciliation, not historical canonical keys after a mapping change. Changes to upstream, URL templates or `cache_key_version` require identifying the actual old keys separately. This switch is dashboard-only: the *automatic* hourly `warmed_retention_days` expiry (see above) always purges through the per-repository location regardless of this setting. |
 
 **Purge locations live in a separate included file.** When `enable_purge` is
@@ -274,10 +335,12 @@ you're generating the config manually with `nginx-render` (no `--policy`,
 no root), the purge locations print as a separate labeled block after the
 main config — save it to the path nginx will `include`.
 
-**How dedup works and its limits.** Only apt, pacman, dnf, and
-xbps packages carry a per-package SHA256 in their index today (apt's
+**How dedup works and its limits.** apt, pacman, dnf, and
+xbps packages carry a per-package SHA256 in their index (apt's
 `SHA256:` field, pacman's `%SHA256SUM%`, dnf's `<checksum type="sha256">`,
-xbps's `filename-sha256`) — apk's
+xbps's `filename-sha256`). Gentoo also participates when its index advertises
+`SHA256`; the inspected official binhost only advertises MD5/SHA1. Slackware's
+MD5 manifest is not used for SHA256 deduplication. apk's
 `APKINDEX` `C:` field is a different digest (SHA1, base64) that could never
 match a real cross-format duplicate, and apt-rpm's binary pkglist doesn't
 currently carry a verified whole-file digest; both are deliberately left out
@@ -330,6 +393,7 @@ included only if changing it takes effect immediately (no restart needed):
 `check_interval`, `event_retention_days`, `request_retention_days`,
 `warmed_retention_days`, `event_max_rows_per_repo`, `request_max_rows`,
 `prefetch_concurrency`, `check_concurrency`, `prefetch_bandwidth_limit`,
+`prefetch_bandwidth_timezone`, `prefetch_bandwidth_schedule`,
 `cache_base_url`, `public_cache_url`, `notify_after_failures`,
 `key_expiry_warning_days`.
 

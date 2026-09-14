@@ -209,6 +209,8 @@ class DiffResult:
 
 class StateStore:
     def __init__(self, db_path: str | Path):
+        from repowatch.bandwidth import BandwidthBudget
+        self.bandwidth = BandwidthBudget()
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:

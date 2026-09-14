@@ -11,12 +11,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import hashlib
-import time
 import urllib.parse
 
 import httpx
 
 from repowatch.config import Config, RepoConfig
+from repowatch.bandwidth import BandwidthLimiter
 from repowatch.notifications import record_failure_and_maybe_notify, record_success_and_maybe_notify
 from repowatch.parsers.base import USER_AGENT
 from repowatch.state import StateStore
@@ -27,35 +27,6 @@ logger = logging.getLogger(__name__)
 # accurate byte-level pacing, large enough not to flood syscalls.
 _CHUNK_SIZE = 64 * 1024
 
-
-class BandwidthLimiter:
-    """Paces the TOTAL warm-up bandwidth (bytes/sec), not request rate (not
-    a token bucket that accumulates "credit" — a hard ceiling, no bursts
-    after idling). Shared across all concurrent warm tasks — bounds the
-    aggregate rate independently of prefetch_concurrency (which only bounds
-    parallelism, not bandwidth).
-
-    Bytes, not requests: the size of warmed files varies by orders of
-    magnitude (a couple hundred bytes for a pacman .desc vs. hundreds of
-    megabytes for a debian .deb) — a requests/sec limit wouldn't protect the
-    actual bandwidth to upstream/the local nginx (see this field's history —
-    it used to be RateLimiter.acquire(), which counted requests)."""
-
-    def __init__(self, bytes_per_sec: float | None):
-        self._bytes_per_sec = bytes_per_sec
-        self._lock = asyncio.Lock()
-        self._next_allowed = time.monotonic()
-
-    async def consume(self, n_bytes: int) -> None:
-        if not self._bytes_per_sec or n_bytes <= 0:
-            return
-        async with self._lock:
-            now = time.monotonic()
-            wait = self._next_allowed - now
-            if wait > 0:
-                await asyncio.sleep(wait)
-                now = time.monotonic()
-            self._next_allowed = max(now, self._next_allowed) + (n_bytes / self._bytes_per_sec)
 
 
 def _apt_top_segment(repo: RepoConfig) -> str:
@@ -107,6 +78,8 @@ def _repo_url_prefix(repo: RepoConfig) -> str:
         # namespace by repo_id avoids mixing hosts/architectures that
         # happen to share a path.
         return f"/rpm/{urllib.parse.quote(repo.id, safe='')}"
+    if repo.type in ('gentoo', 'slackware'):
+        return f"/{repo.type}/{urllib.parse.quote(repo.id, safe='')}"
     if repo.type == "xbps":
         # Same reasoning as dnf above — Void mirrors/components (nonfree,
         # multilib, multilib/nonfree, debug) have no common upstream
@@ -197,14 +170,14 @@ async def warm_cache(
     the repo.prefetch check: a manual operator action shouldn't be blocked
     by the repository's automatic policy.
 
-    Warm-up speed is bounded by
-    config.effective_prefetch_bandwidth_limit(repo) (bytes/sec, a per-repo
-    override of the global prefetch_bandwidth_limit) — separate from
+    Warm-up speed is paced by the shared application bandwidth budget and
+    an additional per-repository ceiling. Manual and automatic operations
+    share this budget across threads and event loops — separate from
     prefetch_concurrency, which only bounds parallelism, not total
     bandwidth (you might want many concurrent connections without
     exceeding N bytes/sec in aggregate).
 
-    Banned packages (StateStore.prefetch_bans, by name, see api.py) are
+    Whitelist/blacklist patterns and exact bans are
     filtered out right here — a single point that behaves the same for
     automatic warming and force=True (manual warming does not bypass bans:
     if you really need to warm a banned package, unban it first).
@@ -224,23 +197,23 @@ async def warm_cache(
         logger.debug("prefetch disabled for %s, skipping", repo.id)
         return {}
 
-    banned = set(store.get_banned_packages(repo.id))
-    names = store.get_names(repo.id) if banned else {}
+    from repowatch.warming_policy import WarmingPolicy
+    policy = WarmingPolicy(repo, store)
 
     tasks: list[tuple[str, str, str]] = []
     for key, filename in new_packages.items():
         if not filename:
             logger.warning("%s: empty filename for package %s, cannot warm", repo.id, key)
             continue
-        if names.get(key) in banned:
-            logger.debug("%s: package %s is banned from warming, skipping", repo.id, key)
+        if not policy.allows(key):
+            logger.debug("%s: package %s is excluded by warming policy, skipping", repo.id, key)
             continue
         tasks.append((key, filename, _build_warm_url(config, repo, filename)))
 
     if not tasks:
         return {}
 
-    limiter = BandwidthLimiter(config.effective_prefetch_bandwidth_limit(repo))
+    limiter = store.bandwidth.limiter(config, repo)
     semaphore = asyncio.Semaphore(config.prefetch_concurrency)
     failed_keys: list[str] = []
     outcomes: dict[str, bool] = {}
@@ -398,12 +371,12 @@ async def _warm_one(
             received = 0
             async for chunk in resp.aiter_bytes(_CHUNK_SIZE):
                 received += len(chunk)
+                await limiter.consume(len(chunk))
                 if expected_size is not None and received > expected_size:
                     logger.warning("warm size exceeds metadata: %s", url)
                     return False, resp.status_code
                 if digest is not None:
                     digest.update(chunk)
-                await limiter.consume(len(chunk))
             if expected_size is not None and received != expected_size:
                 logger.warning("warm size mismatch: %s", url)
                 return False, resp.status_code

@@ -372,3 +372,28 @@ def test_real_nix_client_through_generated_nginx(tmp_path):
         if process is not None:
             process.terminate();process.wait(timeout=10)
         backend.shutdown();backend.server_close()
+
+
+@run_async
+async def test_nix_warming_lists_filter_roots_without_breaking_closure(tmp_path, monkeypatch):
+    r = repo(prefetch=False, prefetch_whitelist=['hello:*'], prefetch_blacklist=['*:dev', 'dependency:*'])
+    c = config(tmp_path, r); store = StateStore(c.state_db)
+    files = {'root': A+'.narinfo', 'blocked': B+'.narinfo'}
+    store.record_snapshot(RepoSnapshot(r.id, files, {'root': 'hello:out', 'blocked': 'hello:dev'}))
+    calls = []
+    def handler(request):
+        calls.append(str(request.url))
+        if request.url.path.endswith(A+'.narinfo'):
+            return httpx.Response(200, content=metadata(A, f'{B}-dependency'))
+        if request.url.path.endswith(B+'.narinfo'):
+            return httpx.Response(200, content=metadata(B))
+        return httpx.Response(200, content=b'archive')
+    client_factory(monkeypatch, handler)
+    assert await prefetch.warm_cache(c, r, store, files, force=True) == {'root': True}
+    assert any(B+'.nar' in url for url in calls)
+    assert len(store.get_nix_artifacts(r.id, 'root')) == 4
+    assert not store.get_nix_artifacts(r.id, 'blocked')
+    calls.clear()
+    blocked_repo = replace(r, prefetch_blacklist=['*'])
+    assert await prefetch.warm_cache(c, blocked_repo, store, files, force=True) == {}
+    assert not calls

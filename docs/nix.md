@@ -12,14 +12,20 @@ The service account must be able to use the Nix store or daemon, including
 adding source trees and evaluation results. `check-config` checks executable
 availability; it does not prove daemon permissions or evaluate a source.
 The standard repowatch installer and container image do not install Nix.
-Native integration tests currently exercise Nix 2.24.11.
+Native integration tests exercise Nix 2.24.11; production tests also passed
+with Ubuntu's Nix 2.18.1 daemon.
 
 For the supplied systemd unit, prefer a multi-user Nix daemon: the unit uses
 `ProtectSystem=strict` and cannot write directly to `/nix`. If Nix executables
 are installed under `/nix/var/nix/profiles/default/bin`, add that directory to
 the unit's PATH using a systemd override. A single-user Nix installation needs
 an explicit writable store override as well; repowatch does not weaken the
-unit's sandbox automatically. `ProtectHome=true` also hides user-home profiles.
+unit's sandbox automatically. `ProtectHome=true` also hides user-home profiles. Nix may
+inspect the account's home even with user config disabled. Give the dedicated
+service account a home accessible inside the sandbox, such as its existing
+`/var/lib/repowatch` state directory. On Ubuntu, membership in `nix-users`
+provides access to the daemon socket; restart repowatch after changing groups
+or the account home. Keep `ProtectHome` and `ProtectSystem` enabled.
 
 ```yaml
 repos:
@@ -69,7 +75,10 @@ that is a failed warm, retried on later checks even if the catalog is unchanged.
 Warming follows `.narinfo` references and fetches every dependency's metadata
 and NAR through nginx, plus `nix-cache-info`. Shared HTTP artifacts are fetched
 once per warm operation. Bandwidth and concurrency settings apply to artifact
-downloads. Bans select root entries; dependencies needed by an allowed root
+downloads. Nix warming shares the application bandwidth budget with other
+repository types; schedule windows and additional per-repository ceilings
+apply to its artifact downloads. Source evaluation and direct metadata
+discovery are outside that budget. Bans select root entries; dependencies needed by an allowed root
 are still fetched. A successful warm means the entire discovered closure was
 downloaded successfully, not merely its root metadata.
 

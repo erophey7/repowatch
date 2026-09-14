@@ -1,7 +1,7 @@
 # repowatch
 
 A lightweight, self-hosted "smart cache" for package repositories: Arch
-(pacman), Debian/Ubuntu (apt), Alpine (apk), Void (xbps), Nix, and RPM-based
+(pacman), Debian/Ubuntu (apt), Alpine (apk), Void (xbps), Gentoo binary packages, Slackware, Nix, and RPM-based
 distributions (RPM-MD: Rocky, Fedora, openSUSE, etc.). Unlike a plain caching proxy
 (apt-cacher-ng, pacoloco, and similar), repowatch actively watches upstream
 indexes on a schedule, can prefetch new packages ahead of any client
@@ -157,3 +157,6 @@ setup.
 ## License
 
 [MIT](LICENSE).
+
+See [Gentoo and Slackware repositories](docs/gentoo-slackware.md) for binhost and
+release/component setup, client URLs and signature limitations.

@@ -178,8 +178,8 @@ async def refresh_replacements(config: Config, repo: RepoConfig, store: StateSto
     pending = store.get_pending_replacements(repo.id)
     if not pending:
         return
-    banned = set(store.get_banned_packages(repo.id))
-    names = store.get_names(repo.id) if banned else {}
+    from repowatch.warming_policy import WarmingPolicy
+    policy = WarmingPolicy(repo, store)
     for item in pending:
         key = item['package_key']
         error = None
@@ -200,7 +200,7 @@ async def refresh_replacements(config: Config, repo: RepoConfig, store: StateSto
                 if results[key] not in ('purged', 'not_cached'):
                     error = results[key]
                     break
-        if error is None and item['filename'] and repo.prefetch and names.get(key) not in banned:
+        if error is None and item['filename'] and repo.prefetch and policy.allows(key):
             warmed = await warm_cache(
                 config, repo, store, {key: item['filename']},
                 expected_hashes={key: item['content_hash']} if item['content_hash'] else None)
@@ -360,6 +360,7 @@ async def run_forever(
     stop this loop after a bounded number of iterations instead of relying
     on an exception to unwind out of `while True`, the same pattern already
     used by supervisor.py's backup/nginx loops."""
+    store.bandwidth.bind(config_path)
     config = initial_config or load_config(config_path)
     logger.info(
         "repowatch started: %d repositories, default interval %ds (overridable per repo)",

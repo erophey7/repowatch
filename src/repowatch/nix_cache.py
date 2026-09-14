@@ -154,14 +154,14 @@ async def discover(client: httpx.AsyncClient, repo, root: str, cached: dict | No
 
 
 async def warm(config, repo, store, packages: dict[str, str], force: bool) -> dict[str, bool]:
-    from repowatch.prefetch import BandwidthLimiter, _build_warm_url, _warm_one
+    from repowatch.prefetch import _build_warm_url, _warm_one
     from repowatch.notifications import record_failure_and_maybe_notify, record_success_and_maybe_notify
     if not force and not repo.prefetch:
         return {}
     store.update_nix_trust(repo.id, repo.verify_signature, repo.nix_public_keys)
-    banned = set(store.get_banned_packages(repo.id))
-    names = store.get_names(repo.id)
-    limiter = BandwidthLimiter(config.effective_prefetch_bandwidth_limit(repo))
+    from repowatch.warming_policy import WarmingPolicy
+    policy = WarmingPolicy(repo, store)
+    limiter = store.bandwidth.limiter(config, repo)
     outcomes = {}
     discovered = {}
     signature_failed = False
@@ -171,7 +171,7 @@ async def warm(config, repo, store, packages: dict[str, str], force: bool) -> di
     async with httpx.AsyncClient() as client:
         cache_info_ok = None
         for key, filename in packages.items():
-            if names.get(key) in banned:
+            if not policy.allows(key):
                 continue
             ok, status = False, None
             try:

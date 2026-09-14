@@ -140,7 +140,7 @@ def test_disabled_purge_exposes_pending_without_warming_old_hit(tmp_path, monkey
     assert status_payload(path, store)[1]['r']['pending_replacements'] == 1
 
 
-@pytest.mark.parametrize('policy', ['disabled', 'banned', 'removed'])
+@pytest.mark.parametrize('policy', ['disabled', 'banned', 'removed', 'blacklisted', 'not-whitelisted'])
 def test_replacement_invalidates_without_overriding_warming_policy(tmp_path, monkeypatch, policy):
     store = StateStore(tmp_path / 'state')
     store.record_snapshot(snapshot('old.rpm'))
@@ -149,7 +149,9 @@ def test_replacement_invalidates_without_overriding_warming_policy(tmp_path, mon
         store.record_snapshot(RepoSnapshot('r'))
     if policy == 'banned':
         store.ban_package('r', 'foo')
-    repo = RepoConfig('r', 'dnf', 'https://mirror.test/repo', 'x86_64', prefetch=policy != 'disabled')
+    repo = RepoConfig('r', 'dnf', 'https://mirror.test/repo', 'x86_64', prefetch=policy != 'disabled',
+                      prefetch_blacklist=['f*'] if policy == 'blacklisted' else [],
+                      prefetch_whitelist=['bar*'] if policy == 'not-whitelisted' else [])
     config = Config(tmp_path / 'state', 300, 'http://cache.test', StatusServerConfig(), repos=[repo],
                     nginx=NginxConfig(enable_purge=True))
     calls = []
