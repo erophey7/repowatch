@@ -22,6 +22,7 @@ from repowatch.notifications import record_failure_and_maybe_notify, record_succ
 from repowatch.parsers import PARSERS
 from repowatch.parsers.base import IndexHeadResult
 from repowatch.prefetch import purge_removed, purge_selected, warm_cache
+from repowatch import cache_probe
 from repowatch.state import StateStore
 
 logger = logging.getLogger(__name__)
@@ -50,14 +51,15 @@ async def _check_key_expiry(config: Config, repo: RepoConfig, store: StateStore)
     "still failing" for that purpose: notify once when first crossed, once
     more on recovery (renewed past the threshold), silent in between.
     """
-    if repo.verify_signature and repo.type != "apk" and repo.keyring_path:
+    if repo.verify_signature and repo.type not in ("apk", "nix") and repo.keyring_path:
         expires_at = await asyncio.to_thread(soonest_key_expiry, repo.keyring_path)
     else:
         expires_at = None
     store.record_key_expiry(repo.id, expires_at)
 
     if expires_at is None:
-        await record_success_and_maybe_notify(config, store, repo.id, "key_expiry")
+        # Unknown expiry is not evidence of recovery. Preserve the streak
+        # until a known expiry outside the warning window is observed.
         return
     remaining_days = (datetime.fromisoformat(expires_at) - datetime.now(timezone.utc)).days
     if remaining_days < config.key_expiry_warning_days:
@@ -91,11 +93,12 @@ async def check_repo(config: Config, repo: RepoConfig, store: StateStore) -> Non
             )
             head = IndexHeadResult(unchanged=False, etag=None, last_modified=None)
 
-        # Signed APK indexes are reverified each cycle: an unchanged HTTP
+        # Signed indexes are reverified each cycle: an unchanged HTTP
         # validator says nothing about changed local trust keys/backend. This
         # also covers enabling verification over an existing unsigned snapshot.
-        if head.unchanged and not (repo.type == 'apk' and repo.verify_signature):
+        if head.unchanged and not repo.verify_signature:
             store.touch_last_check(repo.id)
+            await refresh_replacements(config, repo, store)
             logger.debug(
                 "%s: index unchanged (ETag/Last-Modified), download skipped", repo.id
             )
@@ -125,21 +128,38 @@ async def check_repo(config: Config, repo: RepoConfig, store: StateStore) -> Non
     # by hand: failure_state stayed untouched after a successful cycle).
     # reset_failure is a cheap SELECT with no write for repositories that
     # never had a streak.
-    await record_success_and_maybe_notify(config, store, repo.id, "gpg")
+    if repo.type != "nix":
+        await record_success_and_maybe_notify(config, store, repo.id, "gpg")
 
     diff = store.record_snapshot(
         snapshot, index_etag=head.etag, index_last_modified=head.last_modified
     )
+
+    await refresh_replacements(config, repo, store)
+
+    if repo.type == 'nix':
+        store.update_nix_trust(repo.id, repo.verify_signature, repo.nix_public_keys)
+        # A missing binary or failed artifact needs a retry even if the source
+        # catalog has not changed. Successful roots retain normal warm policy.
+        warmed = {item['package_key']: item['status'] for item in store.get_warmed_packages(repo.id)}
+        retry = {key: filename for key, filename in snapshot.packages.items() if warmed.get(key) != 'ok'}
+        await warm_cache(config, repo, store, retry)
+        if diff.removed_packages and config.nginx.enable_purge:
+            from repowatch.nix_cache import purge
+            await purge(config, repo, store, diff.removed_filenames)
+        logger.info('%s: Nix catalog checked (%d outputs, changed=%s)', repo.id, len(snapshot.packages), diff.changed)
+        return
 
     if not diff.changed:
         logger.debug("%s: no changes (%d packages)", repo.id, len(snapshot.packages))
         return
 
     logger.info(
-        "%s: changes — %d new, %d removed",
+        "%s: changes — %d new, %d removed, %d modified",
         repo.id,
         len(diff.new_packages),
         len(diff.removed_packages),
+        len(diff.modified_packages),
     )
 
     if diff.new_packages:
@@ -151,6 +171,44 @@ async def check_repo(config: Config, repo: RepoConfig, store: StateStore) -> Non
         # no-op unless nginx.enable_purge is set (see purge_removed), so
         # this doesn't change behavior for any config that hasn't opted in.
         await purge_removed(config, repo, diff.removed_filenames)
+
+
+async def refresh_replacements(config: Config, repo: RepoConfig, store: StateStore) -> None:
+    """Retry replacements even on unchanged indexes; never warm over an unpurged HIT."""
+    pending = store.get_pending_replacements(repo.id)
+    if not pending:
+        return
+    banned = set(store.get_banned_packages(repo.id))
+    names = store.get_names(repo.id) if banned else {}
+    for item in pending:
+        key = item['package_key']
+        error = None
+        if not config.nginx.enable_purge:
+            error = 'replacement requires nginx.enable_purge; cache refresh is pending'
+        else:
+            for target_id, filename in item['targets']:
+                if target_id != repo.id and not config.nginx.enable_dedup:
+                    continue
+                if not filename:
+                    continue
+                target = config.repo_by_id(target_id)
+                if target is None:
+                    error = 'replacement purge target is unavailable'
+                    break
+                purge = cache_probe.purge_selected_raw if config.nginx.enable_cache_probe else purge_selected
+                results = await purge(config, target, {key: filename})
+                if results[key] not in ('purged', 'not_cached'):
+                    error = results[key]
+                    break
+        if error is None and item['filename'] and repo.prefetch and names.get(key) not in banned:
+            warmed = await warm_cache(
+                config, repo, store, {key: item['filename']},
+                expected_hashes={key: item['content_hash']} if item['content_hash'] else None)
+            if not warmed or not warmed.get(key):
+                error = 'replacement warm failed; retry on next check'
+        if error:
+            logger.warning('%s: %s: %s', repo.id, key, error)
+        store.finish_replacement(repo.id, key, item['revision'], error)
 
 
 def _is_due(config: Config, repo: RepoConfig, store: StateStore) -> bool:
@@ -220,8 +278,12 @@ async def _purge_and_unwarm_stale(
         if repo is None:
             store.remove_warmed_packages(repo_id, list(items))
             continue
-        results = await purge_selected(config, repo, items)
-        resolved = [key for key, outcome in results.items() if outcome in ("purged", "not_cached")]
+        if repo.type == 'nix':
+            from repowatch.nix_cache import purge
+            results = await purge(config, repo, store, items)
+        else:
+            results = await purge_selected(config, repo, items)
+        resolved = [key for key, outcome in results.items() if outcome in ("purged", "not_cached", "retained_shared")]
         if resolved:
             store.remove_warmed_packages(repo_id, resolved)
         errored = len(items) - len(resolved)

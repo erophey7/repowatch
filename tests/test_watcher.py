@@ -557,3 +557,63 @@ def test_check_repo_resets_gpg_failure_after_success_even_without_verify_signatu
 
     # the streak is fully reset — the next failure starts the count at 1 again
     assert store.bump_failure("r", "gpg", "peek") == (1, False)
+
+
+def test_signed_unchanged_indexes_are_reverified_after_trust_changes(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+    for kind, extra in [('pacman', {'repo_name': 'core'}),
+                        ('apt', {'distribution': 'stable', 'component': 'main'}),
+                        ('dnf', {}), ('apt-rpm', {'component': 'classic'})]:
+        store = StateStore(tmp_path / f'{kind}.sqlite3')
+        repo = RepoConfig('r', kind, 'https://example.org/repo', 'x86_64',
+                          verify_signature=True, keyring_path='/missing/keyring', **extra)
+        store.record_snapshot(RepoSnapshot('r', {'foo-1': 'foo.pkg'}), index_etag='same')
+        before = store.get_status('r')['last_check']
+        parser = watcher.PARSERS[kind]
+        fetch = AsyncMock(side_effect=SignatureError('keyring changed'))
+        with monkeypatch.context() as patcher:
+            patcher.setattr(parser, 'check_index_changed', AsyncMock(return_value=IndexHeadResult(True, 'same', None)))
+            patcher.setattr(parser, 'fetch', fetch)
+            patcher.setattr(watcher, 'soonest_key_expiry', lambda _: None)
+            asyncio.run(check_repo(_config(repos=[repo]), repo, store))
+        assert fetch.await_count == 1
+        assert store.get_status('r')['last_check'] == before
+        assert store.get_packages('r') == {'foo-1': 'foo.pkg'}
+        assert store.bump_failure('r', 'gpg', 'peek') == (2, False)
+
+
+def test_unknown_key_expiry_does_not_report_recovery(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+    store = StateStore(tmp_path / 'state.sqlite3')
+    repo = RepoConfig('r', 'pacman', 'https://example.org', 'x86_64',
+                      repo_name='core', verify_signature=True, keyring_path='/missing')
+    store.bump_failure('r', 'key_expiry', 'expiring')
+    store.mark_failure_notified('r', 'key_expiry')
+    sent = AsyncMock(return_value=True)
+    monkeypatch.setattr('repowatch.notifications._send', sent)
+    monkeypatch.setattr(watcher, 'soonest_key_expiry', lambda _: None)
+    config = _config(repos=[repo], notify_webhook_url='https://example.org/webhook')
+    asyncio.run(watcher._check_key_expiry(config, repo, store))
+    sent.assert_not_called()
+    assert store.bump_failure('r', 'key_expiry', 'peek') == (2, True)
+    future = (datetime.now(timezone.utc) + timedelta(days=200)).isoformat()
+    monkeypatch.setattr(watcher, 'soonest_key_expiry', lambda _: future)
+    asyncio.run(watcher._check_key_expiry(config, repo, store))
+    assert sent.call_args.args[1]['status'] == 'recovered'
+
+
+def test_first_failed_check_has_no_success_timestamp_and_remains_due(tmp_path, monkeypatch):
+    from repowatch.api import _repo_staleness
+    store = StateStore(tmp_path / 'state.sqlite3')
+    repo = RepoConfig('r', 'pacman', 'https://example.org', 'x86_64', repo_name='core')
+    config = _config(repos=[repo])
+    monkeypatch.setitem(watcher.PARSERS, 'pacman', _SignatureErrorParser)
+    asyncio.run(check_repo(config, repo, store))
+    assert store.get_status('r')['last_check'] is None
+    assert store.get_repo_summaries()['r']['last_check'] is None
+    assert _is_due(config, repo, store)
+    assert not _repo_staleness(config, store)
+    monkeypatch.setitem(watcher.PARSERS, 'pacman', _SucceedingParser)
+    asyncio.run(check_repo(config, repo, store))
+    assert store.get_status('r')['last_check']
+    assert not _is_due(config, repo, store)

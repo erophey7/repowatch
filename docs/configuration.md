@@ -37,7 +37,7 @@ example config and edit it (see the main README's Quick start).
 | `admin_password_hash` | string or `null` | `null` | PBKDF2 hash of the dashboard admin password. Generate it with `repowatch hash-password` — see [Setting the admin password](#setting-the-admin-password). Until this is set, the dashboard and administrative API are closed. |
 | `notify_webhook_url` | URL or `null` | `null` | Webhook for notifications about repeated warm-up/signature-verification failures — a generic JSON POST with a `text` field, the format Slack and Mattermost incoming webhooks read directly. **Discord's own webhook endpoint does not read `text` at all** (it expects `content`) — point this at Discord's separate Slack-compatible endpoint instead, `https://discord.com/api/webhooks/<id>/<token>/slack`, not the plain webhook URL Discord's UI gives you by default. Treat this as a secret (the URL itself is a bearer token): it is **not** exposed through `GET /api/config` or the dashboard, only editable by hand in `config.yaml`. |
 | `notify_after_failures` | int | `3` | How many *consecutive* failures (per repository, per failure kind — signature verification or warm-up) before sending a notification. Fires once at the threshold and once on recovery, not on every failure. |
-| `key_expiry_warning_days` | int | `30` | Warning window before the earliest expiry in a GPG keyring, for repositories with `verify_signature: true`. Requires the full `gpg` binary; without it expiry is unknown, while `gpgv` verification continues normally. Exposed in the dashboard and the `repowatch_repo_key_expiring_soon` / `repowatch_repo_key_expires_at_timestamp_seconds` metrics. Webhook notification uses `kind="key_expiry"` and fires after `notify_after_failures` consecutive checks within the window (third by default), then once on recovery after a delivered warning. Does not apply to apk or xbps. |
+| `key_expiry_warning_days` | int | `30` | Warning window before the earliest expiry in a GPG keyring, for repositories with `verify_signature: true`. Requires the full `gpg` binary; without it expiry is unknown, while `gpgv` verification continues normally. Exposed in the dashboard and the `repowatch_repo_key_expiring_soon` / `repowatch_repo_key_expires_at_timestamp_seconds` metrics. Webhook notification uses `kind="key_expiry"` and fires after `notify_after_failures` consecutive checks within the window (third by default), then once on recovery after a delivered warning. An unknown expiry does not clear the warning streak or send recovery; recovery requires a known expiry outside the window. Does not apply to apk, xbps, or nix. |
 | `status_server` | mapping | — | See [`status_server`](#status_server). |
 | `syslog_listener` | mapping | — | See [`syslog_listener`](#syslog_listener). |
 | `nginx` | mapping | — | See [`nginx`](#nginx). |
@@ -53,17 +53,22 @@ and adding a new one; there's no rename.
 | Field | Type | Default | Applies to | Notes |
 |---|---|---|---|---|
 | `id` | string | — (required) | all | Stable identifier. Immutable in practice — see above. |
-| `type` | `pacman` \| `apt` \| `apk` \| `dnf` \| `apt-rpm` \| `xbps` | — (required) | all | Selects the index parser. `dnf` covers any RPM-MD repository (Rocky, Fedora, openSUSE, …), not just Fedora/DNF-branded ones. `apt-rpm` is for ALT Linux-style apt-over-RPM repositories, not RPM-MD. `xbps` is Void Linux; it requires the system `zstd` binary (see the README) and does not support `verify_signature`. |
+| `type` | `pacman` \| `apt` \| `apk` \| `dnf` \| `apt-rpm` \| `xbps` \| `nix` | — (required) | all | Selects the index parser. `dnf` covers any RPM-MD repository (Rocky, Fedora, openSUSE, …), not just Fedora/DNF-branded ones. `apt-rpm` is for ALT Linux-style apt-over-RPM repositories, not RPM-MD. `xbps` is Void Linux; it requires the system `zstd` binary (see the README) and does not support `verify_signature`. |
 | `upstream` | URL | — (required) | all | The real upstream mirror address. repowatch's own index checks go straight here; warm-up requests go through `cache_base_url` instead (see architecture note in the README). |
-| `arch` | string | — (required) | all | Target architecture (`x86_64`, `amd64`, `i686`, `noarch`, …). One `RepoConfig` = one architecture; to mirror multiple architectures of the same repository, add multiple entries (see `group` below for grouping them visually). |
+| `arch` | string | — (required) | all | Target architecture (Nix uses `x86_64-linux` or `aarch64-linux`; otherwise `x86_64`, `amd64`, `i686`, `noarch`, …). One `RepoConfig` = one architecture; to mirror multiple architectures of the same repository, add multiple entries (see `group` below for grouping them visually). |
 | `prefetch` | bool | `true` | all | Whether repowatch actively warms new packages into the cache. Set `false` for repositories you only want indexed/tracked in `status.json` without eagerly pulling every new package (useful for very large or rarely-used repos). |
 | `repo_name` | string | — (required for `pacman`) | pacman | e.g. `core`, `extra`, `community`. |
 | `distribution` | string | — (required for `apt`) | apt | e.g. `bookworm`, `jammy`, `noble-updates`. |
 | `component` | string | — (required for `apt`, `apt-rpm`) | apt, apt-rpm | e.g. `main`, `contrib`, `non-free`. For `apt-rpm` it must match `[A-Za-z0-9_-]+` (e.g. `classic`, `checkinstall`). |
-| `verify_signature` | bool | `false` | apt, pacman, dnf, apt-rpm, apk | Enables GPG (or, for apk, RSA) verification of the index before it's parsed. See per-type key fields below. |
+| `verify_signature` | bool | `false` | apt, pacman, dnf, apt-rpm, apk, nix | Enables index signature verification, or Nix closure metadata signature verification during warming. See per-type key fields below. |
 | `keyring_path` | path or `null` | `null` | apt, pacman, dnf, apt-rpm | Path to an **exported keyring** (`gpg --export ... > keyring.gpg`), not a `.asc`/armored key file. Required when `verify_signature: true` for these types. |
 | `apk_signature_backend` | `openssl` \| `apk-tools` | `openssl` | apk | Which system tool performs the embedded-RSA signature check (apk uses its own scheme, not OpenPGP — `keyring_path`/`gpgv` don't apply to it). |
 | `apk_keys_dir` | path or `null` | `null` | apk | Directory of trusted apk public keys (the same format/layout as `/etc/apk/keys`). Required when `verify_signature: true` for apk. |
+| `nix_source` | HTTP(S) URL or `null` | `null` | nix | Required source tarball containing a Nix expression, normally a nixpkgs channel. See [Nix repositories](nix.md). |
+| `nix_attributes` | list of attribute paths | `[]` | nix | Selected packages/subtrees, such as `[hello, jq]`. Empty evaluates the complete available catalog for the selected system. |
+| `nix_public_keys` | list of `name:base64` keys | `[]` | nix | Trusted Ed25519 public keys; required when `verify_signature: true`. |
+| `nix_timeout` | positive int (seconds) | `600` | nix | Timeout for each CLI invocation, including source resolution and signature batches. |
+| `nix_max_paths` | positive int | `500000` | nix | Maximum catalog outputs and maximum store paths in any one dependency closure. |
 | `check_interval` | int (seconds) or `null` | `null` | all | Per-repository override of the top-level `check_interval`. `null` means "use the global value". |
 | `prefetch_bandwidth_limit` | float (bytes/sec) or `null` | `null` | all | Per-repository override of the top-level `prefetch_bandwidth_limit`. `null` means "use the global value" (which may itself be unlimited). |
 | `group` | string or `null` | `null` | all | Free-text label for grouping repositories in the dashboard into collapsible sections. Purely cosmetic — no validation, any string is allowed, and it isn't tied to `type`/distribution automatically. Repositories without a group show up under "Ungrouped". |
@@ -71,6 +76,13 @@ and adding a new one; there's no rename.
 | `url_variables` | mapping (string → string) | `{}` | all | Extra substitution values for `url_template`. |
 
 ### Signature verification: what's actually checked
+
+- **Nix**: while warming, Nix CLI verifies the downloaded `.narinfo` signatures
+  against `nix_public_keys`, including dependency metadata. Signatures cover
+  store identity, NAR hash/size and references, not compressed `FileHash`.
+  Downloads are checked against advertised `FileHash`/`FileSize` when present;
+  final NAR content verification remains with the consuming Nix client.
+  A catalog check without warming does not verify binary-cache signatures.
 
 - **apt**: the `InRelease` (or detached `Release`/`Release.gpg`) file is
   checked with `gpgv` against `keyring_path`. `Packages.gz`'s checksum is
@@ -95,14 +107,22 @@ and adding a new one; there's no rename.
   `apk_signature_backend: apk-tools`. There is no plain-OpenPGP option for
   apk — `keyring_path` is not used here.
 - **xbps** (Void Linux): `verify_signature: true` is rejected at config
-  time. Unlike every other type here, XBPS repositories don't publish a
+  time. XBPS repositories don't publish a
   signed index at all (`<arch>-repodata` has no accompanying `.sig`/`.sig2`
   upstream); trust instead comes from a per-*package* RSA signature
   (`<file>.xbps.sig2`), checked by the real `xbps` client at install time —
   a different shape of verification (per package, at warm-time) that isn't
   implemented yet.
 
-A repository with `verify_signature: true` and a missing/wrong keyring or
+Signed indexes are downloaded and reverified on every check, even when HEAD
+returns an unchanged ETag or Last-Modified. This makes local key changes
+and enabling verification effective without waiting for upstream changes;
+it costs a full index download per check. Unsigned repositories retain the
+HEAD optimization for index-based formats. Nix evaluates its configured
+source on every check and verifies binary metadata during warming, as
+described above.
+
+An index-based repository with `verify_signature: true` and a missing/wrong keyring or
 key is not silently skipped — the check fails, the last good snapshot is
 kept, and the failure is counted for `notify_after_failures` (a webhook
 fires once the consecutive-failure threshold is reached). `/healthz`
@@ -116,6 +136,12 @@ considered stale — that's an expected state, not a failure", the same rule
 that also covers a brand-new repository nobody's checked yet). For
 persistent from-the-start failures, `notify_after_failures` is the signal
 that actually fires — don't rely on `/healthz` alone to catch that case.
+
+For Nix, a successful catalog evaluation can coexist with failed binary
+signature checks during warming. Such failures mark the warm attempt as
+failed and contribute to the signature notification streak; they do not
+roll back the evaluated catalog. `/healthz` catalog freshness therefore does
+not establish that Nix closures have been warmed or verified successfully.
 
 ## `url_template` / `url_variables`
 
@@ -233,7 +259,7 @@ config actually serves them.
 | `cache_dir` | path or `null` | `null` | **Read-only/informational** — the actual cache directory nginx writes to is set once, at install time, in the root-owned `policy.json` (see `CACHE_DIR` in [deployment.md](deployment.md)), not here. Setting this makes the path visible in `config.yaml` instead of hidden inside a file the service user can't read; `nginx-apply` cross-checks it against `policy.json` and refuses to apply on a mismatch, so it can't silently go stale. To actually change the cache directory: `sudo make install CACHE_DIR=... && sudo make activate` (stop the repowatch services/timers first). Setting it also unlocks the cache directory's size in `repowatch stats --cache-dir` and the dashboard's Storage panel ("Calculate cache directory size") — without it there is no path to walk, so that number is simply omitted rather than guessed at or defaulted to zero. **A real permissions caveat, found on a live deployment**: nginx creates `proxy_cache_path`'s `levels=1:2` subdirectories `0700`, owned by the nginx worker user (e.g. `www-data`) — regardless of the top-level `cache_dir`'s own mode. repowatch deliberately runs as a separate, unprivileged service user (not the nginx worker's), so on most real installs it can list the top-level directory but cannot descend into any of the hashed subdirectories at all. When that happens the reported size is a real undercount, but it is never silently wrong: the result includes `inaccessible_directories` (CLI prints a `WARNING`, the dashboard shows it in red) whenever this happens, so a permission wall doesn't read as "the cache is empty". Turning on `enable_cache_probe` below sidesteps this permission gap entirely (the scan runs inside the nginx worker itself, not as the repowatch service user) — see its own row for what that trades off instead. |
 | `enable_purge` | bool | `false` | Actively evict a package's cache entry the moment it disappears from the upstream index, instead of waiting for `inactive`/`max_size` to notice on their own. Requires the third-party `ngx_cache_purge` nginx module (Debian/Ubuntu: `libnginx-mod-http-cache-purge`; Arch: `nginx-mod-cache_purge`) — **not** the nginx-plus `proxy_cache_purge on` API, and not a real `PURGE` HTTP method (nginx core rejects unknown methods outright); the generator instead adds a dedicated, loopback-only `GET /purge<prefix>/...` location per repository. You must separately add `load_module ".../ngx_http_cache_purge_module.so";` to your own main `nginx.conf` — that's a main-context directive the generated file (which lives inside `http{}`/`sites-enabled`) can't emit itself. Without the module loaded, `nginx -t` fails clearly during `nginx-apply` and the usual atomic rollback applies — it doesn't silently do nothing. When it's on, the dashboard's per-repository panel also gets a "Cache purge (stale warmed entries)" section: "Scan for stale entries" computes candidates from repowatch's own records only (no nginx/network call), then "Purge selected" is the only point that actually asks nginx — its 200/404 response IS the "was this cached" answer, so there's no separate non-destructive pre-check (a normal HEAD/GET on a cache miss can fetch and populate the object, so it is not a read-only existence check; nginx normally converts HEAD to GET for caching via [proxy_cache_convert_head](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_cache_convert_head)). If `enable_cache_probe` is *also* on, "Purge selected" and un-warming go through that instead — see its own row below. |
 | `enable_dedup` | bool | `false` | When two DIFFERENT repositories publish the byte-identical file (e.g. the same binary package shipped by both Debian and Ubuntu), serve and cache it once instead of twice. Detected from a per-package SHA256 that apt/pacman/dnf/xbps indexes already publish — apk and apt-rpm packages never participate (see below). No extra download or storage of file content is needed; only the already-parsed index metadata is compared. |
-| `enable_cache_probe` | bool | `false` | Read-only cache introspection running *inside the nginx worker itself*, via the third-party `ngx_http_js_module` (njs) — Debian/Ubuntu: `libnginx-mod-http-js`; Arch: `nginx-mod-njs`. Same `load_module` caveat as `enable_purge` (a main-context directive the generated file can't emit itself). Solves a real permission problem: repowatch's own unprivileged process cannot read `proxy_cache_path`'s `0700`-owned subdirectories (see `cache_dir`'s own caveat above), but nginx's worker already owns them — so a small njs script running there can. Adds two loopback-only endpoints (`/cache-probe?key=...`: does this exact package's cache entry exist right now — a genuine non-destructive check, unlike asking via purge; `/cache-scan?dir=<a>/<bb>`: list one of the 4096 fixed leaf directories nginx's cache tree always has, together with each file's real on-disk key) and, when `enable_purge` is *also* on, one more: `/purge-raw?key=...` — evicts an arbitrary already-known key regardless of whether any current repository route still exists for it (the only way to clean up a repository removed from `config.yaml` whose files are still on disk). Two concrete effects on other features when this is on: the dashboard's "Calculate cache directory size" / `repowatch stats --cache-dir` use this instead of `os.walk()` — no `cache_dir` needed, no permission undercount (though a single leaf directory can still fail to respond on its own, e.g. a transient timeout; when that happens the result carries `incomplete_leaves`, the same "you can see it's an undercount" signal `inaccessible_directories` gives the os.walk() path, not silence); and the dashboard's "Purge selected" and "Remove from warmed" buttons switch from the per-repository `/purge<prefix>` location to `/purge-raw`, checking both distinct keys obtained with `enable_dedup` on and off. This removes both old and current copies after a dedup toggle; an error for either key preserves the warmed record for retry. Identical keys are requested only once. Changes to upstream, URL templates or `cache_key_version` require identifying the actual old keys separately. This switch is dashboard-only: the *automatic* hourly `warmed_retention_days` expiry (see above) always purges through the per-repository location regardless of this setting. |
+| `enable_cache_probe` | bool | `false` | Read-only cache introspection running *inside the nginx worker itself*, via the third-party `ngx_http_js_module` (njs) — Debian/Ubuntu: `libnginx-mod-http-js`; Arch: `nginx-mod-njs`. Same `load_module` caveat as `enable_purge` (a main-context directive the generated file can't emit itself). Solves a real permission problem: repowatch's own unprivileged process cannot read `proxy_cache_path`'s `0700`-owned subdirectories (see `cache_dir`'s own caveat above), but nginx's worker already owns them — so a small njs script running there can. Adds two loopback-only endpoints (`/cache-probe?key=...`: does this exact package's cache entry exist right now — a genuine non-destructive check, unlike asking via purge; `/cache-scan?dir=<a>/<bb>`: list one of the 4096 fixed leaf directories nginx's cache tree always has, together with each file's real on-disk key) and, when `enable_purge` is *also* on, one more: `/purge-raw?key=...` — evicts an arbitrary already-known key regardless of whether any current repository route still exists for it (the only way to clean up a repository removed from `config.yaml` whose files are still on disk). Two concrete effects on other features when this is on: the dashboard's "Calculate cache directory size" / `repowatch stats --cache-dir` use this instead of `os.walk()` — no `cache_dir` needed, no permission undercount (though a single leaf directory can still fail to respond on its own, e.g. a transient timeout; directory I/O errors also return HTTP 500 rather than an empty list; when a scan is partial the result carries `incomplete_leaves`, the same "you can see it's an undercount" signal `inaccessible_directories` gives the os.walk() path, not silence); and the dashboard's "Purge selected" and "Remove from warmed" buttons switch from the per-repository `/purge<prefix>` location to `/purge-raw`, checking both distinct keys obtained with `enable_dedup` on and off. This removes both old and current copies after a dedup toggle; an error for either key preserves the warmed record for retry. Identical keys are requested only once. With dedup enabled, manual purge also checks the canonical key resolved from the current package database, using the same duplicate groups as nginx-apply. Evicting that shared copy affects every repository using it; their next request can populate it again. This describes the current mapping after nginx reconciliation, not historical canonical keys after a mapping change. Changes to upstream, URL templates or `cache_key_version` require identifying the actual old keys separately. This switch is dashboard-only: the *automatic* hourly `warmed_retention_days` expiry (see above) always purges through the per-repository location regardless of this setting. |
 
 **Purge locations live in a separate included file.** When `enable_purge` is
 on, the generated `active.conf` doesn't inline the purge locations among the
@@ -248,7 +274,7 @@ you're generating the config manually with `nginx-render` (no `--policy`,
 no root), the purge locations print as a separate labeled block after the
 main config — save it to the path nginx will `include`.
 
-**How dedup works, and its one real limitation.** Only apt, pacman, dnf, and
+**How dedup works and its limits.** Only apt, pacman, dnf, and
 xbps packages carry a per-package SHA256 in their index today (apt's
 `SHA256:` field, pacman's `%SHA256SUM%`, dnf's `<checksum type="sha256">`,
 xbps's `filename-sha256`) — apk's
@@ -256,8 +282,9 @@ xbps's `filename-sha256`) — apk's
 match a real cross-format duplicate, and apt-rpm's binary pkglist doesn't
 currently carry a verified whole-file digest; both are deliberately left out
 rather than guessed at, since a false match would mean serving one
-package's bytes under a different package's name. When a match is found
-across two repos, the alphabetically-first `repo_id` is treated as
+package's bytes under a different package's name. A match requires both identical `filename` (including its relative path)
+and identical SHA256; equal bytes under different filenames are not merged.
+When a match is found across two repos, the alphabetically-first `repo_id` is treated as
 canonical; every other repo serving that same file gets an internal nginx
 rewrite (`map`/`if`/`rewrite ... last`, generated in `dedup.map`, the same
 included-sub-config pattern as `purge.conf` above) to the canonical repo's
@@ -363,3 +390,70 @@ repowatch check-config              # or: repowatch -c path/to/config.yaml check
 Validates the file and exits — it does not create `state_db`, connect to any
 network, or otherwise touch disk beyond reading `config.yaml` itself. Use
 this in CI or before rolling out a config change.
+
+## Failed operations and cache observations
+
+Automatic warming runs for newly detected package keys. A failed initial attempt is
+recorded, but an unchanged index does not schedule a retry of that new package;
+use manual warming to retry. Purge triggered by removed packages logs failures
+without maintaining a retry queue. Hourly warmed retention is a separate
+mechanism, not a guaranteed retry of that removal.
+
+Warmed records describe attempts and observed client requests, not a permanent
+guarantee that the file remains on disk. For cache scans, `unreadable_keys`
+counts entries that cannot be identified, while `unreadable_sizes` counts
+files missing from the byte total because stat failed. A successful stat
+preserves the size even when reading the key fails. `incomplete_leaves`
+counts whole directories whose scan request failed. Missing directories
+(ENOENT) are empty; other filesystem errors are not treated as absence.
+
+The njs scan reads cache-key headers in 4 KiB blocks, stopping at the complete
+key line or a hard limit of 64 KiB per file. One 64 KiB buffer is reused per
+leaf request; package size no longer determines the read buffer size. Missing,
+truncated, or oversized key headers produce an entry error (`unreadable_keys`),
+while a successful stat still contributes the file size. This requires njs
+0.7.7 or newer for its descriptor-based filesystem API. Filesystem operations
+remain synchronous inside nginx workers: a slow NFS operation or a directory
+with many entries can still delay client requests.
+Same-version replacements are handled separately as described below.
+
+## Same-version package replacements
+
+An existing name-version key is reported as `modified` when its filename
+changes, or when a known SHA256 changes to another known SHA256. A hash
+becoming known or unavailable is only a metadata update. History includes
+`modified_packages` separately from `new_packages` and `removed_packages`;
+`changed_at` advances for replacements too.
+
+Replacement work is saved in SQLite in the same transaction as the snapshot.
+The previous warmed record is removed because it does not confirm the new
+bytes. With `nginx.enable_purge`, the watcher invalidates the old and new
+filenames before warming the replacement. When dedup is enabled, recorded
+previous canonical locations are invalidated too; this can evict shared copies.
+Warming still respects `prefetch` and package bans. If warming is disabled,
+successful invalidation completes the operation without downloading a package.
+If a pending package disappears from the index, its stored purge targets are
+retained for cleanup, with no subsequent warming.
+
+A purge error prevents warming. A download error or SHA256 mismatch also
+keeps the operation pending. If the index supplies SHA256, replacement
+warming checks the actual response bytes against it; without SHA256 only
+successful invalidation and the HTTP download can be checked. Pending work
+survives restart and is retried on subsequent successful index checks,
+including unchanged HEAD results. A later replacement preserves earlier
+purge targets and cannot be cleared by completion of an older operation.
+This retry behavior is specific to replacements, not initial warming.
+
+With purge disabled, replacement detection and history still work, but cache
+refresh stays pending and no replacement warm is attempted. Enable purge to
+allow the watcher to finish invalidation. `pending_replacements` in the
+status API and repository list counts unfinished operations; the dashboard
+shows a warning. Zero means no tracked replacement remains, not that every
+package is currently cached. `/healthz` continues to measure index freshness.
+Historical nginx routing changes can leave purge targets that the current
+configuration cannot resolve; those remain pending for operator investigation.
+
+Existing databases gain the history field with an empty-list default and a
+pending-work table on startup. Back up the database before upgrading. Old
+history remains readable; restoring an earlier release should use the matching
+pre-upgrade database backup as described in deployment.md.

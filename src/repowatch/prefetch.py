@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import hashlib
 import time
 import urllib.parse
 
@@ -126,6 +127,8 @@ def _repo_url_prefix(repo: RepoConfig) -> str:
         # the same pool/, and there's nothing to be done about that (see
         # CLAUDE.md/ROADMAP).
         return f"{_apt_top_segment(repo)}/pool/{repo.component}"
+    if repo.type == "nix":
+        return f"/nix/{repo.id}"
     if repo.type == "apk":
         # upstream already includes version+component (e.g.
         # ".../alpine/v3.20/main") — this path segment is also needed in
@@ -171,7 +174,8 @@ async def warm_cache(
     store: StateStore,
     new_packages: dict[str, str],
     force: bool = False,
-) -> None:
+    *, expected_hashes: dict[str, str] | None = None,
+) -> dict[str, bool]:
     """Hit the local cache for each new package — in parallel
     (asyncio.Semaphore(config.prefetch_concurrency)), since on the first
     full warm of repositories like arch-extra/debian the count of new
@@ -205,13 +209,20 @@ async def warm_cache(
     automatic warming and force=True (manual warming does not bypass bans:
     if you really need to warm a banned package, unban it first).
 
+    Returns attempted package keys mapped to success. expected_hashes, when
+    supplied for replacements, verifies the downloaded bytes before success
+    is recorded. Skipped packages are absent from the result.
+
     If this run had at least one failure, it bumps the "repeated warm
     failure" streak used for webhook notifications (see notifications.py);
     a run with zero failures resets the streak.
     """
+    if repo.type == 'nix':
+        from repowatch.nix_cache import warm
+        return await warm(config, repo, store, new_packages, force)
     if not force and not repo.prefetch:
         logger.debug("prefetch disabled for %s, skipping", repo.id)
-        return
+        return {}
 
     banned = set(store.get_banned_packages(repo.id))
     names = store.get_names(repo.id) if banned else {}
@@ -227,17 +238,23 @@ async def warm_cache(
         tasks.append((key, filename, _build_warm_url(config, repo, filename)))
 
     if not tasks:
-        return
+        return {}
 
     limiter = BandwidthLimiter(config.effective_prefetch_bandwidth_limit(repo))
     semaphore = asyncio.Semaphore(config.prefetch_concurrency)
     failed_keys: list[str] = []
+    outcomes: dict[str, bool] = {}
 
     async def _run(client: httpx.AsyncClient, task: tuple[str, str, str]) -> None:
         key, filename, url = task
         async with semaphore:
-            ok, http_status = await _warm_one(client, url, limiter)
+            digest = (expected_hashes or {}).get(key)
+            if digest:
+                ok, http_status = await _warm_one(client, url, limiter, expected_sha256=digest)
+            else:
+                ok, http_status = await _warm_one(client, url, limiter)
         store.record_warmed_package(repo.id, key, filename, ok, http_status, source="prefetch")
+        outcomes[key] = ok
         if not ok:
             # A single event loop, no real thread parallelism — append()
             # from different coroutines is safe here without a lock.
@@ -263,6 +280,8 @@ async def warm_cache(
         )
     else:
         await record_success_and_maybe_notify(config, store, repo.id, "prefetch")
+
+    return outcomes
 
 
 async def purge_removed(
@@ -360,7 +379,8 @@ async def purge_selected(config: Config, repo: RepoConfig, items: dict[str, str]
 
 
 async def _warm_one(
-    client: httpx.AsyncClient, url: str, limiter: BandwidthLimiter
+    client: httpx.AsyncClient, url: str, limiter: BandwidthLimiter,
+    *, expected_sha256: str | None = None, expected_size: int | None = None,
 ) -> tuple[bool, int | None]:
     """The body is read in chunks (not loaded into memory whole) — each
     chunk "spends" its size in the limiter, so the limit is actually paced
@@ -374,8 +394,22 @@ async def _warm_one(
             "GET", url, headers={"User-Agent": USER_AGENT}, timeout=60
         ) as resp:
             resp.raise_for_status()
+            digest = hashlib.sha256() if expected_sha256 else None
+            received = 0
             async for chunk in resp.aiter_bytes(_CHUNK_SIZE):
+                received += len(chunk)
+                if expected_size is not None and received > expected_size:
+                    logger.warning("warm size exceeds metadata: %s", url)
+                    return False, resp.status_code
+                if digest is not None:
+                    digest.update(chunk)
                 await limiter.consume(len(chunk))
+            if expected_size is not None and received != expected_size:
+                logger.warning("warm size mismatch: %s", url)
+                return False, resp.status_code
+            if digest is not None and digest.hexdigest() != expected_sha256.lower():
+                logger.warning("warm hash mismatch: %s", url)
+                return False, resp.status_code
             logger.info("warmed: %s (%s)", url, resp.status_code)
             return True, resp.status_code
     except httpx.HTTPStatusError as exc:

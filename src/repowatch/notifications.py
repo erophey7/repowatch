@@ -5,8 +5,8 @@ we don't want to drag SMTP server config/credentials into this otherwise
 simple tool (see CLAUDE.md — minimum dependencies — httpx is already there
 for network I/O, adding an smtplib layer for a second channel would be
 excessive). The "text" field in the payload is a human-readable string that
-Slack/Mattermost/Discord incoming webhooks display directly with no extra
-setup on their side; the other fields are for anyone parsing the JSON
+Slack/Mattermost incoming webhooks display directly; Discord requires its
+Slack-compatible /slack endpoint; the other fields are for anyone parsing the JSON
 themselves.
 
 A notification is sent not on every failure, but once when the

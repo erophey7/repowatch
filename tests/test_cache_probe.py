@@ -199,7 +199,8 @@ def test_cache_dir_size_sums_bytes_and_flags_unreadable_keys(monkeypatch):
             return await cache_probe.cache_dir_size('http://127.0.0.1:8080', concurrency=4)
 
     result = asyncio.run(run())
-    assert result == {'size_bytes': 150, 'file_count': 3, 'unreadable_keys': 1}
+    # The missing stat is a byte-total gap, not only an unreadable key.
+    assert result == {'size_bytes': 150, 'file_count': 3, 'unreadable_keys': 1, 'unreadable_sizes': 1}
 
 
 def test_cache_dir_size_flags_incomplete_leaves_instead_of_silently_undercounting(monkeypatch):
@@ -454,3 +455,17 @@ def test_purge_both_copies_and_preserve_any_failure(first, second, expected):
         result = asyncio.run(cache_probe.purge_selected_raw(config, repo, {'foo': 'foo.pkg.tar.zst'}))
     assert result == {'foo': expected}
     assert len(seen) == len(set(seen)) == 2
+
+
+def test_scan_reports_missing_sizes_separately_from_missing_keys(monkeypatch):
+    monkeypatch.setattr(cache_probe, 'LEAF_DIRS', ['0/00'])
+    def handler(request):
+        return httpx.Response(200, json=[
+            {'file': 'read-error', 'size': 100, 'error': 'EIO'},
+            {'file': 'stat-error', 'error': 'EACCES'},
+        ])
+    real_client = httpx.AsyncClient
+    with patch('repowatch.cache_probe.httpx.AsyncClient',
+               lambda **kw: real_client(transport=httpx.MockTransport(handler))):
+        result = asyncio.run(cache_probe.cache_dir_size('http://localhost:8080'))
+    assert result == {'size_bytes': 100, 'file_count': 2, 'unreadable_keys': 2, 'unreadable_sizes': 1}

@@ -1,7 +1,7 @@
 # repowatch
 
 A lightweight, self-hosted "smart cache" for package repositories: Arch
-(pacman), Debian/Ubuntu (apt), Alpine (apk), Void (xbps), and RPM-based
+(pacman), Debian/Ubuntu (apt), Alpine (apk), Void (xbps), Nix, and RPM-based
 distributions (RPM-MD: Rocky, Fedora, openSUSE, etc.). Unlike a plain caching proxy
 (apt-cacher-ng, pacoloco, and similar), repowatch actively watches upstream
 indexes on a schedule, can prefetch new packages ahead of any client
@@ -46,6 +46,10 @@ rest of repowatch runs normally):
     `libnginx-mod-http-js`; Arch: `nginx-mod-njs`) — only if
     `nginx.enable_cache_probe` is on; see
     [docs/configuration.md](docs/configuration.md#nginx).
+- Nix CLI (`nix`, `nix-env`, `nix-instantiate`) — optional system dependency
+  required only for `type: nix`. It evaluates package output paths and verifies
+  binary-cache signatures; no new Python dependency is needed. The service user
+  needs a usable Nix store/daemon. See [Nix repositories](docs/nix.md).
 - `gpg` — optional key-expiry warnings for GPG-signed repositories;
   signature verification itself only needs `gpgv`.
 - `gpgv` — signature verification for apt/pacman/RPM-MD/apt-rpm repositories

@@ -267,7 +267,20 @@ def run_listener(config_path: str, initial_config: Config, store: StateStore) ->
         # mark EVERY repository whose known packages actually contain this
         # file as warmed; there can be more than one.
         if parsed.status == "200":
+            for candidate in repos:
+                if candidate.type == 'nix':
+                    prefix = _repo_url_prefix(candidate).rstrip('/') + '/'
+                    if parsed.path.startswith(prefix):
+                        try:
+                            store.touch_nix_artifact(candidate.id, parsed.path[len(prefix):])
+                        except Exception:
+                            logger.exception('failed to refresh Nix artifact activity')
             for matched_repo_id, key in matches:
+                matched_repo = next((r for r in repos if r.id == matched_repo_id), None)
+                if matched_repo is not None and matched_repo.type == 'nix':
+                    # A narinfo GET cannot establish that every archive/reference
+                    # was downloaded. Only closure warming records Nix success.
+                    continue
                 filename = packages_by_repo.get(matched_repo_id, {}).get(key, "")
                 try:
                     store.record_warmed_package(matched_repo_id, key, filename, True, 200, source="client")

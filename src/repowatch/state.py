@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import base64
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -27,6 +28,21 @@ CREATE TABLE IF NOT EXISTS host_tokens (
     expires_at REAL,
     last_used_at REAL,
     revoked_at REAL
+);
+
+-- Nix closure artifacts are retained with warmed tombstones after catalog removal.
+CREATE TABLE IF NOT EXISTS nix_artifacts (
+    repo_id TEXT NOT NULL,
+    package_key TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    content_hash TEXT,
+    size INTEGER,
+    PRIMARY KEY (repo_id, package_key, filename)
+);
+CREATE INDEX IF NOT EXISTS nix_artifacts_file ON nix_artifacts(repo_id, filename);
+CREATE TABLE IF NOT EXISTS nix_trust (
+    repo_id TEXT PRIMARY KEY,
+    policy TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS repo_state (
@@ -59,10 +75,21 @@ CREATE TABLE IF NOT EXISTS repo_events (
     repo_id    TEXT NOT NULL,
     ts         TEXT NOT NULL,
     new_pkgs_json TEXT NOT NULL,   -- list of package-version strings that appeared
-    removed_pkgs_json TEXT NOT NULL DEFAULT '[]'
+    removed_pkgs_json TEXT NOT NULL DEFAULT '[]',
+    modified_pkgs_json TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE INDEX IF NOT EXISTS idx_repo_events_repo_ts ON repo_events(repo_id, ts DESC);
+
+CREATE TABLE IF NOT EXISTS pending_replacements (
+    repo_id TEXT NOT NULL,
+    package_key TEXT NOT NULL,
+    targets_json TEXT NOT NULL,
+    expected_hash TEXT,
+    revision TEXT NOT NULL,
+    last_error TEXT,
+    PRIMARY KEY (repo_id, package_key)
+);
 
 CREATE TABLE IF NOT EXISTS request_events (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -176,6 +203,8 @@ class DiffResult:
     # item 24) to know which file to purge from nginx's cache — the key
     # alone isn't a filename.
     removed_filenames: dict[str, str]
+    modified_packages: list[str] = field(default_factory=list)
+    modified_filenames: dict[str, str] = field(default_factory=dict)
 
 
 class StateStore:
@@ -204,6 +233,64 @@ class StateStore:
         finally:
             conn.close()
 
+    def update_nix_trust(self, repo_id: str, verify: bool, keys: list[str]) -> None:
+        """Recheck completed closures when signature policy changes."""
+        policy = json.dumps([verify, sorted(set(keys))])
+        with self._connect() as conn:
+            previous = conn.execute("SELECT policy FROM nix_trust WHERE repo_id=?", (repo_id,)).fetchone()
+            if previous is None or previous[0] != policy:
+                conn.execute("UPDATE warmed_packages SET status='failed' WHERE repo_id=?", (repo_id,))
+                conn.execute("INSERT INTO nix_trust VALUES (?, ?) ON CONFLICT(repo_id) "
+                             "DO UPDATE SET policy=excluded.policy", (repo_id, policy))
+
+    def nix_has_unknown_owners(self, repo_id: str, excluded_keys: list[str]) -> bool:
+        """An undiscovered current output might reference any known artifact."""
+        excluded = set(excluded_keys)
+        with self._connect() as conn:
+            return any(key not in excluded for (key,) in conn.execute(
+                "SELECT p.package_key FROM repo_packages p WHERE p.repo_id=? AND NOT EXISTS "
+                "(SELECT 1 FROM nix_artifacts a WHERE a.repo_id=p.repo_id AND a.package_key=p.package_key)",
+                (repo_id,)))
+
+    def record_nix_artifacts(self, repo_id: str, package_key: str, artifacts: list[dict]) -> None:
+        """Preserve discovered files before warming, including failed attempts.
+
+        Keep older encodings too so purge can remove them after a NAR URL change.
+        A failed discovery must not erase the previous complete artifact list.
+        """
+        with self._connect() as conn:
+            conn.executemany(
+                "INSERT INTO nix_artifacts (repo_id, package_key, filename, content_hash, size) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(repo_id, package_key, filename) DO UPDATE SET "
+                "content_hash=excluded.content_hash, size=excluded.size",
+                ((repo_id, package_key, a['filename'], a.get('content_hash'), a.get('size')) for a in artifacts),
+            )
+
+    def get_nix_artifacts(self, repo_id: str, package_key: str) -> list[dict]:
+        with self._connect() as conn:
+            return [dict(filename=f, content_hash=h, size=s) for f, h, s in conn.execute(
+                "SELECT filename, content_hash, size FROM nix_artifacts WHERE repo_id=? AND package_key=?",
+                (repo_id, package_key))]
+
+    def touch_nix_artifact(self, repo_id: str, filename: str) -> None:
+        """Refresh existing successful closures after a real artifact request.
+
+        A metadata request alone must never create a successful closure record.
+        """
+        with self._connect() as conn:
+            conn.execute("UPDATE warmed_packages SET warmed_at=? WHERE repo_id=? AND status='ok' "
+                         "AND package_key IN (SELECT package_key FROM nix_artifacts WHERE repo_id=? AND filename=?)",
+                         (_utcnow(), repo_id, repo_id, filename))
+
+    def nix_shared_files(self, repo_id: str, excluded_keys: list[str]) -> set[str]:
+        """Files owned by current catalog entries outside a purge selection."""
+        excluded = set(excluded_keys)
+        with self._connect() as conn:
+            return {filename for key, filename in conn.execute(
+                "SELECT a.package_key,a.filename FROM nix_artifacts a JOIN repo_packages p "
+                "ON p.repo_id=a.repo_id AND p.package_key=a.package_key WHERE a.repo_id=?", (repo_id,))
+                    if key not in excluded}
+
     def record_snapshot(
         self,
         snapshot: RepoSnapshot,
@@ -224,13 +311,45 @@ class StateStore:
                 "SELECT changed_at FROM repo_state WHERE repo_id = ?",
                 (snapshot.repo_id,),
             ).fetchone()
-            prev_packages = dict(conn.execute(
-                "SELECT package_key, filename FROM repo_packages WHERE repo_id = ?", (snapshot.repo_id,)
-            ))
+            previous = {key: (filename, digest) for key, filename, digest in conn.execute(
+                "SELECT package_key, filename, content_hash FROM repo_packages WHERE repo_id = ?", (snapshot.repo_id,)
+            )}
+            prev_packages = {key: value[0] for key, value in previous.items()}
 
             new_keys = set(snapshot.packages) - set(prev_packages)
             removed_keys = set(prev_packages) - set(snapshot.packages)
-            changed = bool(new_keys or removed_keys)
+            modified_keys = {
+                key for key in set(snapshot.packages) & set(previous)
+                if snapshot.packages[key] != previous[key][0]
+                or (previous[key][1] and snapshot.content_hashes.get(key)
+                    and previous[key][1] != snapshot.content_hashes[key])
+            }
+            changed = bool(new_keys or removed_keys or modified_keys)
+            for key in sorted(modified_keys):
+                old_filename, old_hash = previous[key]
+                pending = conn.execute(
+                    "SELECT targets_json FROM pending_replacements WHERE repo_id=? AND package_key=?",
+                    (snapshot.repo_id, key),
+                ).fetchone()
+                targets = {tuple(target) for target in json.loads(pending[0])} if pending else set()
+                targets.update(((snapshot.repo_id, old_filename), (snapshot.repo_id, snapshot.packages[key])))
+                # Preserve the previous shared location before replacing its hash.
+                if old_hash:
+                    shared = conn.execute(
+                        "SELECT MIN(repo_id) FROM repo_packages WHERE filename=? AND content_hash=?",
+                        (old_filename, old_hash),
+                    ).fetchone()[0]
+                    if shared:
+                        targets.add((shared, old_filename))
+                conn.execute(
+                    "INSERT INTO pending_replacements (repo_id, package_key, targets_json, expected_hash, revision, last_error) "
+                    "VALUES (?, ?, ?, ?, ?, NULL) "
+                    "ON CONFLICT(repo_id, package_key) DO UPDATE SET targets_json=excluded.targets_json, "
+                    "expected_hash=excluded.expected_hash, revision=excluded.revision, last_error=NULL",
+                    (snapshot.repo_id, key, json.dumps(sorted(targets)), snapshot.content_hashes.get(key), uuid.uuid4().hex),
+                )
+                # A previous successful warm does not confirm replacement bytes.
+                conn.execute("DELETE FROM warmed_packages WHERE repo_id=? AND package_key=?", (snapshot.repo_id, key))
 
             changed_at = now if changed else (row and _prev_changed_at(conn, snapshot.repo_id))
 
@@ -283,14 +402,15 @@ class StateStore:
             if changed:
                 conn.execute(
                     """
-                    INSERT INTO repo_events (repo_id, ts, new_pkgs_json, removed_pkgs_json)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO repo_events (repo_id, ts, new_pkgs_json, removed_pkgs_json, modified_pkgs_json)
+                    VALUES (?, ?, ?, ?, ?)
                     """,
                     (
                         snapshot.repo_id,
                         now,
                         json.dumps(sorted(new_keys)),
                         json.dumps(sorted(removed_keys)),
+                        json.dumps(sorted(modified_keys)),
                     ),
                 )
 
@@ -300,6 +420,8 @@ class StateStore:
                 new_packages=sorted(new_keys),
                 removed_packages=sorted(removed_keys),
                 removed_filenames={key: prev_packages[key] for key in removed_keys},
+                modified_packages=sorted(modified_keys),
+                modified_filenames={key: prev_packages[key] for key in modified_keys},
             )
 
     def get_index_meta(self, repo_id: str) -> tuple[str | None, str | None]:
@@ -321,9 +443,9 @@ class StateStore:
         creates its repo_state row (the key-expiry check runs unconditionally
         at the top of every cycle, independent of whether the index itself
         changed, so a quiet repository that rarely changes still gets its
-        key checked on schedule). The placeholder last_check this INSERT
-        branch writes is immediately superseded later in the same cycle by
-        the real touch_last_check()/record_snapshot() call."""
+        key checked on schedule). An empty internal timestamp means no successful
+        check yet, preserving the existing NOT NULL schema. Public readers
+        expose it as None. Only a successful index check supplies a date."""
         with self._connect() as conn:
             conn.execute(
                 """
@@ -331,7 +453,7 @@ class StateStore:
                 VALUES (?, ?, ?)
                 ON CONFLICT(repo_id) DO UPDATE SET key_expires_at = excluded.key_expires_at
                 """,
-                (repo_id, _utcnow(), expires_at),
+                (repo_id, "", expires_at),
             )
 
     def touch_last_check(self, repo_id: str) -> None:
@@ -356,7 +478,7 @@ class StateStore:
                 "SELECT repo_id, last_check, changed_at, package_count, key_expires_at FROM repo_state"
             ).fetchall()
             warmed = dict(conn.execute("SELECT repo_id, COUNT(*) FROM warmed_packages GROUP BY repo_id")) if include_warmed else {}
-        result = {row[0]: {"last_check": row[1], "changed_at": row[2], "package_count": row[3],
+        result = {row[0]: {"last_check": row[1] or None, "changed_at": row[2], "package_count": row[3],
                             "key_expires_at": row[4]} for row in rows}
         if include_warmed:
             # Keep the count even for orphaned warmed rows without repo_state:
@@ -396,20 +518,22 @@ class StateStore:
 
             last_event = conn.execute(
                 """
-                SELECT new_pkgs_json, removed_pkgs_json FROM repo_events
-                WHERE repo_id = ? ORDER BY ts DESC LIMIT 1
+                SELECT new_pkgs_json, removed_pkgs_json, modified_pkgs_json FROM repo_events
+                WHERE repo_id = ? ORDER BY ts DESC, id DESC LIMIT 1
                 """,
                 (repo_id,),
             ).fetchone()
 
             new_pkgs = json.loads(last_event[0]) if last_event else []
             removed_pkgs = json.loads(last_event[1]) if last_event else []
+            modified_pkgs = json.loads(last_event[2]) if last_event else []
 
             return {
-                "last_check": last_check,
+                "last_check": last_check or None,
                 "changed_at": changed_at,
                 "last_new_packages": new_pkgs,
                 "last_removed_packages": removed_pkgs,
+                "last_modified_packages": modified_pkgs,
                 # None for rows written before this column existed — see
                 # _migrate and repos_list_payload (which has a fallback to
                 # len(get_packages())).
@@ -623,7 +747,7 @@ class StateStore:
         removed from the upstream index). The combination of "known to have
         been cached" + "no longer a real package" is the best-supported
         "probably safe to purge" signal available without touching nginx's
-        cache files directly (see CLAUDE.md's "Ключевые решения" #3) or
+        cache files directly or
         risking a false read from a live HTTP probe (see prefetch.py).
         Does not confirm the file is STILL in nginx's cache right now —
         only an actual purge attempt (see prefetch.purge_selected) can tell
@@ -1092,6 +1216,11 @@ class StateStore:
         )
         with self._connect() as conn:
             cur = conn.execute("DELETE FROM warmed_packages WHERE warmed_at < ?", (cutoff,))
+            conn.execute("DELETE FROM nix_artifacts WHERE NOT EXISTS "
+                         "(SELECT 1 FROM repo_packages p WHERE p.repo_id=nix_artifacts.repo_id "
+                         "AND p.package_key=nix_artifacts.package_key) AND NOT EXISTS "
+                         "(SELECT 1 FROM warmed_packages w WHERE w.repo_id=nix_artifacts.repo_id "
+                         "AND w.package_key=nix_artifacts.package_key)")
             return cur.rowcount
 
     def get_stale_warmed_packages(self, retention_days: int) -> list[tuple[str, str, str]]:
@@ -1117,8 +1246,8 @@ class StateStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT ts, new_pkgs_json, removed_pkgs_json FROM repo_events
-                WHERE repo_id = ? ORDER BY ts DESC LIMIT ?
+                SELECT ts, new_pkgs_json, removed_pkgs_json, modified_pkgs_json FROM repo_events
+                WHERE repo_id = ? ORDER BY ts DESC, id DESC LIMIT ?
                 """,
                 (repo_id, limit),
             ).fetchall()
@@ -1127,9 +1256,35 @@ class StateStore:
                 "ts": ts,
                 "new_packages": json.loads(new_json),
                 "removed_packages": json.loads(removed_json),
+                "modified_packages": json.loads(modified_json),
             }
-            for ts, new_json, removed_json in rows
+            for ts, new_json, removed_json, modified_json in rows
         ]
+
+    def get_pending_replacements(self, repo_id: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT q.package_key, q.targets_json, q.revision, p.filename, q.last_error, COALESCE(p.content_hash, q.expected_hash) "
+                "FROM pending_replacements q LEFT JOIN repo_packages p "
+                "ON p.repo_id=q.repo_id AND p.package_key=q.package_key WHERE q.repo_id=?",
+                (repo_id,),
+            ).fetchall()
+        return [dict(package_key=key, targets=json.loads(targets), revision=revision,
+                     filename=filename, last_error=error, content_hash=digest)
+                for key, targets, revision, filename, error, digest in rows]
+
+    def get_pending_replacement_counts(self) -> dict[str, int]:
+        with self._connect() as conn:
+            return dict(conn.execute("SELECT repo_id, COUNT(*) FROM pending_replacements GROUP BY repo_id"))
+
+    def finish_replacement(self, repo_id: str, key: str, revision: str, error: str | None = None) -> None:
+        with self._connect() as conn:
+            if error is None:
+                conn.execute("DELETE FROM pending_replacements WHERE repo_id=? AND package_key=? AND revision=?",
+                             (repo_id, key, revision))
+            else:
+                conn.execute("UPDATE pending_replacements SET last_error=? WHERE repo_id=? AND package_key=? AND revision=?",
+                             (error, repo_id, key, revision))
 
     def bump_failure(self, repo_id: str, kind: str, error_message: str) -> tuple[int, bool]:
         """Increment the consecutive-failure counter ("prefetch"/"gpg") by 1.
@@ -1210,6 +1365,8 @@ def _prev_changed_at(conn: sqlite3.Connection, repo_id: str) -> str | None:
 
 def _migrate(conn: sqlite3.Connection) -> None:
     """Migrate existing schemas inside the initialization transaction."""
+    if 'modified_pkgs_json' not in {r[1] for r in conn.execute('PRAGMA table_info(repo_events)')}:
+        conn.execute("ALTER TABLE repo_events ADD COLUMN modified_pkgs_json TEXT NOT NULL DEFAULT '[]'")
     if 'repo_ids' not in {r[1] for r in conn.execute('PRAGMA table_info(host_tokens)')}:
         conn.execute('ALTER TABLE host_tokens ADD COLUMN repo_ids TEXT')
 

@@ -5,6 +5,7 @@ from repowatch.parsers.pacman import PacmanParser
 from repowatch.parsers.dnf import DnfParser
 from repowatch.parsers.apt_rpm import AptRpmParser
 from repowatch.parsers.xbps import XbpsParser
+from repowatch.parsers.nix import NixParser
 
 PARSERS: dict[str, type[IndexParser]] = {
     "apt": AptParser,
@@ -13,6 +14,7 @@ PARSERS: dict[str, type[IndexParser]] = {
     "dnf": DnfParser,
     "apt-rpm": AptRpmParser,
     "xbps": XbpsParser,
+    "nix": NixParser,
 }
 
-__all__ = ["IndexParser", "AptParser", "PacmanParser", "ApkParser", "DnfParser", "AptRpmParser", "XbpsParser", "PARSERS"]
+__all__ = ["IndexParser", "AptParser", "PacmanParser", "ApkParser", "DnfParser", "AptRpmParser", "XbpsParser", "NixParser", "PARSERS"]

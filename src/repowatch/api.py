@@ -142,6 +142,7 @@ def repos_list_payload(config_path: str | Path, store: StateStore) -> tuple[int,
         return 500, {"error": "config.yaml is currently invalid"}
 
     statuses = store.get_repo_summaries(include_warmed=True)
+    pending_replacements = store.get_pending_replacement_counts()
     result = []
     for repo in current.repos:
         status = statuses.get(repo.id, {})
@@ -167,6 +168,7 @@ def repos_list_payload(config_path: str | Path, store: StateStore) -> tuple[int,
                 "prefetch": repo.prefetch,
                 "package_count": package_count,
                 "warmed_count": warmed_count,
+                "pending_replacements": pending_replacements.get(repo.id, 0),
                 "browse_url": browse_url,
                 "check_interval": current.effective_check_interval(repo),
                 "last_check": status.get("last_check"),
@@ -464,23 +466,36 @@ def purge_candidates_payload(
     }
 
 
-async def _purge_items(config: Config, repo: RepoConfig, items: dict[str, str]) -> dict[str, str]:
+async def _purge_items(config: Config, repo: RepoConfig, items: dict[str, str], store: StateStore) -> dict[str, str]:
     """Picks the purge mechanism for the dashboard's two purge-capable
     handlers (purge_selected_payload, remove_warmed_package_payload): the
     route-independent /purge-raw location (cache_probe.purge_selected_raw,
     keyed via nginx.compute_cache_key()) when nginx.enable_cache_probe is
     on, else the standard per-repo /purge<prefix> location
-    (prefetch.purge_selected) — by direct user request (2026-09-14): "по
-    умолчанию пурж через дашборд работает стандартным механизмом, но если
-    включен cache_probe применяем purge_raw". Same result contract either
-    way ("purged"/"not_cached"/"error (...)" per key), so callers don't
+    (prefetch.purge_selected). Both paths use the same result contract ("purged"/"not_cached"/"error (...)" per key), so callers don't
     need to know which path ran.
 
     cache_probe's version isn't just an alternate transport for the same
     outcome — see its own docstring: it catches a real class of cache entry
     the per-repo path structurally cannot (a file cached under a since-
     changed nginx.enable_dedup basis)."""
+    if repo.type == 'nix':
+        from repowatch.nix_cache import purge
+        return await purge(config, repo, store, items)
     if config.nginx.enable_cache_probe:
+        canonical_keys = {}
+        if config.nginx.enable_dedup:
+            from repowatch.nginx import compute_cache_key
+            selected = set(items.values())
+            for duplicate_id, canonical_id, filename in store.find_duplicate_files():
+                if duplicate_id != repo.id or filename not in selected:
+                    continue
+                canonical = config.repo_by_id(canonical_id)
+                if canonical is not None:
+                    canonical_keys[filename] = compute_cache_key(config, canonical, filename)
+        if canonical_keys:
+            return await cache_probe.purge_selected_raw(
+                config, repo, items, canonical_keys=canonical_keys)
         return await cache_probe.purge_selected_raw(config, repo, items)
     return await purge_selected(config, repo, items)
 
@@ -533,8 +548,8 @@ def purge_selected_payload(
     # _purge_items is async (see above) — bridge sync->async the same way
     # warm_packages_payload does, for the same reason (this handler runs in
     # a plain ThreadingHTTPServer thread).
-    results = asyncio.run(_purge_items(current, repo, filenames)) if filenames else {}
-    resolved = [key for key, outcome in results.items() if outcome in ("purged", "not_cached")]
+    results = asyncio.run(_purge_items(current, repo, filenames, store)) if filenames else {}
+    resolved = [key for key, outcome in results.items() if outcome in ("purged", "not_cached", "retained_shared")]
     if resolved:
         store.remove_warmed_packages(repo_id, resolved)
 
@@ -603,8 +618,8 @@ def remove_warmed_package_payload(
     # _purge_items is async (see above) — bridge sync->async the same way
     # warm_packages_payload/purge_selected_payload do, for the same reason
     # (this handler runs in a plain ThreadingHTTPServer thread).
-    results = asyncio.run(_purge_items(current, repo, filenames)) if filenames else {}
-    resolved = [key for key, outcome in results.items() if outcome in ("purged", "not_cached")]
+    results = asyncio.run(_purge_items(current, repo, filenames, store)) if filenames else {}
+    resolved = [key for key, outcome in results.items() if outcome in ("purged", "not_cached", "retained_shared")]
     # A requested key with no filename on record was never really tracked
     # (nothing to purge) — still let its (already-nonexistent) row drop,
     # remove_warmed_packages is a no-op for keys that aren't there.
@@ -949,6 +964,7 @@ def status_payload(config_path: str | Path, store: StateStore,
     if repo_id is not None and current.repo_by_id(repo_id) is None:
         return 404, {"error": f"unknown repo_id: {repo_id}"}
     summaries = store.get_repo_summaries()
+    pending_replacements = store.get_pending_replacement_counts()
     stale_ids = {item["repo_id"] for item in _repo_staleness(current, store, summaries)}
     result = {}
     for repo in current.repos:
@@ -960,6 +976,7 @@ def status_payload(config_path: str | Path, store: StateStore,
             "last_check": last_check,
             "changed_at": summary.get("changed_at"),
             "stale": not last_check or repo.id in stale_ids,
+            "pending_replacements": pending_replacements.get(repo.id, 0),
         }
     return 200, result if repo_id is None else result[repo_id]
 

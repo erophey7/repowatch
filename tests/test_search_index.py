@@ -3,10 +3,11 @@ import pytest
 from repowatch.state import StateStore, RepoSnapshot
 
 
-@pytest.mark.parametrize('q', ['lib', 'LIB', 'a_b', 'a%b', '"ab', 'a-b', 'été', 'ÉTÉ', '中文包', 'x', 'ab', 'OR', 'missing', 'a\x00b'])
+# Unicode fixtures exercise accented case folding and CJK substring matching.
+@pytest.mark.parametrize('q', ['lib', 'LIB', 'a_b', 'a%b', '"ab', 'a-b', '\xe9t\xe9', '\xc9T\xc9', '\u4e2d\u6587\u5305', 'x', 'ab', 'OR', 'missing', 'a\x00b'])
 def test_search_matches_scan_across_pages(tmp_path, q):
     store = StateStore(tmp_path / 'state')
-    names = ['libtest', 'a_b', 'a%b', '"abc', 'a-bc', 'été', 'ÉTÉ', '中文包', 'xab', 'OR', 'a\x00b']
+    names = ['libtest', 'a_b', 'a%b', '"abc', 'a-bc', '\xe9t\xe9', '\xc9T\xc9', '\u4e2d\u6587\u5305', 'xab', 'OR', 'a\x00b']
     for repo in ('a', 'b'):
         store.record_snapshot(RepoSnapshot(repo, {f'{n}-{i}': 'file' for n in names for i in range(3)},
                                            {f'{n}-{i}': n for n in names for i in range(3)}))

@@ -18,13 +18,13 @@ from pathlib import PurePosixPath
 import re
 import shutil
 import subprocess
-import tempfile
 from typing import BinaryIO
 from urllib.parse import urlsplit
 import xml.etree.ElementTree as ET
 
 import httpx
 
+from repowatch.processes import ProcessStream
 from repowatch.gpgverify import SignatureError, verify_detached
 from repowatch.parsers.base import IndexParser, PackageRef
 
@@ -116,68 +116,34 @@ def _verify_bytes(raw: bytes, algorithm: str | None, digest: str | None, size: i
 
 
 class _ZstdSubprocessStream:
-    """Streaming Zstandard decompression via the system `zstd` binary
-    (subprocess), not stdlib `compression.zstd` (Python 3.14+) — same
-    "external tool for one feature" pattern already used for
-    gpgv/openssl/apk-tools elsewhere in this project, and for XBPS's own
-    repodata decompression (see parsers/xbps.py, converted the same way
-    after the same reasoning: gating this on a Python 3.14+-only stdlib
-    module would raise the whole project's floor for one optional
-    compression format).
-
-    Streams the decompressed bytes from the subprocess's stdout — a
-    read(size) never materializes the whole decompressed primary.xml in
-    memory at once, same memory profile gzip.GzipFile/lzma.LZMAFile already
-    have for the other branches here. That streaming is not cosmetic: on a
-    real Rocky primary.gz (~23MB compressed / ~168MB XML), switching this
-    module to streaming cut peak RSS from ~399 to ~65 MiB — a
-    subprocess.run()-style "decompress everything into one bytes object up
-    front" would silently regress that.
-
-    The compressed input is written to a temp file rather than piped via
-    stdin: writing a large payload directly to a subprocess's stdin can
-    deadlock if its stdout pipe fills up before anything drains it (nothing
-    reads stdout until decompression is already underway) — a temp file
-    sidesteps that without needing a second thread just to feed stdin.
-    """
+    """Keep large primary XML streaming; process mechanics live in processes."""
 
     def __init__(self, raw: bytes):
-        self._tmp = tempfile.NamedTemporaryFile(suffix='.zst')
-        try:
-            self._tmp.write(raw)
-            self._tmp.flush()
-            self._process = subprocess.Popen(
-                ['zstd', '-d', '-c', '-q', self._tmp.name],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            )
-        except Exception:
-            self._tmp.close()
-            raise
+        self._stream = ProcessStream(['zstd', '-d', '-c', '-q'], input=raw, timeout=60)
 
     def read(self, size: int = -1) -> bytes:
-        return self._process.stdout.read(size)
+        try:
+            return self._stream.read(size)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ValueError(f'dnf: zstd decompression failed: {exc}') from exc
 
     def close(self) -> None:
         try:
-            self._process.stdout.close()
-            self._process.wait(timeout=60)
-            stderr = self._process.stderr.read()
-        finally:
-            self._tmp.close()
-        if self._process.returncode != 0:
-            # Caught even if iterparse already "succeeded" on a truncated
-            # stream (see _checked_primary — its `return` sits inside the
-            # `with` block, so __exit__/close() below still runs, and a
-            # raise here replaces the pending return) — a corrupted/
-            # truncated zstd stream must not be silently accepted just
-            # because the truncation happened to land on valid-looking XML.
-            raise ValueError(f'dnf: zstd decompression failed: {stderr.decode(errors="replace")[-500:]}')
+            self._stream.close()
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ValueError(f'dnf: zstd decompression failed: {exc}') from exc
+        if self._stream.returncode != 0:
+            stderr = self._stream.stderr.decode(errors='replace')[-500:]
+            raise ValueError(f'dnf: zstd decompression failed: {stderr}')
 
     def __enter__(self) -> '_ZstdSubprocessStream':
         return self
 
-    def __exit__(self, *exc_info: object) -> None:
-        self.close()
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        if exc_type is not None:
+            self._stream.abort()
+        else:
+            self.close()
 
 
 def _open_primary(raw: bytes, href: str) -> BinaryIO:

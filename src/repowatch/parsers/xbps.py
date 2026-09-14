@@ -43,6 +43,8 @@ import plistlib
 import re
 import shutil
 import subprocess
+
+from repowatch.processes import run
 import tarfile
 
 import httpx
@@ -57,8 +59,8 @@ def _decompress(raw: bytes) -> bytes:
             "xbps: repodata is Zstandard-compressed — install the system 'zstd' package"
         )
     try:
-        result = subprocess.run([binary, "-d", "-c", "-q"], input=raw, capture_output=True, timeout=60)
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        result = run([binary, "-d", "-c", "-q"], input=raw, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
         raise ValueError(f"xbps: failed to run zstd: {exc}") from exc
     if result.returncode != 0:
         raise ValueError(f"xbps: zstd decompression failed: {result.stderr.decode(errors='replace')[-500:]}")

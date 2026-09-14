@@ -19,7 +19,7 @@ class ConfigError(Exception):
 @dataclass(frozen=True)
 class RepoConfig:
     id: str
-    type: str  # "pacman" | "apt" | "apk" | "dnf" | "apt-rpm" | "xbps"
+    type: str  # "pacman" | "apt" | "apk" | "dnf" | "apt-rpm" | "xbps" | "nix"
     upstream: str
     arch: str
     prefetch: bool = True
@@ -49,11 +49,41 @@ class RepoConfig:
     url_template: str | None = None
     url_variables: dict[str, str] = field(default_factory=dict)
 
+    # Optional system Nix CLI backend, agreed by the user for Nix evaluation.
+    # Other repository types do not require Nix or additional Python packages.
+    nix_source: str | None = None
+    nix_attributes: list[str] = field(default_factory=list)
+    nix_public_keys: list[str] = field(default_factory=list)
+    nix_timeout: int = 600
+    nix_max_paths: int = 500000
+
     def __post_init__(self) -> None:
         from repowatch.url_templates import expand
         expand(self)
-        if self.type not in {"pacman", "apt", "apk", "dnf", "apt-rpm", "xbps"}:
+        if self.type not in {"pacman", "apt", "apk", "dnf", "apt-rpm", "xbps", "nix"}:
             raise ConfigError(f"{self.id}: unknown type={self.type!r}")
+        if self.type == 'nix':
+            from urllib.parse import urlsplit
+            if not isinstance(self.nix_source, str):
+                raise ConfigError(f'{self.id}: nix_source must be a URL string')
+            try:
+                source = urlsplit(self.nix_source)
+            except ValueError as exc:
+                raise ConfigError(f'{self.id}: invalid nix_source URL') from exc
+            if (source.scheme not in ('http', 'https') or not source.hostname
+                    or source.username or source.password or source.fragment):
+                raise ConfigError(f'{self.id}: nix_source must be an HTTP(S) nixpkgs source tarball URL')
+            if not isinstance(self.arch, str) or not re.fullmatch(r'[A-Za-z0-9_]+-(linux|darwin)', self.arch):
+                raise ConfigError(f'{self.id}: Nix arch must be a system such as x86_64-linux')
+            if (not isinstance(self.nix_attributes, list) or any(not isinstance(a, str) or
+                    not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_+-]*(?:\.[A-Za-z_][A-Za-z0-9_+-]*)*", a) for a in self.nix_attributes)):
+                raise ConfigError(f'{self.id}: nix_attributes must be a list of attribute paths')
+            if (not isinstance(self.nix_public_keys, list) or any(not isinstance(k, str) or
+                    not re.fullmatch(r'[A-Za-z0-9_.-]+:[A-Za-z0-9+/]{43}=', k) for k in self.nix_public_keys)):
+                raise ConfigError(f'{self.id}: nix_public_keys must contain Nix Ed25519 public keys')
+            for name in ('nix_timeout', 'nix_max_paths'):
+                if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                    raise ConfigError(f'{self.id}: {name} must be a positive integer')
         if self.type == "pacman" and not self.repo_name:
             raise ConfigError(f"{self.id}: repo_name is required for pacman")
         if self.type == "apt" and not (self.distribution and self.component):
@@ -68,7 +98,10 @@ class RepoConfig:
         if self.apk_keys_dir is not None and (not isinstance(self.apk_keys_dir, str) or not self.apk_keys_dir.strip()):
             raise ConfigError(f'{self.id}: apk_keys_dir must be a nonempty directory path')
         if self.verify_signature:
-            if self.type == 'apk':
+            if self.type == 'nix':
+                if not self.nix_public_keys:
+                    raise ConfigError(f'{self.id}: verify_signature=true requires nix_public_keys')
+            elif self.type == 'apk':
                 if not self.apk_keys_dir:
                     raise ConfigError(f'{self.id}: verify_signature=true requires apk_keys_dir')
             elif self.type == 'xbps':

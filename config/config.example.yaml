@@ -99,3 +99,18 @@ repos:
     arch: x86_64
 
 # admin_password_hash: <paste the output of `repowatch hash-password` here>
+
+  # Optional Nix repository. Install Nix CLI and make its store usable by the
+  # repowatch service user before enabling this entry; see docs/nix.md.
+  # Keep an explicit selection initially: evaluating all nixpkgs outputs and
+  # warming their dependency closures can require substantial resources.
+  # - id: nix-unstable
+  #   type: nix
+  #   upstream: https://cache.nixos.org
+  #   arch: x86_64-linux
+  #   nix_source: https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz
+  #   nix_attributes: [hello, jq]
+  #   verify_signature: true
+  #   nix_public_keys:
+  #     - "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
+  #   prefetch: true

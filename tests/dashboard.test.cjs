@@ -570,3 +570,41 @@ test('dashboard shows a warning badge for a repo with an expiring GPG key, plain
     assert.equal(cell('none').textContent.trim(), '—');
   } finally { dom.window.close(); }
 });
+
+test('Nix repository editor preserves source, outputs and signature policy', async () => {
+  let submitted;
+  const cfg = {id: 'n', type: 'nix', upstream: 'https://cache.test', arch: 'x86_64-linux',
+    nix_source: 'https://source.test/nixexprs.tar.xz', nix_attributes: ['hello', 'jq'],
+    nix_public_keys: ['cache.test-1:' + 'A'.repeat(43) + '='], nix_timeout: 900,
+    nix_max_paths: 20000, verify_signature: true, prefetch: true};
+  const repo = {id: 'n', type: 'nix', upstream: cfg.upstream, config: cfg};
+  const dom = new JSDOM(html, {url: 'http://localhost/', runScripts: 'dangerously',
+    beforeParse(w) {
+      w.HTMLElement.prototype.scrollIntoView = () => {};
+      w.fetch = async (raw, options = {}) => {
+        const url = new URL(raw, 'http://localhost');
+        let data = [];
+        if (url.pathname === '/api/auth/session') data = {role: 'admin', csrf_token: 'csrf'};
+        else if (url.pathname === '/api/repos') data = [repo];
+        else if (url.pathname === '/api/repos/n' && options.method === 'POST') {
+          submitted = JSON.parse(options.body); data = {ok: true};
+        } else if (url.pathname.endsWith('/summary')) {
+          data = {by_client_ip: [], by_path: [], by_repo: [], timeline: [], cache_hit_stats: []};
+        }
+        return {ok: true, json: async () => data};
+      };
+    }});
+  try {
+    await delay(30);
+    dom.window.openEditForm(repo);
+    const doc = dom.window.document;
+    assert.equal(doc.getElementById('f-nix-source').closest('[data-for]').hidden, false);
+    assert.equal(doc.getElementById('f-keyring-path').closest('.field').hidden, true);
+    doc.getElementById('f-nix-source').closest('form').dispatchEvent(
+      new dom.window.Event('submit', {bubbles: true, cancelable: true}));
+    await delay(30);
+    for (const key of ['nix_source', 'nix_attributes', 'nix_public_keys', 'nix_timeout', 'nix_max_paths', 'verify_signature']) {
+      assert.deepEqual(submitted[key], cfg[key]);
+    }
+  } finally {dom.window.close();}
+});

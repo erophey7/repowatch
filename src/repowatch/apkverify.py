@@ -11,6 +11,8 @@ import os
 from pathlib import Path
 import re
 import subprocess
+
+from repowatch.processes import run
 import tarfile
 import tempfile
 import zlib
@@ -31,9 +33,9 @@ def _member(raw: bytes, limit: int) -> tuple[bytes, bytes]:
 
 def _run(args: list[str]) -> subprocess.CompletedProcess:
     try:
-        result = subprocess.run(args, capture_output=True, text=True, timeout=30,
+        result = run(args, text=True, timeout=30,
                                 env={**os.environ, 'LC_ALL': 'C'})
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
         raise SignatureError(f'APKINDEX: cannot run {args[0]}: {exc}') from exc
     if result.returncode:
         raise SignatureError(f'APKINDEX: {args[0]} verification failed: {result.stderr[-2000:]}')

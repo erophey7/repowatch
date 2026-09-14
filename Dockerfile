@@ -2,7 +2,7 @@
 # container (see docs_dev/ROADMAP.md item 10). nginx is a separate
 # container/service in any real deployment (repowatch only ever talks to it
 # over plain HTTP, via cache_base_url — the same relationship as on a bare
-# host, see CLAUDE.md "Ключевые решения" #3); this image does not bundle or
+# host); this image does not bundle or
 # manage nginx at all.
 FROM python:3.12-slim
 

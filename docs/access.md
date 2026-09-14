@@ -217,6 +217,17 @@ than serving the dashboard's actual HTML — so "the dashboard's static HTML
 shell is public" isn't quite accurate; what's public is the separate login
 page you get redirected to.
 
+## Replacement status and history
+
+Each repository in `status.json` includes `pending_replacements`, the number
+of detected same-version replacements awaiting cache invalidation or warming.
+Host tokens can read this counter under their normal repository scope.
+A nonzero value means index freshness alone is not sufficient to conclude
+that replacement bytes are available in the cache. `/healthz` is unchanged.
+History adds `modified_packages` for these replacements; history still
+requires an admin session or guest-read access, not a host token.
+See [replacement handling](configuration.md#same-version-package-replacements).
+
 ## Reverse proxies and `trusted_proxies`
 
 If you run repowatch behind a reverse proxy, the proxy's own address is what

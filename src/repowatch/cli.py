@@ -133,6 +133,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.command == "check-config":
+        if any(repo.type == 'nix' for repo in config.repos):
+            import shutil
+            missing = [tool for tool in ('nix', 'nix-env', 'nix-instantiate') if shutil.which(tool) is None]
+            if missing:
+                print('Nix repositories require optional system tools: ' + ', '.join(missing), file=sys.stderr)
+                return 1
         # Validation only — deliberately does not create a StateStore
         # (doesn't touch state_db/directories on disk), unlike the other
         # commands below.
@@ -166,8 +172,11 @@ def main(argv: list[str] | None = None) -> int:
                           f"{cache['file_count']:,} file(s)")
                     if cache.get("unreadable_keys"):
                         print(f"  NOTE: {cache['unreadable_keys']:,} file(s) had an unreadable "
-                              "stored key (counted for size, not identifiable individually).",
+                              "stored key (not identifiable individually).",
                               file=sys.stderr)
+                    if cache.get("unreadable_sizes"):
+                        print(f"  WARNING: {cache['unreadable_sizes']:,} file size(s) could not be read; "
+                              "reported bytes are incomplete.", file=sys.stderr)
                     if cache.get("incomplete_leaves"):
                         print(f"  WARNING: {cache['incomplete_leaves']:,} of 4096 cache directories "
                               "could not be scanned (transient failure) — the numbers above are an "

@@ -1,0 +1,10 @@
+StorePath: /nix/store/62sz3ibrfd05p2k31xva2n909f7ccc8p-repowatch-nix-payload
+URL: nar/19kswl950lr93xwphf220ni2fyv0lh0jknc8jksibsa50pw1fyi9.nar.xz
+Compression: xz
+FileHash: sha256:19kswl950lr93xwphf220ni2fyv0lh0jknc8jksibsa50pw1fyi9
+FileSize: 184
+NarHash: sha256:04lfb4r6680j05lyg5jschnpdjjwd1kfdmbqy4qapa1l6a24ans5
+NarSize: 304
+References: 
+Sig: repowatch-test:YXm6qChV1XBF3M+EARtuOHO7Z0SMmgR1h5p+iTv+ZP9NGtRvofAng68s9LviyhQqDlg4CfYy3SMqck3C2FxnCQ==
+CA: fixed:r:sha256:04lfb4r6680j05lyg5jschnpdjjwd1kfdmbqy4qapa1l6a24ans5

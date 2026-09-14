@@ -16,6 +16,8 @@ import logging
 import os
 import shutil
 import subprocess
+
+from repowatch.processes import run
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,11 +66,13 @@ def _run_gpgv(keyring_path: str, sig_path: Path, data_path: Path | None) -> None
     if data_path is not None:
         args.append(str(data_path))
     try:
-        result = subprocess.run(args, capture_output=True, text=True, timeout=30)
+        result = run(args, text=True, timeout=30)
     except FileNotFoundError as exc:
         raise SignatureError(
             "gpgv not found — install gnupg on the host running repowatch"
         ) from exc
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SignatureError(f"gpgv: verification process failed: {exc}") from exc
 
     status_lines = result.stdout.splitlines()
     if any(line.startswith("[GNUPG:] BADSIG") for line in status_lines):
@@ -137,15 +141,15 @@ def soonest_key_expiry(keyring_path: str) -> str | None:
         with tempfile.TemporaryDirectory(prefix="repowatch-gpg-home-") as home:
             os.chmod(home, 0o700)
             env = {**os.environ, "GNUPGHOME": home}
-            subprocess.run(
+            run(
                 ["gpg", "--batch", "--yes", "--import", keyring_path],
-                capture_output=True, text=True, timeout=10, env=env,
+                text=True, timeout=10, env=env,
             )
-            result = subprocess.run(
+            result = run(
                 ["gpg", "--batch", "--with-colons", "--list-keys"],
-                capture_output=True, text=True, timeout=10, env=env,
+                text=True, timeout=10, env=env,
             )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.SubprocessError):
         logger.warning("could not run gpg to check key expiry for %s", keyring_path, exc_info=True)
         return None
     if result.returncode != 0:

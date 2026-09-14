@@ -251,6 +251,7 @@
         <option value="apt-rpm">apt-rpm (ALT Linux)</option>
         <option value="dnf">dnf / rpm</option>
         <option value="xbps">xbps (Void Linux)</option>
+        <option value="nix">Nix</option>
       </select>
     </div>
 
@@ -262,6 +263,29 @@
     <div class="field">
       <label for="f-arch">arch</label>
       <input type="text" id="f-arch" required placeholder="x86_64">
+    </div>
+
+    <div class="field" data-for="nix" hidden>
+      <label for="f-nix-source">Nixpkgs source tarball URL</label>
+      <input type="url" id="f-nix-source" placeholder="https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz">
+      <span class="field-hint">Requires the optional Nix CLI. Upstream is the binary cache; architecture is a Nix system such as x86_64-linux.</span>
+    </div>
+    <div class="field" data-for="nix" hidden>
+      <label for="f-nix-attributes">Nix attributes (comma-separated)</label>
+      <input type="text" id="f-nix-attributes" placeholder="hello, jq">
+      <span class="field-hint">Empty evaluates the complete package set. Each output is tracked separately; warming includes its dependencies.</span>
+    </div>
+    <div class="field" data-for="nix" hidden>
+      <label for="f-nix-keys">Nix trusted public keys (space-separated)</label>
+      <input type="text" id="f-nix-keys" placeholder="cache.example.org-1:...">
+    </div>
+    <div class="field" data-for="nix" hidden>
+      <label for="f-nix-timeout">Nix evaluation timeout (seconds)</label>
+      <input type="number" id="f-nix-timeout" min="1" value="600">
+    </div>
+    <div class="field" data-for="nix" hidden>
+      <label for="f-nix-max-paths">Maximum Nix outputs / closure paths</label>
+      <input type="number" id="f-nix-max-paths" min="1" value="500000">
     </div>
 
     <div class="field">
@@ -547,7 +571,11 @@ function renderStorageStats(stats) {
     }
     if (stats.cache_dir.unreadable_keys) {
       html += `<p class="form-msg error">Note: ${stats.cache_dir.unreadable_keys.toLocaleString()} ` +
-        'file(s) had an unreadable stored key (still counted for size, just not individually identifiable).</p>';
+        'file(s) had an unreadable stored key (not individually identifiable).</p>';
+    }
+    if (stats.cache_dir.unreadable_sizes) {
+      html += `<p class="form-msg error">Warning: ${stats.cache_dir.unreadable_sizes.toLocaleString()} ` +
+        'file size(s) could not be read; reported bytes are incomplete.</p>';
     }
     if (stats.cache_dir.incomplete_leaves) {
       html += `<p class="form-msg error">Warning: ${stats.cache_dir.incomplete_leaves.toLocaleString()} ` +
@@ -912,6 +940,7 @@ function renderPicker(container, keys, filterText) {
 }
 
 async function toggleDetail(tr, repoId) {
+  const repo = lastRepos.find(item => item.id === repoId) || {};
   const existing = tr.nextElementSibling;
   if (existing && existing.classList.contains('detail-row')) {
     existing.remove();
@@ -981,6 +1010,7 @@ async function toggleDetail(tr, repoId) {
     </div>
     <div class="detail-col">
       <h3>Change history</h3>
+      ${repo.pending_replacements ? `<p class="form-msg error">${repo.pending_replacements} replacement(s) awaiting cache refresh.</p>` : ''}
       <div class="scroll-list" data-slot="history">Loading…</div>
     </div>
   </div>`;
@@ -1144,12 +1174,12 @@ async function toggleDetail(tr, repoId) {
         purgeMsg.textContent = data.error || `HTTP ${res.status}`;
         return;
       }
-      const counts = { purged: 0, not_cached: 0, error: 0 };
+      const counts = { purged: 0, not_cached: 0, retained_shared: 0, error: 0 };
       for (const outcome of Object.values(data.results)) {
         counts[outcome.startsWith('error') ? 'error' : outcome] = (counts[outcome.startsWith('error') ? 'error' : outcome] || 0) + 1;
       }
       purgeMsg.className = counts.error ? 'form-msg error' : 'form-msg ok';
-      purgeMsg.textContent = `Purged: ${counts.purged}, not cached: ${counts.not_cached}` +
+      purgeMsg.textContent = `Purged: ${counts.purged}, not cached: ${counts.not_cached}, shared artifacts retained: ${counts.retained_shared}` +
         (counts.error ? `, errors: ${counts.error}` : '');
       await scanForStaleEntries(true); // silent re-scan: keep the "Purged: ..." summary on screen
       await loadWarmed(); // reflect the same cleanup in the warmed list above
@@ -1266,7 +1296,7 @@ async function toggleDetail(tr, repoId) {
   if (histRes.ok) {
     const events = await histRes.json();
     histSlot.innerHTML = events.length
-      ? events.map(e => `<div>${fmtTs(e.ts)} · +${e.new_packages.length} / -${e.removed_packages.length}</div>`).join('')
+      ? events.map(e => `<div>${fmtTs(e.ts)} · +${e.new_packages.length} / -${e.removed_packages.length} / ~${(e.modified_packages || []).length} modified</div>`).join('')
       : '<div class="empty">no changes yet</div>';
   } else {
     histSlot.innerHTML = '<div class="empty">failed to load</div>';
@@ -1388,6 +1418,11 @@ function openEditForm(repo) {
   document.getElementById('f-group').value = cfg.group ?? '';
   document.getElementById('f-url-template').value = cfg.url_template ?? '';
   document.getElementById('f-url-variables').value = Object.keys(cfg.url_variables || {}).length ? JSON.stringify(cfg.url_variables) : '';
+  document.getElementById('f-nix-source').value = cfg.nix_source ?? '';
+  document.getElementById('f-nix-attributes').value = (cfg.nix_attributes || []).join(', ');
+  document.getElementById('f-nix-keys').value = (cfg.nix_public_keys || []).join(' ');
+  document.getElementById('f-nix-timeout').value = cfg.nix_timeout ?? 600;
+  document.getElementById('f-nix-max-paths').value = cfg.nix_max_paths ?? 500000;
   document.getElementById('f-repo-name').value = cfg.repo_name ?? '';
   document.getElementById('f-distribution').value = cfg.distribution ?? '';
   document.getElementById('f-component').value = cfg.component ?? '';
@@ -1442,7 +1477,7 @@ function updateConditionalFields() {
   // from a previously selected type would submit a doomed request.
   verifyField.hidden = type === 'xbps';
   if (type === 'xbps') $verifySignature.checked = false;
-  keyringField.hidden = type === 'apk' || type === 'xbps' || !$verifySignature.checked;
+  keyringField.hidden = type === 'apk' || type === 'xbps' || type === 'nix' || !$verifySignature.checked;
 }
 $typeSelect.addEventListener('change', updateConditionalFields);
 $verifySignature.addEventListener('change', updateConditionalFields);
@@ -1469,6 +1504,14 @@ $addForm.addEventListener('submit', async (ev) => {
     body.component = document.getElementById('f-component').value.trim();
   }
 
+  if (type === 'nix') {
+    body.nix_source = document.getElementById('f-nix-source').value.trim();
+    body.nix_attributes = document.getElementById('f-nix-attributes').value.split(',').map(s => s.trim()).filter(Boolean);
+    body.nix_public_keys = document.getElementById('f-nix-keys').value.trim().split(/\s+/).filter(Boolean);
+    body.nix_timeout = Number(document.getElementById('f-nix-timeout').value);
+    body.nix_max_paths = Number(document.getElementById('f-nix-max-paths').value);
+  }
+
   if (type === 'apt-rpm') body.component = document.getElementById('f-component').value.trim();
 
   const checkInterval = document.getElementById('f-check-interval').value.trim();
@@ -1485,7 +1528,7 @@ $addForm.addEventListener('submit', async (ev) => {
     if (type === 'apk') {
       body.apk_keys_dir = document.getElementById('f-apk-keys').value.trim();
       body.apk_signature_backend = document.getElementById('f-apk-backend').value;
-    } else body.keyring_path = document.getElementById('f-keyring-path').value.trim();
+    } else if (type !== 'nix') body.keyring_path = document.getElementById('f-keyring-path').value.trim();
   }
 
   const url = editingRepoId ? `/api/repos/${encodeURIComponent(editingRepoId)}` : '/api/repos';

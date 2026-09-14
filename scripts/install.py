@@ -365,7 +365,7 @@ def check(layout: Layout, for_install: bool = True) -> Report:
             'import sys, json; from repowatch.config import load_config; '
             'c=load_config(sys.argv[1]); print(json.dumps({"signed": '
             '[[r.id,r.type,r.keyring_path,getattr(r,"apk_keys_dir",None),getattr(r,"apk_signature_backend","openssl")] for r in c.repos if r.verify_signature], "db": str(c.state_db), '
-            '"tls": [c.status_server.tls_cert_path, c.status_server.tls_key_path]}))', str(config)],
+            '"nix": [r.id for r in c.repos if r.type == "nix"], "tls": [c.status_server.tls_cert_path, c.status_server.tls_key_path]}))', str(config)],
             capture_output=True, text=True, timeout=15)
         if probe.returncode:
             missing = 'ModuleNotFoundError' in probe.stderr
@@ -379,7 +379,14 @@ def check(layout: Layout, for_install: bool = True) -> Report:
                 report.emit('OK' if pem_file.is_file() and os.access(pem_file, os.R_OK) else 'FAIL',
                             'TLS PEM', str(pem_file))
             report.path('configured DB', layout.disk(absolute(data['db'])), directory=False, preserve=True)
+            if data.get('nix'):
+                # Optional system backend: only Nix repositories require these tools.
+                report.tool('nix-env', required=not bool(layout.destdir))
+                report.tool('nix-instantiate', required=not bool(layout.destdir))
+                report.tool('nix', required=not bool(layout.destdir))
             for repo, kind, key, keys_dir, backend in data['signed']:
+                if kind == 'nix':
+                    continue
                 tool = ('apk' if backend == 'apk-tools' else 'openssl') if kind == 'apk' else 'gpgv'
                 report.tool(tool, required=not bool(layout.destdir))
                 key_file = layout.disk(absolute(keys_dir if kind == 'apk' else key))

@@ -182,7 +182,8 @@ async def cache_dir_size(base_url: str, *, concurrency: int = 8) -> dict:
     (the stat() succeeded even if the key line didn't parse) but flagged
     via `unreadable_keys` — a METADATA gap (this file's identity), distinct
     from `incomplete_leaves` (a whole leaf's files, size included, missing
-    entirely).
+    entirely). If stat itself fails, `unreadable_sizes` separately reports
+    files missing from the byte total.
     """
     async with httpx.AsyncClient() as client:
         # Fails loudly (propagates) if /cache-scan isn't actually reachable
@@ -203,6 +204,9 @@ async def cache_dir_size(base_url: str, *, concurrency: int = 8) -> dict:
     unreadable = sum(1 for e in inventory.entries if e.key is None)
     if unreadable:
         result["unreadable_keys"] = unreadable
+    unreadable_sizes = sum(1 for e in inventory.entries if e.size is None)
+    if unreadable_sizes:
+        result["unreadable_sizes"] = unreadable_sizes
     if inventory.failed_leaves:
         result["incomplete_leaves"] = inventory.failed_leaves
     return result
@@ -246,15 +250,16 @@ async def purge_raw(client: httpx.AsyncClient, base_url: str, key: str) -> str:
     return f"error (HTTP {resp.status_code})"
 
 
-async def purge_selected_raw(config: Config, repo: RepoConfig, items: dict[str, str]) -> dict[str, str]:
+async def purge_selected_raw(
+    config: Config, repo: RepoConfig, items: dict[str, str],
+    *, canonical_keys: dict[str, str] | None = None,
+) -> dict[str, str]:
     """Drop-in alternative to prefetch.purge_selected() — same inputs
     ({package_key: filename}), same result contract per key
     ("purged"/"not_cached"/"error (...)") — used by api.py's dashboard
     purge handlers (purge_selected_payload, remove_warmed_package_payload)
     INSTEAD of prefetch.purge_selected() whenever nginx.enable_cache_probe
-    is on (2026-09-14, by direct user request: "по умолчанию пурж через
-    дашборд работает стандартным механизмом, но если включен cache_probe
-    применяем purge_raw").
+    is on.
 
     Goes through the route-independent /purge-raw location (see
     nginx.render_purge()) instead of the per-repo /purge<prefix> one, using
@@ -268,6 +273,10 @@ async def purge_selected_raw(config: Config, repo: RepoConfig, items: dict[str, 
     so callers retain warmed bookkeeping until a later retry confirms
     both copies are gone. Identical keys require only one request.
 
+    canonical_keys maps filenames to shared cache keys resolved by the caller
+    from the same duplicate groups used by nginx-apply. Purging one also evicts
+    the shared copy used by other repositories.
+
     Callers gate on enable_cache_probe themselves (same convention as the
     rest of this module) — this function does not check the flag.
     """
@@ -280,6 +289,8 @@ async def purge_selected_raw(config: Config, repo: RepoConfig, items: dict[str, 
     async def _run(client: httpx.AsyncClient, key: str, filename: str) -> None:
         keys = dict.fromkeys((compute_cache_key(config, repo, filename),
                               compute_cache_key(alt_config, repo, filename)))
+        if canonical_keys and filename in canonical_keys:
+            keys[canonical_keys[filename]] = None
         outcomes = []
         for cache_key in keys:
             async with semaphore:

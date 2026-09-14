@@ -177,9 +177,10 @@ def render(config: Config, *, cache_dir: str = '/var/cache/nginx/repowatch',
     for number, (local, (scheme, host, remote, ttl)) in enumerate(sorted(routes.items())):
         # All mutable metadata (including signatures and apt translations) get short TTL.
         patterns = (r'[^/]+\.(db|files)(\.tar\.(gz|xz|zst))?(\.sig)?$',
-                    r'dists/', r'APKINDEX\.tar\.gz$', r'repodata/', r'base/', r'[^/]+-repodata$')
+                    r'dists/', r'APKINDEX\.tar\.gz$', r'repodata/', r'base/', r'[^/]+-repodata$',
+                    r'(nix-cache-info|[^/]+\.narinfo)$')
         kind = kinds[local]
-        pattern = patterns[('pacman', 'apt', 'apk', 'dnf', 'apt-rpm', 'xbps').index(kind)]
+        pattern = patterns[('pacman', 'apt', 'apk', 'dnf', 'apt-rpm', 'xbps', 'nix').index(kind)]
         for index in (True, False):
             location = f'~ ^{re.escape(local)}{pattern}' if index else local
             lines += [f'    location {location} {{']
@@ -228,12 +229,19 @@ def render(config: Config, *, cache_dir: str = '/var/cache/nginx/repowatch',
             lines += [f'        proxy_pass {scheme}://$rw_backend_{number};',
                       '        proxy_http_version 1.1;', f'        proxy_set_header Host {host};',
                       '        proxy_ssl_server_name on;']
+            if kind == 'nix':
+                basis = '$uri$is_args$args' if settings.enable_dedup else '$request_uri'
+                lines.append(f'        proxy_cache_key "{key_prefix}$scheme$proxy_host{basis}";')
+                lines.append('        proxy_cache_valid 404 1s;')
+                if not index:
+                    # Defining the negative TTL replaces the inherited TTL list.
+                    lines.append(f'        proxy_cache_valid 200 206 {settings.package_ttl}s;')
             if index:
                 if kind == 'pacman':
                     lines.append(f'        proxy_cache_key "{key_prefix}arch-index-v2:$scheme$proxy_host$request_uri";')
                 lines.append(f'        proxy_cache_valid 200 206 {ttl}s;')
             else:
-                if settings.enable_dedup:
+                if settings.enable_dedup and kind != 'nix':
                     # $uri (not $request_uri, see above) — applied to every
                     # content location uniformly when dedup is on, not just
                     # ones with a duplicate right now, so the key format
@@ -319,11 +327,12 @@ def render_purge(config: Config) -> str:
             # object; the same class of risk /metrics already guards
             # against for a different resource.
             basis = remote if settings.enable_dedup else local
+            query = '$is_args$args' if kinds[local] == 'nix' else ''
             lines += [
                 f'    location ~ ^/purge{re.escape(local)}(.*)$ {{',
                 '        allow 127.0.0.1;',
                 '        deny all;',
-                f'        proxy_cache_purge repo_cache "{key_prefix}${{scheme}}{host}{basis}$1";',
+                f'        proxy_cache_purge repo_cache "{key_prefix}${{scheme}}{host}{basis}$1{query}";',
                 '    }',
             ]
         if settings.enable_cache_probe:
@@ -352,9 +361,9 @@ def render_purge(config: Config) -> str:
 
 def compute_cache_key(config: Config, repo: RepoConfig, filename: str) -> str:
     """The exact literal proxy_cache_key string for one package file — the
-    same value a real request through render()'s content location for this
-    file would produce, computed here as a plain Python string instead of an
-    nginx expression at request time.
+    value for this repository's own content location, before any cross-repo
+    canonical rewrite. For a deduplicated request, resolve the canonical
+    repository first; this function does not consult the package database.
 
     Used by cache_probe.py: to ask /cache-probe whether one SPECIFIC known
     package is really on disk (a non-destructive complement to
@@ -441,6 +450,7 @@ def render_probe_js(config: Config, *, cache_dir: str = '/var/cache/nginx/repowa
         '        const st = fs.statSync(cachePath(hash));',
         '        result = {exists: true, size: st.size, mtime: st.mtime};',
         '    } catch (e) {',
+        "        if (e.code !== 'ENOENT') { r.return(500, 'cache stat failed\\n'); return; }",
         '        result = {exists: false};',
         '    }',
         "    r.headersOut['Content-Type'] = 'application/json';",
@@ -456,6 +466,23 @@ def render_probe_js(config: Config, *, cache_dir: str = '/var/cache/nginx/repowa
         '    return buf.slice(start, nl).toString();',
         '}',
         '',
+        'function readKey(full, buffer) {',
+        "    const fd = fs.openSync(full, 'r');",
+        '    try {',
+        '        let used = 0;',
+        '        while (used < buffer.length) {',
+        '            const count = fs.readSync(fd, buffer, used, Math.min(4096, buffer.length - used), used);',
+        "            if (count === 0) throw Error('cache key header missing or truncated');",
+        '            used += count;',
+        '            const key = extractKey(buffer.subarray(0, used));',
+        '            if (key !== null && key.length > 0) return key;',
+        '        }',
+        "        throw Error('cache key header exceeds 65536 bytes or is malformed');",
+        '    } finally {',
+        '        fs.closeSync(fd);',
+        '    }',
+        '}',
+        '',
         'function scan(r) {',
         '    const dir = r.args.dir;',
         # Validated against the fixed levels=1:2 shape (nginx.py's
@@ -465,15 +492,21 @@ def render_probe_js(config: Config, *, cache_dir: str = '/var/cache/nginx/repowa
         "    if (!/^[0-9a-f]\\/[0-9a-f]{2}$/.test(dir || '')) { r.return(400, 'bad dir\\n'); return; }",
         "    const dirPath = CACHE_DIR + '/' + dir;",
         '    let entries = [];',
-        '    try { entries = fs.readdirSync(dirPath); } catch (e) { entries = []; }',
+        '    try { entries = fs.readdirSync(dirPath); } catch (e) {',
+        "        if (e.code !== 'ENOENT') { r.return(500, 'cache directory read failed\\n'); return; }",
+        '    }',
+        '    // Reuse one bounded buffer per request; never read the package body in full.',
+        '    const buffer = Buffer.alloc(65536);',
         '    const results = entries.map((name) => {',
-        '        try {',
-        "            const full = dirPath + '/' + name;",
-        '            const buf = fs.readFileSync(full);',
-        '            const st = fs.statSync(full);',
-        '            return {file: name, key: extractKey(buf), size: st.size, mtime: st.mtime};',
-        '        } catch (e) {',
+        "        const full = dirPath + '/' + name;",
+        '        let st;',
+        '        try { st = fs.statSync(full); } catch (e) {',
         '            return {file: name, error: String(e)};',
+        '        }',
+        '        try {',
+        '            return {file: name, key: readKey(full, buffer), size: st.size, mtime: st.mtime};',
+        '        } catch (e) {',
+        '            return {file: name, size: st.size, mtime: st.mtime, error: String(e)};',
         '        }',
         '    });',
         "    r.headersOut['Content-Type'] = 'application/json';",

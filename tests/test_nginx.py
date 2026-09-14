@@ -929,3 +929,109 @@ def test_apply_detects_a_probe_only_content_change_not_just_active_conf(tmp_path
     monkeypatch.setattr(nginx, 'load_config', lambda p: c2)
     assert nginx.apply('config', str(policy))
     assert not nginx.apply('config', str(policy))
+
+
+def test_generated_probe_distinguishes_missing_files_from_io_errors(tmp_path):
+    import shutil
+    node = shutil.which('node')
+    if node is None:
+        pytest.skip('node is required to execute generated JavaScript')
+    c = config([apt()])
+    c = replace(c, nginx=replace(c.nginx, enable_cache_probe=True))
+    source = nginx.render_probe_js(c).replace('export default {probe, scan};', '')
+    script = r'''
+const vm = require('vm');
+const assert = require('assert/strict');
+const source = SOURCE;
+function invoke(handler, failure, code) {
+  const fake = {
+    readdirSync() { if (failure === 'dir') throw Object.assign(Error(code), {code}); return ['pkg']; },
+    statSync() { if (failure === 'stat') throw Object.assign(Error(code), {code}); return {size: 123, mtime: 'now'}; },
+    openSync() { return 1; },
+    closeSync() {},
+    readSync() { if (failure === 'read') throw Object.assign(Error(code), {code}); return 0; }
+  };
+  const context = {Buffer, require: name => name === 'fs' ? fake : require(name)};
+  vm.createContext(context); vm.runInContext(source, context);
+  let response;
+  context[handler]({args: {dir: 'a/bc', key: 'key'}, headersOut: {}, return(status, body) {response = {status, body};}});
+  return response;
+}
+assert.equal(invoke('scan', 'dir', 'EACCES').status, 500);
+assert.equal(invoke('scan', 'dir', 'EIO').status, 500);
+assert.deepEqual(JSON.parse(invoke('scan', 'dir', 'ENOENT').body), []);
+assert.equal(invoke('probe', 'stat', 'EIO').status, 500);
+assert.deepEqual(JSON.parse(invoke('probe', 'stat', 'ENOENT').body), {exists: false});
+const read = JSON.parse(invoke('scan', 'read', 'EIO').body)[0];
+assert.equal(read.size, 123); assert.ok(read.error);
+const stat = JSON.parse(invoke('scan', 'stat', 'EACCES').body)[0];
+assert.equal(stat.size, undefined); assert.ok(stat.error);
+'''.replace('SOURCE', json.dumps(source))
+    path = tmp_path / 'probe-test.cjs'
+    path.write_text(script)
+    subprocess.run([node, str(path)], check=True, capture_output=True, text=True)
+
+
+def test_generated_scan_bounds_reads_and_closes_files(tmp_path):
+    import shutil
+    node = shutil.which('node')
+    if node is None:
+        pytest.skip('node is required to execute generated JavaScript')
+    c = config([apt()])
+    c = replace(c, nginx=replace(c.nginx, enable_cache_probe=True))
+    source = nginx.render_probe_js(c).replace('export default {probe, scan};', '')
+    script = r'''
+const vm = require('vm');
+const assert = require('assert/strict');
+const source = SOURCE;
+function run(data, options = {}) {
+  let read = 0, closes = 0, opened = 0;
+  const fake = {
+    readdirSync() { return ['pkg']; },
+    statSync() { return {size: 1240123966, mtime: 'now'}; },
+    openSync() { if (options.openError) throw Error('open failed'); opened++; return 42; },
+    closeSync(fd) { assert.equal(fd, 42); closes++; },
+    readSync(fd, buffer, offset, length, position) {
+      assert.equal(fd, 42); assert.equal(position, read);
+      assert.ok(length <= 4096); assert.ok(buffer.length <= 65536);
+      if (options.readError) throw Error('read failed');
+      const count = Math.max(0, Math.min(length, data.length - position, options.short || Infinity));
+      data.copy(buffer, offset, position, position + count); read += count;
+      return count;
+    },
+    readFileSync() { throw Error('whole-file reads are forbidden'); }
+  };
+  const context = {Buffer, require: name => name === 'fs' ? fake : require(name)};
+  vm.createContext(context); vm.runInContext(source, context);
+  let response;
+  context.scan({args: {dir: 'a/bc'}, headersOut: {}, return(status, body) {
+    assert.equal(status, 200); response = JSON.parse(body)[0];
+  }});
+  assert.equal(closes, opened);
+  assert.equal(response.size, 1240123966);
+  return {response, read};
+}
+for (const prefix of [0, 128, 4093, 4095, 8190]) {
+  const key = 'v1|repo|/pool/package';
+  const data = Buffer.concat([Buffer.alloc(prefix), Buffer.from('\nKEY: ' + key + '\n'), Buffer.alloc(100000)]);
+  for (const short of [undefined, 3]) {
+    const result = run(data, {short});
+    assert.equal(result.response.key, key);
+    assert.ok(result.read <= prefix + key.length + 7 + 4095);
+  }
+}
+const limit = run(Buffer.concat([Buffer.alloc(65528), Buffer.from('\nKEY: k\n')]));
+assert.equal(limit.response.key, 'k'); assert.equal(limit.read, 65536);
+for (const data of [Buffer.alloc(0), Buffer.from('\nKEY: unfinished'),
+                    Buffer.from('\nKEY: \n'), Buffer.alloc(100000),
+                    Buffer.concat([Buffer.alloc(65535), Buffer.from('\nKEY: too-late\n')])]) {
+  const result = run(data);
+  assert.ok(result.response.error); assert.equal(result.response.key, undefined);
+  assert.ok(result.read <= 65536);
+}
+assert.ok(run(Buffer.alloc(10), {openError: true}).response.error);
+assert.ok(run(Buffer.alloc(10), {readError: true}).response.error);
+'''.replace('SOURCE', json.dumps(source))
+    path = tmp_path / 'bounded-scan-test.cjs'
+    path.write_text(script)
+    subprocess.run([node, str(path)], check=True, capture_output=True, text=True)

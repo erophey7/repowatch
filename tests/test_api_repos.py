@@ -1102,12 +1102,12 @@ def test_dashboard_health_and_metrics_do_not_read_package_change_lists(tmp_path,
 def test_minimal_status_lifecycle(tmp_path):
     config_path, store = _setup(tmp_path)
     assert status_payload(config_path, store) == (200, {
-        'alpine-test': {'last_check': None, 'changed_at': None, 'stale': True},
+        'alpine-test': {'last_check': None, 'changed_at': None, 'stale': True, 'pending_replacements': 0},
     })
     store.record_snapshot(RepoSnapshot('alpine-test', {'one-1': 'one.apk'}))
     code, first = status_payload(config_path, store, 'alpine-test')
     assert code == 200
-    assert set(first) == {'last_check', 'changed_at', 'stale'}
+    assert set(first) == {'last_check', 'changed_at', 'stale', 'pending_replacements'}
     assert first['changed_at'] and first['stale'] is False
     store.touch_last_check('alpine-test')
     assert status_payload(config_path, store, 'alpine-test')[1]['changed_at'] == first['changed_at']
@@ -1472,10 +1472,8 @@ def test_purge_selected_payload_purges_and_cleans_up_warmed_bookkeeping(tmp_path
 
 
 def test_purge_selected_payload_uses_cache_probe_when_enable_cache_probe_is_on(tmp_path, monkeypatch):
-    """By direct user request (2026-09-14): "по умолчанию пурж через
-    дашборд работает стандартным механизмом, но если включен cache_probe
-    применяем purge_raw" — with nginx.enable_cache_probe on, "Purge
-    selected" must go through cache_probe.purge_selected_raw() instead of
+    """With nginx.enable_cache_probe on, "Purge selected" must go through
+    cache_probe.purge_selected_raw() instead of
     prefetch.purge_selected(), not just fall back to it."""
     config_path, store = _setup_purge(tmp_path, enable_cache_probe=True)
     store.record_warmed_package("alpine-test", "a-1", "a-1.apk", True, 200)
@@ -1532,3 +1530,47 @@ nginx:
     assert status == 200
     assert payload[result_field]['foo'] == 'purged'
     assert store.get_warmed_packages('core') == []
+
+
+@pytest.mark.parametrize('action', [purge_selected_payload, remove_warmed_package_payload])
+@pytest.mark.parametrize('canonical_status', [200, 503])
+def test_purge_duplicate_checks_shared_canonical_copy(tmp_path, monkeypatch, action, canonical_status):
+    import httpx
+    from repowatch.nginx import compute_cache_key, resolve_dedup_pairs
+    config_path = _write_config(tmp_path, '''  - id: a
+    type: dnf
+    upstream: https://a.test/repo
+    arch: x86_64
+  - id: b
+    type: dnf
+    upstream: https://b.test/repo
+    arch: x86_64
+nginx:
+  enabled: true
+  enable_purge: true
+  enable_cache_probe: true
+  enable_dedup: true
+''', admin_password='secret123')
+    config = load_config(config_path)
+    store = StateStore(config.state_db)
+    for repo_id in ('a', 'b'):
+        store.record_snapshot(RepoSnapshot(repo_id, {'foo-1': 'foo.rpm'},
+                                          content_hashes={'foo-1': 'a' * 64}))
+    store.record_warmed_package('b', 'foo-1', 'foo.rpm', True, 200)
+    assert resolve_dedup_pairs(config, store.find_duplicate_files()) == [('/rpm/b/foo.rpm', '/rpm/a/foo.rpm')]
+    canonical_key = compute_cache_key(config, config.repo_by_id('a'), 'foo.rpm')
+    seen = []
+    def handler(request):
+        key = request.url.params['key']
+        seen.append(key)
+        return httpx.Response(canonical_status if key == canonical_key else 404)
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr('repowatch.cache_probe.httpx.AsyncClient',
+                        lambda **kw: real_client(transport=httpx.MockTransport(handler)))
+    status, payload = action(config_path, store, 'b', _session(config_path, 'secret123'),
+                             {'package_keys': ['foo-1']})
+    field = 'results' if action is purge_selected_payload else 'purge_results'
+    assert status == 200
+    assert seen.count(canonical_key) == 1
+    assert payload[field]['foo-1'] == ('purged' if canonical_status == 200 else 'error (HTTP 503)')
+    assert bool(store.get_warmed_packages('b')) == (canonical_status != 200)
