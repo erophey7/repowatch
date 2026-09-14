@@ -1,27 +1,16 @@
-"""Notifications for repeated warm/GPG-verification failures.
+"""Opt-in repository events and bounded, idempotency-aware webhook delivery.
 
-The only channel is a generic JSON webhook via httpx (POST), not email/SMTP:
-we don't want to drag SMTP server config/credentials into this otherwise
-simple tool (see CLAUDE.md — minimum dependencies — httpx is already there
-for network I/O, adding an smtplib layer for a second channel would be
-excessive). The "text" field in the payload is a human-readable string that
-Slack/Mattermost incoming webhooks display directly; Discord requires its
-Slack-compatible /slack endpoint; the other fields are for anyone parsing the JSON
-themselves.
-
-A notification is sent not on every failure, but once when the
-consecutive_failures threshold (config.notify_after_failures) is reached —
-otherwise a persistently broken upstream would produce a message on every
-check cycle. And once on recovery (the first success after a failure
-notification) — so the operator doesn't have to guess whether it fixed
-itself.
-
-Never raises outward — a failure to send the notification itself (webhook
-unreachable, DNS, etc.) must not take down check_repo/warm_cache."""
+Existing failure streak bookkeeping remains in SQLite. Delivery retries are
+in memory, not a durable outbox. See docs/webhooks.md for guarantees.
+"""
 
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import logging
+import uuid
 
 import httpx
 
@@ -43,11 +32,12 @@ async def record_failure_and_maybe_notify(
     watcher._check_key_expiry; the mechanism itself is identical)."""
     count, already_notified = store.bump_failure(repo_id, kind, message)
 
-    if not config.notify_webhook_url or already_notified or count < config.notify_after_failures:
+    if (not enabled(config, "repository.failing") or already_notified
+            or count < config.notify_after_failures):
         return
 
-    sent = await _send(
-        config.notify_webhook_url,
+    sent = await emit(
+        config, "repository.failing", repo_id,
         {
             "text": f"repowatch: {repo_id} — {kind} has failed {count} time(s) in a row: {message}",
             "repo_id": repo_id,
@@ -68,11 +58,11 @@ async def record_success_and_maybe_notify(
     failure notification was already sent for this streak, send a separate
     recovery notification."""
     was_notified = store.reset_failure(repo_id, kind)
-    if not was_notified or not config.notify_webhook_url:
+    if not was_notified or not enabled(config, "repository.recovered"):
         return
 
-    await _send(
-        config.notify_webhook_url,
+    await emit(
+        config, "repository.recovered", repo_id,
         {
             "text": f"repowatch: {repo_id} — {kind} is working again",
             "repo_id": repo_id,
@@ -82,12 +72,59 @@ async def record_success_and_maybe_notify(
     )
 
 
-async def _send(url: str, payload: dict) -> bool:
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(url, json=payload, timeout=10)
-            resp.raise_for_status()
-        return True
-    except httpx.HTTPError:
-        logger.warning("failed to send webhook notification to %s", url, exc_info=True)
+def enabled(config: Config, event: str) -> bool:
+    return bool(config.notify_webhook_url and event in config.notify_events)
+
+
+async def emit(config: Config, event: str, repo_id: str, data: dict) -> bool:
+    """Create one immutable event envelope; retries keep its ID and timestamp."""
+    if not enabled(config, event):
         return False
+    payload = {**data, "event": event, "event_id": str(uuid.uuid4()),
+               "schema_version": 1, "occurred_at": datetime.now(timezone.utc).isoformat(),
+               "repo_id": repo_id}
+    payload.setdefault("text", f"repowatch: {repo_id} — {event}")
+    return await _send(config.notify_webhook_url, payload)
+
+
+def _retry_delay(value: str | None, attempt: int) -> float:
+    """Honor Retry-After seconds or HTTP dates; caller declines long delays."""
+    delay = float(2 ** attempt)
+    if value:
+        try:
+            seconds = int(value) if value.isascii() and value.isdigit() else (
+                parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds()
+            delay = max(delay, seconds)
+        except (ValueError, TypeError, OverflowError):
+            pass
+    return delay
+
+
+async def _send(url: str, payload: dict) -> bool:
+    # Never log URLs, response bodies or exception text: webhook URLs commonly
+    # contain bearer credentials. Cancellation must still propagate normally.
+    async with httpx.AsyncClient(follow_redirects=False) as client:
+        for attempt in range(3):
+            retry_after = None
+            try:
+                async with asyncio.timeout(10):
+                    response = await client.post(
+                        url, json=payload, timeout=10,
+                        headers={"Idempotency-Key": payload["event_id"]})
+                if 200 <= response.status_code < 300:
+                    return True
+                if response.status_code != 429 and not 500 <= response.status_code < 600:
+                    logger.warning("webhook rejected event %s (HTTP %s)",
+                                   payload["event_id"], response.status_code)
+                    return False
+                retry_after = response.headers.get("Retry-After")
+            except (httpx.HTTPError, httpx.InvalidURL, TimeoutError):
+                pass
+            if attempt == 2:
+                break
+            delay = _retry_delay(retry_after, attempt)
+            if delay > 30:
+                break
+            await asyncio.sleep(delay)
+    logger.warning("webhook delivery exhausted for event %s", payload["event_id"])
+    return False

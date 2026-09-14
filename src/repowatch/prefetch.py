@@ -142,6 +142,41 @@ def _purge_url(config: Config, repo: RepoConfig, filename: str) -> str:
 
 
 async def warm_cache(
+    config: Config, repo: RepoConfig, store: StateStore,
+    new_packages: dict[str, str], force: bool = False,
+    *, expected_hashes: dict[str, str] | None = None,
+) -> dict[str, bool]:
+    """Warm selected packages, optionally publishing correlated lifecycle events."""
+    from repowatch.notifications import emit, enabled
+    if (not new_packages or (not force and not repo.prefetch)
+            or not any(enabled(config, e) for e in ('warm.started', 'warm.completed'))):
+        return await _warm_cache(config, repo, store, new_packages, force,
+                                 expected_hashes=expected_hashes)
+    from repowatch.warming_policy import WarmingPolicy
+    import uuid
+    policy = WarmingPolicy(repo, store)
+    selected = {key: path for key, path in new_packages.items() if path and policy.allows(key)}
+    if not selected:
+        return await _warm_cache(config, repo, store, new_packages, force,
+                                 expected_hashes=expected_hashes)
+    operation = {'operation_id': str(uuid.uuid4()), 'requested': len(new_packages),
+                 'eligible': len(selected), 'manual': force}
+    await emit(config, 'warm.started', repo.id, operation)
+    try:
+        outcomes = await _warm_cache(config, repo, store, selected, force,
+                                     expected_hashes=expected_hashes)
+    except Exception:
+        await emit(config, 'warm.completed', repo.id, {**operation, 'status': 'error'})
+        raise
+    succeeded = sum(outcomes.values())
+    failed = len(outcomes) - succeeded
+    await emit(config, 'warm.completed', repo.id, {
+        **operation, 'status': 'partial' if failed and succeeded else 'failed' if failed else 'completed',
+        'succeeded': succeeded, 'failed': failed, 'skipped': len(new_packages) - len(outcomes)})
+    return outcomes
+
+
+async def _warm_cache(
     config: Config,
     repo: RepoConfig,
     store: StateStore,

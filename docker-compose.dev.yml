@@ -1,0 +1,75 @@
+# Development stack: local images and checkout-mounted bootstrap files.
+# Build images with make docker-compose-build before starting.
+name: repowatch-trial
+services:
+  init:
+    image: ${DOCKER_IMAGE:-repowatch:local}
+    pull_policy: never
+    user: "0:0"
+    network_mode: none
+    environment:
+      REPOWATCH_GID: ${REPOWATCH_GID:-10001}
+    entrypoint: ["python", "/bootstrap/init.py"]
+    command: []
+    restart: "no"
+    volumes:
+      - ./docker/compose/init.py:/bootstrap/init.py:ro
+      - ./docker/compose/config.example.yaml:/bootstrap/config.yaml:ro
+      - ./config:/etc/repowatch
+      - ./data/state:/var/lib/repowatch
+      - ./data/nix:/nix
+      - ./data/cache:/var/cache/nginx/repowatch
+
+  nginx:
+    user: "0:${REPOWATCH_GID:-10001}"
+    image: ${DOCKER_NGINX_IMAGE:-repowatch-nginx:trial}
+    pull_policy: never
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    stop_grace_period: 30s
+    security_opt: ["no-new-privileges:true"]
+    ports:
+      - "127.0.0.1:18080:8080"
+      # Published here because repowatch shares this network namespace.
+      - "127.0.0.1:18085:8085"
+    volumes:
+      - ./config:/etc/repowatch:ro
+      # The existing helper uses SQLite for dedup; UID/GID is coordinated by init.
+      - ./data/state:/var/lib/repowatch
+      - ./data/cache:/var/cache/nginx/repowatch
+    healthcheck:
+      test: ["CMD", "python", "-c", "from pathlib import Path; import urllib.request; assert Path('/run/repowatch-nginx.ready').exists(); assert urllib.request.urlopen('http://127.0.0.1:8081/healthz', timeout=2).status == 200"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  repowatch:
+    user: "10001:${REPOWATCH_GID:-10001}"
+    image: ${DOCKER_IMAGE:-repowatch:local}
+    pull_policy: never
+    network_mode: service:nginx
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      nginx:
+        condition: service_healthy
+        restart: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    volumes:
+      - ./config:/etc/repowatch
+      - ./data/state:/var/lib/repowatch
+      # Empty in the base variant; ready for the optional Nix image.
+      - ./data/nix:/nix
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json, urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8085/healthz', timeout=2))['healthy']"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
+

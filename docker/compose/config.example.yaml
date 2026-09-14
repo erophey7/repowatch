@@ -1,0 +1,33 @@
+# Trial stack: small initial scope, no automatic package downloads.
+state_db: /var/lib/repowatch/state.sqlite3
+cache_base_url: http://127.0.0.1:8080
+public_cache_url: http://127.0.0.1:18080
+check_interval: 300
+prefetch_bandwidth_limit: 2097152
+status_server:
+  bind: 0.0.0.0
+  port: 8085
+  guest_read_only: true
+# Set a password with the Compose exec command for your stack (see docs/docker.md).
+admin_password_hash: null
+nginx:
+  enabled: true
+  listen: '8080'
+  cache_dir: /var/cache/nginx/repowatch
+  cache_max_size: 2g
+  enable_purge: true
+  enable_cache_probe: true
+  enable_dedup: true
+syslog_listener:
+  enabled: true
+  bind: 127.0.0.1
+  port: 5514
+repos:
+  - id: debian-bookworm-main
+    type: apt
+    upstream: https://deb.debian.org/debian
+    arch: amd64
+    distribution: bookworm
+    component: main
+    prefetch: false
+    group: Compose trial

@@ -154,6 +154,13 @@ Issues and pull requests are welcome. There's no CI pipeline yet — run
 sending a PR; see [Install → Development](#development) above for the dev
 setup.
 
+## Experimental container builds
+
+See [Docker builds](docs/docker.md) for generated build files, Make targets and
+optional experimental features and [docker-compose.dev.yml](docker-compose.dev.yml).
+The Docker Hub release Compose draft stays local until release preparation. Container runtime
+validation is still pending.
+
 ## License
 
 [MIT](LICENSE).

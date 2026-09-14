@@ -18,7 +18,7 @@ import httpx
 
 from repowatch.config import Config, ConfigError, RepoConfig, load_config
 from repowatch.gpgverify import SignatureError, soonest_key_expiry
-from repowatch.notifications import record_failure_and_maybe_notify, record_success_and_maybe_notify
+from repowatch.notifications import emit, record_failure_and_maybe_notify, record_success_and_maybe_notify
 from repowatch.parsers import PARSERS
 from repowatch.parsers.base import IndexHeadResult
 from repowatch.prefetch import purge_removed, purge_selected, warm_cache
@@ -134,6 +134,11 @@ async def check_repo(config: Config, repo: RepoConfig, store: StateStore) -> Non
     diff = store.record_snapshot(
         snapshot, index_etag=head.etag, index_last_modified=head.last_modified
     )
+
+    if diff.changed:
+        await emit(config, 'repository.changed', repo.id, {
+            'added': len(diff.new_packages), 'removed': len(diff.removed_packages),
+            'modified': len(diff.modified_packages), 'packages': len(snapshot.packages)})
 
     await refresh_replacements(config, repo, store)
 

@@ -12,6 +12,10 @@ from typing import Any
 import yaml
 
 
+WEBHOOK_EVENTS = frozenset({'repository.failing', 'repository.recovered',
+                            'repository.changed', 'warm.started', 'warm.completed'})
+
+
 class ConfigError(Exception):
     """Invalid configuration."""
 
@@ -374,6 +378,8 @@ class Config:
     # exactly once when the threshold is reached, not on every subsequent
     # failure.
     notify_after_failures: int = 3
+    notify_events: list[str] = field(default_factory=lambda: [
+        "repository.failing", "repository.recovered"])
     # global limit on total warm-up bandwidth (bytes/sec through
     # warm_cache, not requests/sec — the size of warmed files varies by
     # orders of magnitude, from a few hundred bytes for a pacman .desc to
@@ -394,6 +400,10 @@ class Config:
     key_expiry_warning_days: int = 30
 
     def __post_init__(self) -> None:
+        if (not isinstance(self.notify_events, list)
+                or any(not isinstance(e, str) or e not in WEBHOOK_EVENTS for e in self.notify_events)
+                or len(set(self.notify_events)) != len(self.notify_events)):
+            raise ConfigError("notify_events must be a list of unique supported webhook events")
         from repowatch.bandwidth import validate_limit, validate_schedule
         try:
             validate_limit(self.prefetch_bandwidth_limit)
@@ -478,6 +488,7 @@ def load_config(path: str | Path) -> Config:
             prefetch_bandwidth_schedule=raw.get('prefetch_bandwidth_schedule', []),
             notify_webhook_url=(str(raw["notify_webhook_url"]) if raw.get("notify_webhook_url") else None),
             notify_after_failures=int(raw.get("notify_after_failures", 3)),
+            notify_events=raw.get("notify_events", ["repository.failing", "repository.recovered"]),
             key_expiry_warning_days=int(raw.get("key_expiry_warning_days", 30)),
         )
         if config.nginx.enabled or any(repo.url_template is not None for repo in config.repos):

@@ -11,7 +11,8 @@ Install Nix with `nix`, `nix-env`, and `nix-instantiate` on the service's PATH.
 The service account must be able to use the Nix store or daemon, including
 adding source trees and evaluation results. `check-config` checks executable
 availability; it does not prove daemon permissions or evaluate a source.
-The standard repowatch installer and container image do not install Nix.
+The standard repowatch installer and base container image do not install Nix.
+The experimental container build can explicitly include it; see [Docker builds](docker.md).
 Native integration tests exercise Nix 2.24.11; production tests also passed
 with Ubuntu's Nix 2.18.1 daemon.
 

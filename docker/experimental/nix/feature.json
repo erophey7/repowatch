@@ -1,0 +1,8 @@
+{
+  "description": "Optional Nix CLI using a private, application-owned local store; no daemon or host socket.",
+  "build_packages": [],
+  "runtime_packages": ["nix-bin"],
+  "requires": [],
+  "conflicts": [],
+  "volumes": ["/nix"]
+}

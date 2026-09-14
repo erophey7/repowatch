@@ -29,6 +29,8 @@ help:
 	@echo 'make activate  Explicit local systemd/nginx activation (root, no DESTDIR)'
 	@echo 'Paths: PREFIX SYSCONFDIR LOCALSTATEDIR DESTDIR CACHE_DIR'
 	@echo 'Integration: WITH_NGINX WITH_SYSTEMD NGINX_CONF NGINX_ENABLED_DIR SYSTEMD_UNIT_DIR'
+	@echo 'Docker: docker-generate docker-check docker-build docker-clean docker-features docker-compose-build'
+	@echo 'Docker options: DOCKER_EXPERIMENTAL=nix DOCKER_IMAGE=tag DOCKER_ENGINE=docker'
 	@echo 'Infrastructure commands: make -f Makefile.dev help'
 
 dev:
@@ -61,3 +63,24 @@ upgrade-plan:
 	$(PYTHON) -B scripts/upgrade-system.py --manifest "$(MANIFEST)" --wheelhouse "$(WHEELHOUSE)"
 upgrade:
 	$(PYTHON) -B scripts/upgrade-system.py --manifest "$(MANIFEST)" --wheelhouse "$(WHEELHOUSE)" --apply
+
+# Only explicit Docker targets generate context files or invoke the build engine.
+DOCKER_EXPERIMENTAL ?=
+DOCKER_ENGINE ?= docker
+export DOCKER_EXPERIMENTAL DOCKER_ENGINE DOCKER_IMAGE DOCKER_NGINX_IMAGE
+.PHONY: docker-generate docker-check docker-build docker-clean docker-features
+docker-generate:
+	$(PYTHON) -B scripts/docker.py generate
+docker-check:
+	$(PYTHON) -B scripts/docker.py check
+docker-build:
+	$(PYTHON) -B scripts/docker.py build
+docker-clean:
+	$(PYTHON) -B scripts/docker.py clean
+docker-features:
+	$(PYTHON) -B scripts/docker.py features
+
+# Builds the trial images only; starting/stopping Compose remains explicit.
+.PHONY: docker-compose-build
+docker-compose-build:
+	$(PYTHON) -B scripts/docker.py compose-build

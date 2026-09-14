@@ -161,3 +161,15 @@ repos:
   # These fields also apply to manual warming. See docs/warming-policy.md.
   #   prefetch_whitelist: ["linux-*", "bash"]
   #   prefetch_blacklist: ["*-debug", "*-doc"]
+
+# Webhook delivery is disabled until a secret URL is configured.
+# notify_webhook_url: https://receiver.example/hooks/your-token
+# Defaults preserve failure/recovery alerts; lifecycle events are opt-in.
+# notify_events:
+#   - repository.failing
+#   - repository.recovered
+#   - repository.changed
+#   - warm.started
+#   - warm.completed
+# Delivery: at most 3 attempts with one stable event ID, no persistent outbox.
+# See docs/webhooks.md for receiver deduplication and retry limits.

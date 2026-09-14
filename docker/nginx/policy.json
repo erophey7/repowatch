@@ -1,0 +1,7 @@
+{
+  "cache_dir": "/var/cache/nginx/repowatch",
+  "access_log": "/var/log/nginx/repo-cache.access.log",
+  "site_link": "/etc/nginx/conf.d/repowatch.conf",
+  "nginx_binary": "/usr/sbin/nginx",
+  "nginx_conf": "/etc/nginx/nginx.conf"
+}
