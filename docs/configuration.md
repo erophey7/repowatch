@@ -5,8 +5,24 @@ no auto-discovery: every repository you want watched/cached has to be listed
 explicitly. The CLI reads `/etc/repowatch/config.yaml` by default; pass
 `-c`/`--config` to use a different path.
 
-This file documents every field. For a working starting point, copy an
-example config and edit it (see the main README's Quick start).
+This file documents every field. Start with the [quick start](quick-start.md)
+and [repository management examples](repositories.md).
+
+**Schema defaults versus installation defaults:** the tables below describe
+what happens when a field is omitted. The shipped `config/config.example.yaml`
+sets an explicit profile: no repositories (`repos: []`), 900-second checks,
+four index checks/four downloads per warm run, a shared 10 MiB/s warm budget,
+100 GiB nginx cache target, purge/dedup/cache probe and syslog enabled, loopback
+status binding, no guest access, and repository-scoped host tokens. Omitting
+nginx feature flags still leaves them disabled for compatibility with existing
+configurations. Upgrades preserve existing YAML rather than replacing it.
+
+An empty repository list is valid. It keeps administration available and starts
+no upstream checks. `/healthz` can report healthy with zero sources; it does not
+assert that clients have usable repositories. Use `repos: []`, not `null`.
+Signature verification requires repository-specific trusted keys, TLS requires
+certificates, webhooks require a destination, and Nix requires its optional CLI;
+these cannot be made operational by a universal default.
 
 - [Top-level fields](#top-level-fields)
 - [Bandwidth schedules](#bandwidth-schedules)
@@ -45,7 +61,7 @@ example config and edit it (see the main README's Quick start).
 | `status_server` | mapping | — | See [`status_server`](#status_server). |
 | `syslog_listener` | mapping | — | See [`syslog_listener`](#syslog_listener). |
 | `nginx` | mapping | — | See [`nginx`](#nginx). |
-| `repos` | list | — (required, non-empty) | See [`repos[]`](#repos). |
+| `repos` | list | `[]` | Empty installations are valid; add sources through YAML or the dashboard. See [`repos[]`](#repos). |
 
 ## Bandwidth schedules
 
@@ -321,7 +337,7 @@ config actually serves them.
 | `cache_dir` | path or `null` | `null` | **Read-only/informational** — the actual cache directory nginx writes to is set once, at install time, in the root-owned `policy.json` (see `CACHE_DIR` in [deployment.md](deployment.md)), not here. Setting this makes the path visible in `config.yaml` instead of hidden inside a file the service user can't read; `nginx-apply` cross-checks it against `policy.json` and refuses to apply on a mismatch, so it can't silently go stale. To actually change the cache directory: `sudo make install CACHE_DIR=... && sudo make activate` (stop the repowatch services/timers first). Setting it also unlocks the cache directory's size in `repowatch stats --cache-dir` and the dashboard's Storage panel ("Calculate cache directory size") — without it there is no path to walk, so that number is simply omitted rather than guessed at or defaulted to zero. **A real permissions caveat, found on a live deployment**: nginx creates `proxy_cache_path`'s `levels=1:2` subdirectories `0700`, owned by the nginx worker user (e.g. `www-data`) — regardless of the top-level `cache_dir`'s own mode. repowatch deliberately runs as a separate, unprivileged service user (not the nginx worker's), so on most real installs it can list the top-level directory but cannot descend into any of the hashed subdirectories at all. When that happens the reported size is a real undercount, but it is never silently wrong: the result includes `inaccessible_directories` (CLI prints a `WARNING`, the dashboard shows it in red) whenever this happens, so a permission wall doesn't read as "the cache is empty". Turning on `enable_cache_probe` below sidesteps this permission gap entirely (the scan runs inside the nginx worker itself, not as the repowatch service user) — see its own row for what that trades off instead. |
 | `enable_purge` | bool | `false` | Actively evict a package's cache entry the moment it disappears from the upstream index, instead of waiting for `inactive`/`max_size` to notice on their own. Requires the third-party `ngx_cache_purge` nginx module (Debian/Ubuntu: `libnginx-mod-http-cache-purge`; Arch: `nginx-mod-cache_purge`) — **not** the nginx-plus `proxy_cache_purge on` API, and not a real `PURGE` HTTP method (nginx core rejects unknown methods outright); the generator instead adds a dedicated, loopback-only `GET /purge<prefix>/...` location per repository. You must separately add `load_module ".../ngx_http_cache_purge_module.so";` to your own main `nginx.conf` — that's a main-context directive the generated file (which lives inside `http{}`/`sites-enabled`) can't emit itself. Without the module loaded, `nginx -t` fails clearly during `nginx-apply` and the usual atomic rollback applies — it doesn't silently do nothing. When it's on, the dashboard's per-repository panel also gets a "Cache purge (stale warmed entries)" section: "Scan for stale entries" computes candidates from repowatch's own records only (no nginx/network call), then "Purge selected" is the only point that actually asks nginx — its 200/404 response IS the "was this cached" answer, so there's no separate non-destructive pre-check (a normal HEAD/GET on a cache miss can fetch and populate the object, so it is not a read-only existence check; nginx normally converts HEAD to GET for caching via [proxy_cache_convert_head](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_cache_convert_head)). If `enable_cache_probe` is *also* on, "Purge selected" and un-warming go through that instead — see its own row below. |
 | `enable_dedup` | bool | `false` | When two DIFFERENT repositories publish the byte-identical file (e.g. the same binary package shipped by both Debian and Ubuntu), serve and cache it once instead of twice. Detected from a per-package SHA256 that apt/pacman/dnf/xbps indexes (and Gentoo indexes that advertise SHA256) publish — apk and apt-rpm packages never participate (see below). No extra download or storage of file content is needed; only the already-parsed index metadata is compared. |
-| `enable_cache_probe` | bool | `false` | Read-only cache introspection running *inside the nginx worker itself*, via the third-party `ngx_http_js_module` (njs) — Debian/Ubuntu: `libnginx-mod-http-js`; Arch: `nginx-mod-njs`. Same `load_module` caveat as `enable_purge` (a main-context directive the generated file can't emit itself). Solves a real permission problem: repowatch's own unprivileged process cannot read `proxy_cache_path`'s `0700`-owned subdirectories (see `cache_dir`'s own caveat above), but nginx's worker already owns them — so a small njs script running there can. Adds two loopback-only endpoints (`/cache-probe?key=...`: does this exact package's cache entry exist right now — a genuine non-destructive check, unlike asking via purge; `/cache-scan?dir=<a>/<bb>`: list one of the 4096 fixed leaf directories nginx's cache tree always has, together with each file's real on-disk key) and, when `enable_purge` is *also* on, one more: `/purge-raw?key=...` — evicts an arbitrary already-known key regardless of whether any current repository route still exists for it (the only way to clean up a repository removed from `config.yaml` whose files are still on disk). Two concrete effects on other features when this is on: the dashboard's "Calculate cache directory size" / `repowatch stats --cache-dir` use this instead of `os.walk()` — no `cache_dir` needed, no permission undercount (though a single leaf directory can still fail to respond on its own, e.g. a transient timeout; directory I/O errors also return HTTP 500 rather than an empty list; when a scan is partial the result carries `incomplete_leaves`, the same "you can see it's an undercount" signal `inaccessible_directories` gives the os.walk() path, not silence); and the dashboard's "Purge selected" and "Remove from warmed" buttons switch from the per-repository `/purge<prefix>` location to `/purge-raw`, checking both distinct keys obtained with `enable_dedup` on and off. This removes both old and current copies after a dedup toggle; an error for either key preserves the warmed record for retry. Identical keys are requested only once. With dedup enabled, manual purge also checks the canonical key resolved from the current package database, using the same duplicate groups as nginx-apply. Evicting that shared copy affects every repository using it; their next request can populate it again. This describes the current mapping after nginx reconciliation, not historical canonical keys after a mapping change. Changes to upstream, URL templates or `cache_key_version` require identifying the actual old keys separately. This switch is dashboard-only: the *automatic* hourly `warmed_retention_days` expiry (see above) always purges through the per-repository location regardless of this setting. |
+| `enable_cache_probe` | bool | `false` | Read-only cache introspection running *inside the nginx worker itself*, via the third-party `ngx_http_js_module` (njs) — Debian/Ubuntu: `libnginx-mod-http-js`; Arch: `nginx-mod-njs`. Same `load_module` caveat as `enable_purge` (a main-context directive the generated file can't emit itself). Solves a real permission problem: repowatch's own unprivileged process cannot read `proxy_cache_path`'s `0700`-owned subdirectories (see `cache_dir`'s own caveat above), but nginx's worker already owns them — so a small njs script running there can. Adds two loopback-only endpoints (`/cache-probe?key=...`: does this exact package's cache entry exist right now — a genuine non-destructive check, unlike asking via purge; `/cache-scan?dir=<a>/<bb>`: list one of the 4096 fixed leaf directories nginx's cache tree always has, together with each file's real on-disk key) and, when `enable_purge` is *also* on, one more: `/purge-raw?key=...` — evicts an arbitrary already-known key regardless of whether any current repository route still exists for it (the only way to clean up a repository removed from `config.yaml` whose files are still on disk). Two concrete effects on other features when this is on: the dashboard's "Calculate cache directory size" / `repowatch stats --cache-dir` use this instead of `os.walk()` — no `cache_dir` needed, no permission undercount (though a single leaf directory can still fail to respond on its own, e.g. a transient timeout; directory I/O errors also return HTTP 500 rather than an empty list; when a scan is partial the result carries `incomplete_leaves`, the same "you can see it's an undercount" signal `inaccessible_directories` gives the os.walk() path, not silence); and the dashboard's "Purge selected" and "Remove from warmed" buttons switch from the per-repository `/purge<prefix>` location to `/purge-raw`, checking both distinct keys obtained with `enable_dedup` on and off. This removes both old and current copies after a dedup toggle; an error for either key preserves the warmed record for retry. Identical keys are requested only once. With dedup enabled, manual purge also checks the canonical key resolved from the current package database, using the same duplicate groups as nginx-apply. Evicting that shared copy affects every repository using it; their next request can populate it again. This describes the current mapping after nginx reconciliation, not historical canonical keys after a mapping change. Changes to upstream, URL templates or `cache_key_version` require identifying the actual old keys separately. The automatic hourly `warmed_retention_days` expiry uses the same backend and key selection. Successful purge removes only the bookkeeping generation selected before the request; a concurrent warm or observed client request preserves its newer record. This protects bookkeeping, but does not make nginx eviction and SQLite updates a single transaction. |
 
 **Purge locations live in a separate included file.** When `enable_purge` is
 on, the generated `active.conf` doesn't inline the purge locations among the
@@ -457,6 +473,23 @@ Validates the file and exits — it does not create `state_db`, connect to any
 network, or otherwise touch disk beyond reading `config.yaml` itself. Use
 this in CI or before rolling out a config change.
 
+Operational integer settings are validated without truncating floats or converting
+booleans. In YAML, use integer scalars (`60`, not `"60"` or `60.5`).
+`check_interval` (global and per repository), `check_concurrency`,
+`prefetch_concurrency`, `notify_after_failures`, and non-null row limits accept
+1..2147483647. Retention periods accept 1..365000 days; the upper bound protects
+calendar arithmetic. `key_expiry_warning_days` accepts 0..365000. Use `null` to
+clear an optional row limit; zero does not disable retention. Repository
+`prefetch`/`verify_signature` and `syslog_listener.enabled` require YAML booleans.
+The dashboard accepts integer text from form fields, but rejects booleans and
+fractional numbers without replacing the existing YAML.
+
+Unreadable files, invalid UTF-8, malformed YAML and invalid configuration values
+are reported as configuration errors. A running scheduler keeps its last valid
+configuration after a failed reload; startup still requires a valid file.
+Authenticated/read API configuration loading fails closed when the current file
+is unavailable. The existing `/healthz` exception described above is unchanged.
+
 ## Failed operations and cache observations
 
 Automatic warming runs for newly detected package keys. A failed initial attempt is
@@ -523,3 +556,18 @@ Existing databases gain the history field with an empty-list default and a
 pending-work table on startup. Back up the database before upgrading. Old
 history remains readable; restoring an earlier release should use the matching
 pre-upgrade database backup as described in deployment.md.
+
+
+HTTP index validators are bound to a fingerprint of the repository source and
+parser parameters. Changing upstream, architecture, suite, component, URL template
+or Nix catalog selection forces a full index fetch on the next scheduled check.
+Existing databases without fingerprints also fetch once before reusing validators.
+The previous snapshot remains available if that fetch fails. Historical physical
+cache keys are not automatically relocated or erased by a source edit; use the
+cache inventory to identify old origins before removing their files.
+
+The warm list records observed warming, not every file in nginx. Client requests
+can populate nginx independently, UDP access logs can be lost, and a cache may
+predate the current database. Indexes and Nix closure artifacts also do not map
+one-to-one to warm-list rows. An inventory entry missing from that list is not
+by itself proof that the file is stale or safe to purge.

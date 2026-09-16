@@ -30,16 +30,17 @@ from typing import Any
 import httpx
 import yaml
 
-from repowatch.state import RepoSnapshot, StateStore
+from repowatch.models import RepoSnapshot
+from repowatch.runtime.context import ServiceState
 from repowatch.auth import hash_password
-from repowatch.access import COOKIE_NAME
+from repowatch.web.access import COOKIE_NAME
 
 logger = logging.getLogger(__name__)
 
 
-def seed(root: Path, repos: int, packages: int, events: int) -> tuple[StateStore, dict, RepoSnapshot]:
-    store = StateStore(root / "state.sqlite3")
-    config = {"state_db": str(store.db_path), "cache_base_url": "http://127.0.0.1:9", "repos": []}
+def seed(root: Path, repos: int, packages: int, events: int) -> tuple[ServiceState, dict, RepoSnapshot]:
+    store = ServiceState(root / "state.sqlite3")
+    config = {"state_db": str(store.database.db_path), "cache_base_url": "http://127.0.0.1:9", "repos": []}
     snapshot = None
     for r in range(repos):
         repo_id = f"r{r}"
@@ -47,12 +48,12 @@ def seed(root: Path, repos: int, packages: int, events: int) -> tuple[StateStore
                                 "distribution": "test", "component": "main", "arch": "amd64", "prefetch": False})
         data = {f"pkg-{i:07}-1": f"pool/main/p/pkg-{i:07}_1_amd64.deb" for i in range(packages)}
         current = RepoSnapshot(repo_id, data, {k: k.removesuffix("-1") for k in data})
-        store.record_snapshot(current)
+        store.repositories.record_snapshot(current)
         if r == 0:
             snapshot = current
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     # Bulk seed avoids timing thousands of fixture transactions as a benchmark.
-    with sqlite3.connect(store.db_path) as conn:
+    with sqlite3.connect(store.database.db_path) as conn:
         conn.executemany(
             "INSERT INTO request_events (ts,repo_id,client_ip,method,path,status,cache_status) VALUES (?,?,?,?,?,?,?)",
             ((now, f"r{i % repos}", f"192.0.2.{i % 200 + 1}", "GET", f"/debian/pool/main/p/pkg-{i % packages:07}_1_amd64.deb", "200", "HIT") for i in range(events)),
@@ -117,17 +118,17 @@ async def run_case(base: str, name: str, paths: list[str], concurrency: int, sec
     return result
 
 
-def writer(store: StateStore, snapshot: RepoSnapshot, stop: threading.Event, result: dict) -> None:
+def writer(store: ServiceState, snapshot: RepoSnapshot, stop: threading.Event, result: dict) -> None:
     counter = 0
     while not stop.is_set():
         begin = time.perf_counter()
         try:
             for _ in range(10):
-                store.record_request("r0", "192.0.2.250", "GET", "/writer.deb", "200", "MISS")
+                store.requests.record_request("r0", "192.0.2.250", "GET", "/writer.deb", "200", "MISS")
             # A real snapshot replacement transaction runs alongside read traffic.
             packages = dict(snapshot.packages)
             packages[f"new-{counter}"] = f"pool/main/n/new-{counter}.deb"
-            store.record_snapshot(RepoSnapshot("r0", packages, snapshot.names))
+            store.repositories.record_snapshot(RepoSnapshot("r0", packages, snapshot.names))
             result['commits'] += 1
         except Exception as exc:
             result['errors'].append(str(exc))
@@ -143,7 +144,7 @@ async def benchmark(args: argparse.Namespace, root: Path) -> dict:
                               "sqlite": sqlite3.sqlite_version, "cpu_count": os.cpu_count()},
               "dataset": {"repos": args.repos, "packages_per_repo": args.packages_per_repo,
                           "packages": args.repos * args.packages_per_repo, "request_events": args.events,
-                          "database_bytes": store.db_path.stat().st_size}, "cases": []}
+                          "database_bytes": store.database.db_path.stat().st_size}, "cases": []}
     paths = {
         "status": ["/status.json", "/healthz", "/metrics"],
         "dashboard": ["/api/repos"],
@@ -218,12 +219,12 @@ async def benchmark(args: argparse.Namespace, root: Path) -> dict:
                             cursor = page['next_cursor']
                             if not cursor:
                                 break
-                    assert len(seen) == len(store.get_packages('r0'))
+                    assert len(seen) == len(store.repositories.get_packages('r0'))
                     report['cursor_walk'] = {'unique_packages': len(seen), 'ok': True}
             finally:
                 proc.terminate()
                 await asyncio.to_thread(proc.wait, 10)
-    with sqlite3.connect(store.db_path) as conn:
+    with sqlite3.connect(store.database.db_path) as conn:
         report['integrity_check'] = conn.execute('PRAGMA integrity_check').fetchone()[0]
     return report
 

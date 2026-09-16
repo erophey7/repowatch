@@ -1,12 +1,12 @@
 """Gentoo binhost Packages version 0; package signatures belong to Portage."""
+
 from __future__ import annotations
 
 import asyncio
-import re
-
 import httpx
-
-from repowatch.parsers.base import IndexParser, PackageRef, safe_package_path
+import re
+from repowatch.models import PackageRef
+from repowatch.parsers.base import IndexParser, safe_package_path
 
 _CPV = re.compile(r'([A-Za-z0-9_+.-]+/[A-Za-z0-9_+.-]+)-([0-9]+(?:\.[0-9]+)*[a-z]?(?:_(?:alpha|beta|pre|rc|p)[0-9]*)*(?:-r[0-9]+)?)')
 

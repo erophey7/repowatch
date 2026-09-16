@@ -2,17 +2,19 @@ from pathlib import Path
 
 import pytest
 
-from repowatch.config import ConfigError, RepoConfig, load_config
+from repowatch.errors import ConfigError
+from repowatch.config.models import RepoConfig
+from repowatch.config.load import load_config
 
 EXAMPLE_CONFIG = Path(__file__).parent.parent / "config" / "config.example.yaml"
 
 
 def test_example_config_loads():
     config = load_config(EXAMPLE_CONFIG)
-    assert len(config.repos) == 3
-    assert config.repo_by_id("arch-core-x86_64").type == "pacman"
-    assert config.repo_by_id("debian-bookworm-main").type == "apt"
-    assert config.repo_by_id("rocky-9-baseos-x86_64").type == "dnf"
+    assert config.repos == []
+    assert config.nginx.enable_purge and config.nginx.enable_dedup and config.nginx.enable_cache_probe
+    assert config.syslog_listener.enabled and config.status_server.token_repo_restrictions
+    assert config.prefetch_bandwidth_limit == 10 * 1024 * 1024
 
 
 def test_missing_config_raises(tmp_path):
@@ -110,7 +112,8 @@ def test_repo_config_group_is_a_free_form_label():
 
 
 def test_effective_check_interval_falls_back_to_global():
-    from repowatch.config import Config, StatusServerConfig
+    from repowatch.config.models import Config
+    from repowatch.config.models import StatusServerConfig
 
     config = Config(
         state_db="/tmp/x.sqlite3", check_interval=300,
@@ -121,7 +124,8 @@ def test_effective_check_interval_falls_back_to_global():
 
 
 def test_effective_check_interval_per_repo_override():
-    from repowatch.config import Config, StatusServerConfig
+    from repowatch.config.models import Config
+    from repowatch.config.models import StatusServerConfig
 
     config = Config(
         state_db="/tmp/x.sqlite3", check_interval=300,
@@ -134,7 +138,8 @@ def test_effective_check_interval_per_repo_override():
 
 
 def test_effective_prefetch_bandwidth_limit_falls_back_to_global():
-    from repowatch.config import Config, StatusServerConfig
+    from repowatch.config.models import Config
+    from repowatch.config.models import StatusServerConfig
 
     config = Config(
         state_db="/tmp/x.sqlite3", check_interval=300,
@@ -146,7 +151,8 @@ def test_effective_prefetch_bandwidth_limit_falls_back_to_global():
 
 
 def test_effective_prefetch_bandwidth_limit_per_repo_override():
-    from repowatch.config import Config, StatusServerConfig
+    from repowatch.config.models import Config
+    from repowatch.config.models import StatusServerConfig
 
     config = Config(
         state_db="/tmp/x.sqlite3", check_interval=300,
@@ -307,9 +313,10 @@ repos:
 
 def test_multiarch_uses_separate_repo_configs_and_state(tmp_path):
     from repowatch.parsers import PacmanParser
-    from repowatch.prefetch import _repo_url_prefix
-    from repowatch.state import RepoSnapshot, StateStore
-    from repowatch.syslog_listener import match_repo_id
+    from repowatch.routing import repo_prefix
+    from repowatch.models import RepoSnapshot
+    from repowatch.runtime.context import ServiceState
+    from repowatch.runtime.syslog import match_repo_id
     import yaml
     path = tmp_path / 'config.yaml'
     raw = {'state_db': str(tmp_path / 'state'), 'cache_base_url': 'http://localhost', 'repos': [
@@ -319,16 +326,16 @@ def test_multiarch_uses_separate_repo_configs_and_state(tmp_path):
     ]}
     path.write_text(yaml.safe_dump(raw))
     config = load_config(path)
-    store = StateStore(config.state_db)
+    store = ServiceState(config.state_db)
     for repo in config.repos:
         assert PacmanParser(repo).index_url() == f'https://example.org/core/os/{repo.arch}/core.db.tar.gz'
         filename = f'demo-1-{repo.arch}.pkg.tar.zst'
-        store.record_snapshot(RepoSnapshot(repo.id, {'demo-1': filename}, {'demo-1': 'demo'}))
-        assert match_repo_id(_repo_url_prefix(repo) + '/' + filename, config.repos) == repo.id
-    assert store.get_packages('core-x86_64') == {'demo-1': 'demo-1-x86_64.pkg.tar.zst'}
-    assert store.get_packages('core-i686') == {'demo-1': 'demo-1-i686.pkg.tar.zst'}
-    store.ban_package('core-x86_64', 'demo')
-    assert store.get_banned_packages('core-i686') == []
+        store.repositories.record_snapshot(RepoSnapshot(repo.id, {'demo-1': filename}, {'demo-1': 'demo'}))
+        assert match_repo_id(repo_prefix(repo) + '/' + filename, config.repos) == repo.id
+    assert store.repositories.get_packages('core-x86_64') == {'demo-1': 'demo-1-x86_64.pkg.tar.zst'}
+    assert store.repositories.get_packages('core-i686') == {'demo-1': 'demo-1-i686.pkg.tar.zst'}
+    store.cache.ban_package('core-x86_64', 'demo')
+    assert store.cache.get_banned_packages('core-i686') == []
 
 
 @pytest.mark.parametrize('backend', ['openssl', 'apk-tools'])
@@ -341,3 +348,99 @@ def test_apk_signature_config(backend):
 def test_invalid_apk_backend():
     with pytest.raises(ConfigError):
         RepoConfig(id='apk', type='apk', upstream='https://example.org', arch='x86_64', apk_signature_backend='auto')
+
+
+@pytest.mark.parametrize('field', [
+    'check_interval', 'check_concurrency', 'prefetch_concurrency',
+    'notify_after_failures', 'event_retention_days', 'request_retention_days',
+    'warmed_retention_days', 'event_max_rows_per_repo', 'request_max_rows',
+])
+@pytest.mark.parametrize('value', [0, -1, True, 1.5, '12', 'oops', 10**30])
+def test_operational_integer_settings_reject_unsafe_values(tmp_path, field, value):
+    import yaml
+    raw = yaml.safe_load(EXAMPLE_CONFIG.read_text())
+    raw[field] = value
+    path = tmp_path / 'config.yaml'
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ConfigError, match=field):
+        load_config(path)
+
+
+@pytest.mark.parametrize('field,value', [
+    ('prefetch', 'false'), ('verify_signature', 'false'),
+    ('prefetch', 0), ('check_interval', 0), ('check_interval', True),
+    ('check_interval', '30'), ('check_interval', 1.5),
+])
+def test_repository_operational_values_are_strict(field, value):
+    with pytest.raises(ConfigError, match=field):
+        RepoConfig(id='r', type='apk', upstream='https://example.org', arch='x86_64',
+                   **{field: value})
+
+
+def test_config_models_reject_invalid_values_without_yaml():
+    from dataclasses import replace
+    config = load_config(EXAMPLE_CONFIG)
+    with pytest.raises(ConfigError, match='check_concurrency'):
+        replace(config, check_concurrency=0)
+    with pytest.raises(ConfigError, match='warmed_retention_days'):
+        replace(config, warmed_retention_days=-1)
+    with pytest.raises(ConfigError, match='key_expiry_warning_days'):
+        replace(config, key_expiry_warning_days=-1)
+    assert replace(config, key_expiry_warning_days=0).key_expiry_warning_days == 0
+    assert replace(config, request_max_rows=None).request_max_rows is None
+
+
+@pytest.mark.parametrize('failure', [PermissionError('denied'), FileNotFoundError('removed')])
+def test_read_failure_is_config_error_with_cause(tmp_path, monkeypatch, failure):
+    path = tmp_path / 'config.yaml'
+    def fail_read(*args, **kwargs):
+        raise failure
+    monkeypatch.setattr(Path, 'read_text', fail_read)
+    with pytest.raises(ConfigError) as caught:
+        load_config(path)
+    assert caught.value.__cause__ is failure
+
+
+def test_invalid_utf8_is_config_error(tmp_path):
+    path = tmp_path / 'config.yaml'
+    path.write_bytes(b'\xff')
+    with pytest.raises(ConfigError) as caught:
+        load_config(path)
+    assert isinstance(caught.value.__cause__, UnicodeError)
+
+
+def test_syslog_enabled_rejects_string_false():
+    from repowatch.config.models import SyslogListenerConfig
+    with pytest.raises(ConfigError, match='enabled'):
+        SyslogListenerConfig(enabled='false')
+
+
+@pytest.mark.parametrize("value", ["null", "{}", "false", "example", "0"])
+def test_empty_repositories_requires_a_list(tmp_path, value):
+    path = tmp_path / "config.yaml"
+    path.write_text(f"state_db: {tmp_path / 'state.sqlite3'}\n"
+                    f"cache_base_url: http://127.0.0.1:8080\nrepos: {value}\n")
+    with pytest.raises(ConfigError, match="repos must be a list"):
+        load_config(path)
+
+
+def test_empty_installation_checks_and_reports_without_fetching(tmp_path, monkeypatch):
+    import asyncio
+    import repowatch.runtime.scheduler as scheduler
+    from repowatch.reporting.status import healthz_payload, status_payload
+    from repowatch.runtime.context import ServiceState
+
+    path = tmp_path / "config.yaml"
+    path.write_text(f"state_db: {tmp_path / 'state.sqlite3'}\n"
+                    "cache_base_url: http://127.0.0.1:8080\nrepos: []\n")
+    config = load_config(path)
+    assert not config.state_db.exists()
+
+    async def unexpected_check(*args, **kwargs):
+        pytest.fail("an empty installation must not check an upstream")
+
+    monkeypatch.setattr(scheduler, "check_repo", unexpected_check)
+    store = ServiceState(config.state_db)
+    assert asyncio.run(scheduler.check_all(config, store)) == []
+    assert status_payload(path, store) == (200, {})
+    assert healthz_payload(path, store) == (200, {"ok": True})

@@ -521,7 +521,7 @@ def activate(layout: Layout) -> None:
     if check(installed, for_install=False).failures:
         raise ValueError('activation blocked by preflight')
     python = str(installed.venv / 'bin/python')
-    run([python, '-c', 'from repowatch.cli import main; import sys; sys.exit(main())',
+    run([python, '-m', 'repowatch.cli',
          '-c', str(installed.config), 'check-config'])
     try:
         group = grp.getgrnam('repowatch')
@@ -550,56 +550,48 @@ def activate(layout: Layout) -> None:
             'nginx_binary': shutil.which('nginx'),
             'site_link': str(Path(installed.nginx_enabled_dir) / 'repowatch.conf'),
         }, indent=2) + '\n', preserve=True)
-        purge_path = policy.parent / 'purge.conf'
-        dedup_path = policy.parent / 'dedup.map'
-        # Purge locations (nginx.render_purge) and the dedup map
-        # (nginx.render_dedup) are `include`d from their own files rather
-        # than inlined into active.conf — this bootstrap has to produce all
-        # three, same as apply() does on every later run, or the very first
-        # `include` in active.conf would point at a file that doesn't exist
-        # yet. find_duplicate_files() only runs when enable_dedup is set —
-        # same reasoning as apply(): skip the repo_packages query entirely
-        # when the feature is off.
+        # Bootstrap every include before nginx validates the first generation.
+        # Reading dedup must not create a root-owned application database.
         output = run([python, '-B', '-c',
-            'import sys; from repowatch.config import load_config; '
-            'from repowatch.nginx import render, render_purge, render_dedup, resolve_dedup_pairs; '
-            'from repowatch.state import StateStore; '
-            'c = load_config(sys.argv[1]); '
-            'rows = StateStore(c.state_db).find_duplicate_files() if c.nginx.enable_dedup else []; '
-            'sys.stdout.write(render(c, cache_dir=sys.argv[2], access_log=sys.argv[3], '
-            'purge_conf=sys.argv[4], dedup_conf=sys.argv[5])); '
-            'sys.stdout.write("\\0"); '
-            'sys.stdout.write(render_purge(c)); '
-            'sys.stdout.write("\\0"); '
-            'sys.stdout.write(render_dedup(c, resolve_dedup_pairs(c, rows)))',
+            'import json, sys; from pathlib import Path; from repowatch.config import load_config; '
+            'from repowatch.nginx.render import render, render_purge, render_dedup, resolve_dedup_pairs, '
+            'render_probe_conf, render_probe_js; '
+            'from repowatch.storage.database import Database; from repowatch.storage.cache import CacheStore; '
+            'c = load_config(sys.argv[1]); directory = Path(sys.argv[4]); '
+            'rows = CacheStore(Database(c.state_db, read_only=True)).find_duplicate_files() '
+            'if c.nginx.enable_dedup and c.state_db.is_file() else []; '
+            'print(json.dumps({"active.conf": render(c, cache_dir=sys.argv[2], access_log=sys.argv[3], '
+            'purge_conf=str(directory / "purge.conf"), dedup_conf=str(directory / "dedup.map"), '
+            'probe_conf=str(directory / "probe.conf"), probe_js=str(directory / "probe.js")), '
+            '"purge.conf": render_purge(c), '
+            '"dedup.map": render_dedup(c, resolve_dedup_pairs(c, rows)), '
+            '"probe.conf": render_probe_conf(c), '
+            '"probe.js": render_probe_js(c, cache_dir=sys.argv[2])}))',
             str(installed.config), installed.cache_dir,
             installed.localstatedir + '/log/nginx/repo-cache.access.log',
-            str(purge_path), str(dedup_path)], capture_output=True, text=True).stdout
-        candidate, _, rest = output.partition('\0')
-        purge_candidate, _, dedup_candidate = rest.partition('\0')
-        had_purge = purge_path.exists()
-        write(purge_path, purge_candidate, preserve=True)
-        had_dedup = dedup_path.exists()
-        write(dedup_path, dedup_candidate, preserve=True)
+            str(policy.parent)], capture_output=True, text=True).stdout
+        candidates = json.loads(output)
         active = policy.parent / 'active.conf'
-        had_active = active.exists()
-        write(active, candidate, preserve=True)
         link = Path(installed.nginx_enabled_dir) / 'repowatch.conf'
-        created = not link.is_symlink()
-        if created:
-            link.parent.mkdir(parents=True, exist_ok=True)
-            link.symlink_to(active)
+        created_files: list[Path] = []
+        created_link = False
         try:
+            for name in ('purge.conf', 'dedup.map', 'probe.conf', 'probe.js', 'active.conf'):
+                path = policy.parent / name
+                existed = path.exists()
+                write(path, candidates[name], preserve=True)
+                if not existed:
+                    created_files.append(path)
+            if not link.is_symlink():
+                link.parent.mkdir(parents=True, exist_ok=True)
+                link.symlink_to(active)
+                created_link = True
             run(['nginx', '-t', '-c', installed.nginx_conf])
-        except subprocess.CalledProcessError:
-            if created:
-                link.unlink()
-            if not had_active:
-                active.unlink()
-            if not had_purge:
-                purge_path.unlink()
-            if not had_dedup:
-                dedup_path.unlink()
+        except (OSError, subprocess.SubprocessError):
+            if created_link:
+                link.unlink(missing_ok=True)
+            for path in reversed(created_files):
+                path.unlink(missing_ok=True)
             raise
     if installed.with_systemd:
         units = Path(installed.systemd_unit_dir)

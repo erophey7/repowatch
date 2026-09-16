@@ -1,4 +1,10 @@
 """Nix catalog, closure warming, signatures, and cache lifecycle regressions."""
+import repowatch.cache.nix as cache_nix
+import repowatch.cache.purge as cache_purge
+import repowatch.nginx.render as nginx_render
+import repowatch.operations.check as operations_check
+import repowatch.operations.warm as operations_warm
+import repowatch.routing as routing
 from dataclasses import replace
 import hashlib
 import asyncio
@@ -12,11 +18,19 @@ import sys
 import httpx
 import pytest
 
-from repowatch.config import Config, ConfigError, RepoConfig, NginxConfig, StatusServerConfig
-from repowatch.state import StateStore, RepoSnapshot
+from repowatch.config.models import Config
+from repowatch.errors import ConfigError
+from repowatch.config.models import RepoConfig
+from repowatch.config.models import NginxConfig
+from repowatch.config.models import StatusServerConfig
+from repowatch.runtime.context import ServiceState
+from repowatch.models import RepoSnapshot
 from repowatch.parsers.nix import NixParser, parse_catalog, run_nix
-from repowatch import nix_cache, nginx, prefetch, watcher
-from repowatch.gpgverify import SignatureError
+import repowatch.cache.nix as nix_cache
+import repowatch.nginx.render as nginx
+import repowatch.operations.warm as prefetch
+import repowatch.operations.check as watcher
+from repowatch.errors import SignatureError
 
 def run_async(function):
     @wraps(function)
@@ -112,7 +126,7 @@ def test_catalog_rejects_partial_or_invalid_output(data):
 @pytest.mark.parametrize('url', ['nar/a.nar?hash=abc', 'https://cache.test/nar/a.nar?hash=abc'])
 def test_narinfo_preserves_query_and_references(url):
     raw = metadata(references=f'{A}-package {B}-dep', url=url) + b'Sig: one\nSig: two\n'
-    info = nix_cache.parse_narinfo(raw, A+'.narinfo', 'https://cache.test')
+    info = cache_nix.parse_narinfo(raw, A+'.narinfo', 'https://cache.test')
     assert info['filename'] == 'nar/a.nar?hash=abc'
     assert info['refs'] == [A+'.narinfo', B+'.narinfo']
 
@@ -121,7 +135,7 @@ def test_narinfo_preserves_query_and_references(url):
                                  'nar/a#fragment', 'nar/%2e%2e/a', 'nar/a\n'])
 def test_narinfo_rejects_unrepresentable_urls(url):
     with pytest.raises(ValueError):
-        nix_cache.nar_filename('https://cache.test/cache/', url)
+        cache_nix.nar_filename('https://cache.test/cache/', url)
 
 
 def test_narinfo_validates_identity_hash_and_duplicate_fields():
@@ -129,7 +143,7 @@ def test_narinfo_validates_identity_hash_and_duplicate_fields():
                 metadata().replace(b'FileSize: 7', b'FileSize: -1'),
                 metadata().replace(b'FileHash: sha256:', b'FileHash: sha1:')]:
         with pytest.raises(ValueError):
-            nix_cache.parse_narinfo(raw, A+'.narinfo', 'https://cache.test')
+            cache_nix.parse_narinfo(raw, A+'.narinfo', 'https://cache.test')
 
 
 @run_async
@@ -138,19 +152,19 @@ async def test_discovery_handles_cycles_missing_references_and_limits():
         return httpx.Response(200, content=metadata(A, f'{A}-package {B}-dep') if request.url.path.endswith(A+'.narinfo')
                               else metadata(B, f'{A}-package'))
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        found = await nix_cache.discover(client, repo(), A+'.narinfo')
+        found = await cache_nix.discover(client, repo(), A+'.narinfo')
         assert len(found) == 2
         with pytest.raises(ValueError, match='nix_max_paths'):
-            await nix_cache.discover(client, repo(nix_max_paths=1), A+'.narinfo')
+            await cache_nix.discover(client, repo(nix_max_paths=1), A+'.narinfo')
     async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(404))) as client:
         with pytest.raises(httpx.HTTPStatusError):
-            await nix_cache.discover(client, repo(), A+'.narinfo')
+            await cache_nix.discover(client, repo(), A+'.narinfo')
 
 
 @run_async
 async def test_warm_retries_partial_closure_and_preserves_bookkeeping(tmp_path, monkeypatch):
-    c = config(tmp_path); r = c.repos[0]; store = StateStore(c.state_db)
-    store.record_snapshot(RepoSnapshot(r.id, {'root': A+'.narinfo'}, {'root':'hello'}))
+    c = config(tmp_path); r = c.repos[0]; store = ServiceState(c.state_db)
+    store.repositories.record_snapshot(RepoSnapshot(r.id, {'root': A+'.narinfo'}, {'root':'hello'}))
     broken = True
     calls = []
     def handler(request):
@@ -161,101 +175,101 @@ async def test_warm_retries_partial_closure_and_preserves_bookkeeping(tmp_path, 
             return httpx.Response(200, content=metadata(B))
         return httpx.Response(200, content=b'corrupt' if broken and request.url.path.endswith(B+'.nar') else b'archive')
     client_factory(monkeypatch, handler)
-    result = await prefetch.warm_cache(c, r, store, {'root': A+'.narinfo'})
+    result = await operations_warm.warm_cache(c, r, store, {'root': A+'.narinfo'})
     assert result == {'root': False}
-    assert store.get_warmed_packages(r.id)[0]['status'] == 'failed'
-    assert len(store.get_nix_artifacts(r.id, 'root')) == 4
+    assert store.cache.get_warmed_packages(r.id)[0]['status'] == 'failed'
+    assert len(store.cache.get_nix_artifacts(r.id, 'root')) == 4
     broken = False
-    assert await prefetch.warm_cache(c, r, store, {'root': A+'.narinfo'}) == {'root': True}
+    assert await operations_warm.warm_cache(c, r, store, {'root': A+'.narinfo'}) == {'root': True}
     assert all('nginx.test' in url for url in calls if '.nar?' in url or url.endswith('.nar'))
-    assert store.get_warmed_packages(r.id)[0]['status'] == 'ok'
+    assert store.cache.get_warmed_packages(r.id)[0]['status'] == 'ok'
 
 
 @run_async
 async def test_nix_disabled_and_banned_warming_do_not_fetch(tmp_path, monkeypatch):
-    c = config(tmp_path, repo(prefetch=False)); r = c.repos[0]; store = StateStore(c.state_db)
-    store.record_snapshot(RepoSnapshot(r.id, {'root': A+'.narinfo'}, {'root':'hello'}))
+    c = config(tmp_path, repo(prefetch=False)); r = c.repos[0]; store = ServiceState(c.state_db)
+    store.repositories.record_snapshot(RepoSnapshot(r.id, {'root': A+'.narinfo'}, {'root':'hello'}))
     client_factory(monkeypatch, lambda request: pytest.fail('unexpected fetch'))
-    assert await prefetch.warm_cache(c,r,store,{'root':A+'.narinfo'}) == {}
-    store.ban_package(r.id, 'hello')
-    assert await prefetch.warm_cache(c,r,store,{'root':A+'.narinfo'},force=True) == {}
+    assert await operations_warm.warm_cache(c,r,store,{'root':A+'.narinfo'}) == {}
+    store.cache.ban_package(r.id, 'hello')
+    assert await operations_warm.warm_cache(c,r,store,{'root':A+'.narinfo'},force=True) == {}
 
 
 @run_async
 async def test_purge_preserves_shared_artifacts_and_reports_errors(tmp_path, monkeypatch):
-    c=config(tmp_path); r=c.repos[0]; store=StateStore(c.state_db)
-    store.record_snapshot(RepoSnapshot(r.id,{'other':B+'.narinfo'}))
-    store.record_nix_artifacts(r.id,'old',[{'filename': A+'.narinfo'},{'filename':'nar/shared.nar'}])
-    store.record_nix_artifacts(r.id,'other',[{'filename':'nar/shared.nar'}])
+    c=config(tmp_path); r=c.repos[0]; store=ServiceState(c.state_db)
+    store.repositories.record_snapshot(RepoSnapshot(r.id,{'other':B+'.narinfo'}))
+    store.cache.record_nix_artifacts(r.id,'old',[{'filename': A+'.narinfo'},{'filename':'nar/shared.nar'}])
+    store.cache.record_nix_artifacts(r.id,'other',[{'filename':'nar/shared.nar'}])
     selected=[]
     async def purge(c,r,items):
         selected.extend(items.values());return dict.fromkeys(items,'purged')
-    monkeypatch.setattr(prefetch,'purge_selected',purge)
-    assert await nix_cache.purge(c,r,store,{'old':A+'.narinfo'}) == {'old':'retained_shared'}
+    monkeypatch.setattr(cache_purge,'purge_selected',purge)
+    assert await cache_nix.purge(c,r,store,{'old':A+'.narinfo'}) == {'old':'retained_shared'}
     assert selected == [A+'.narinfo']
     async def error(c,r,items): return dict.fromkeys(items,'error (HTTP 503)')
-    monkeypatch.setattr(prefetch,'purge_selected',error)
-    assert (await nix_cache.purge(c,r,store,{'old':A+'.narinfo'}))['old'].startswith('error')
+    monkeypatch.setattr(cache_purge,'purge_selected',error)
+    assert (await cache_nix.purge(c,r,store,{'old':A+'.narinfo'}))['old'].startswith('error')
 
 
 def test_client_activity_does_not_claim_a_partial_closure_is_complete(tmp_path):
-    store=StateStore(tmp_path/'state.sqlite')
+    store=ServiceState(tmp_path/'state.sqlite')
     for key,ok in [('complete',True),('partial',False)]:
-        store.record_nix_artifacts('n',key,[{'filename':'nar/shared.nar'}])
-        store.record_warmed_package('n',key,A+'.narinfo',ok,200)
-    store.touch_nix_artifact('n','nar/shared.nar')
-    assert {x['package_key']:x['status'] for x in store.get_warmed_packages('n')} == {'complete':'ok','partial':'failed'}
+        store.cache.record_nix_artifacts('n',key,[{'filename':'nar/shared.nar'}])
+        store.cache.record_warmed_package('n',key,A+'.narinfo',ok,200)
+    store.cache.touch_nix_artifact('n','nar/shared.nar')
+    assert {x['package_key']:x['status'] for x in store.cache.get_warmed_packages('n')} == {'complete':'ok','partial':'failed'}
 
 
 def test_trust_policy_change_invalidates_completed_closures(tmp_path):
-    store = StateStore(tmp_path / 'state.sqlite')
-    store.update_nix_trust('n', False, [])
-    store.record_warmed_package('n', 'root', A + '.narinfo', True, 200)
-    store.update_nix_trust('n', False, [])
-    assert store.get_warmed_packages('n')[0]['status'] == 'ok'
-    store.update_nix_trust('n', True, ['key-one'])
-    assert store.get_warmed_packages('n')[0]['status'] == 'failed'
-    store.record_warmed_package('n', 'root', A + '.narinfo', True, 200)
-    store.update_nix_trust('n', True, ['key-two'])
-    assert store.get_warmed_packages('n')[0]['status'] == 'failed'
+    store = ServiceState(tmp_path / 'state.sqlite')
+    store.cache.update_nix_trust('n', False, [])
+    store.cache.record_warmed_package('n', 'root', A + '.narinfo', True, 200)
+    store.cache.update_nix_trust('n', False, [])
+    assert store.cache.get_warmed_packages('n')[0]['status'] == 'ok'
+    store.cache.update_nix_trust('n', True, ['key-one'])
+    assert store.cache.get_warmed_packages('n')[0]['status'] == 'failed'
+    store.cache.record_warmed_package('n', 'root', A + '.narinfo', True, 200)
+    store.cache.update_nix_trust('n', True, ['key-two'])
+    assert store.cache.get_warmed_packages('n')[0]['status'] == 'failed'
 
 
 @run_async
 async def test_purge_retains_artifacts_when_other_closures_are_unknown(tmp_path, monkeypatch):
     c = config(tmp_path)
     r = c.repos[0]
-    store = StateStore(c.state_db)
-    store.record_snapshot(RepoSnapshot(r.id, {'unknown': B + '.narinfo'}))
-    store.record_nix_artifacts(r.id, 'old', [{'filename': 'nar/shared.nar'}])
+    store = ServiceState(c.state_db)
+    store.repositories.record_snapshot(RepoSnapshot(r.id, {'unknown': B + '.narinfo'}))
+    store.cache.record_nix_artifacts(r.id, 'old', [{'filename': 'nar/shared.nar'}])
     async def purge(c, r, items):
         assert not items
         return {}
-    monkeypatch.setattr(prefetch, 'purge_selected', purge)
-    assert await nix_cache.purge(c, r, store, {'old': A + '.narinfo'}) == {'old': 'retained_shared'}
+    monkeypatch.setattr(cache_purge, 'purge_selected', purge)
+    assert await cache_nix.purge(c, r, store, {'old': A + '.narinfo'}) == {'old': 'retained_shared'}
 
 
 def test_artifact_retention_keeps_current_and_warmed_owners(tmp_path):
-    store = StateStore(tmp_path / 'state.sqlite')
-    store.record_snapshot(RepoSnapshot('n', {'current': A + '.narinfo'}))
-    store.record_warmed_package('n', 'warmed', B + '.narinfo', True, 200)
+    store = ServiceState(tmp_path / 'state.sqlite')
+    store.repositories.record_snapshot(RepoSnapshot('n', {'current': A + '.narinfo'}))
+    store.cache.record_warmed_package('n', 'warmed', B + '.narinfo', True, 200)
     for key in ('current', 'warmed', 'orphan'):
-        store.record_nix_artifacts('n', key, [{'filename': 'nar/shared.nar'}])
-    store.prune_warmed_packages(180)
-    assert store.get_nix_artifacts('n', 'current')
-    assert store.get_nix_artifacts('n', 'warmed')
-    assert not store.get_nix_artifacts('n', 'orphan')
+        store.cache.record_nix_artifacts('n', key, [{'filename': 'nar/shared.nar'}])
+    store.cache.prune_warmed_packages(180)
+    assert store.cache.get_nix_artifacts('n', 'current')
+    assert store.cache.get_nix_artifacts('n', 'warmed')
+    assert not store.cache.get_nix_artifacts('n', 'orphan')
 
 
 @pytest.mark.parametrize('dedup',[False,True])
 def test_nix_nginx_keys_preserve_nar_query(tmp_path,dedup):
     c=config(tmp_path);c=replace(c,nginx=replace(c.nginx,enable_dedup=dedup))
-    text=nginx.render(c)
+    text=nginx_render.render(c)
     assert 'nix-cache-info' in text and 'proxy_cache_valid 404 1s;' in text
     assert '$uri$is_args$args' in text if dedup else '$request_uri' in text
-    assert '$1$is_args$args' in nginx.render_purge(c)
-    key=nginx.compute_cache_key(c,c.repos[0],'nar/a.nar?hash=one')
+    assert '$1$is_args$args' in nginx_render.render_purge(c)
+    key=routing.compute_cache_key(c,c.repos[0],'nar/a.nar?hash=one')
     assert key.endswith('nar/a.nar?hash=one')
-    assert key != nginx.compute_cache_key(c,c.repos[0],'nar/a.nar?hash=two')
+    assert key != routing.compute_cache_key(c,c.repos[0],'nar/a.nar?hash=two')
 
 
 def test_real_nix_cli_catalog_and_signature_verification():
@@ -267,18 +281,18 @@ def test_real_nix_cli_catalog_and_signature_verification():
     assert {p.name for p in packages} == {'hello:out','tools.multi:out','tools.multi:dev'}
     signed=(FIXTURES/'signed.narinfo').read_bytes()
     filename=signed.split(b'/nix/store/',1)[1][:32].decode()+'.narinfo'
-    info=nix_cache.parse_narinfo(signed,filename,'https://cache.test')
+    info=cache_nix.parse_narinfo(signed,filename,'https://cache.test')
     keys=[(FIXTURES/'trusted.pub').read_text().strip()]
-    nix_cache.verify_metadata({filename:(signed,info)},keys,30)
+    cache_nix.verify_metadata({filename:(signed,info)},keys,30)
     for damaged in [signed.replace(b'NarSize: ',b'NarSize: 1'),
                     b'\n'.join(line for line in signed.split(b'\n') if not line.startswith(b'Sig: '))]:
         with pytest.raises(SignatureError):
-            nix_cache.verify_metadata({filename:(damaged,info)},keys,30)
+            cache_nix.verify_metadata({filename:(damaged,info)},keys,30)
 
 
 @run_async
 async def test_watcher_retries_missing_binary_without_catalog_change(tmp_path, monkeypatch):
-    c=config(tmp_path);store=StateStore(c.state_db)
+    c=config(tmp_path);store=ServiceState(c.state_db)
     monkeypatch.setattr('repowatch.parsers.nix.run_nix', lambda args,timeout:
         json.dumps('/nix/store/'+A+'-source').encode() if args[0]=='nix-instantiate' else catalog())
     missing=True
@@ -289,14 +303,14 @@ async def test_watcher_retries_missing_binary_without_catalog_change(tmp_path, m
             return httpx.Response(200,content=metadata())
         return httpx.Response(200,content=b'archive')
     client_factory(monkeypatch,handler)
-    await watcher.check_repo(c,c.repos[0],store)
-    assert store.get_warmed_packages(c.repos[0].id)[0]['status']=='failed'
-    first=store.get_status(c.repos[0].id)['changed_at']
+    await operations_check.check_repo(c,c.repos[0],store)
+    assert store.cache.get_warmed_packages(c.repos[0].id)[0]['status']=='failed'
+    first=store.repositories.get_status(c.repos[0].id)['changed_at']
     missing=False
-    await watcher.check_repo(c,c.repos[0],store)
-    assert store.get_warmed_packages(c.repos[0].id)[0]['status']=='ok'
-    assert store.get_status(c.repos[0].id)['changed_at']==first
-    assert len(store.get_history(c.repos[0].id))==1
+    await operations_check.check_repo(c,c.repos[0],store)
+    assert store.cache.get_warmed_packages(c.repos[0].id)[0]['status']=='ok'
+    assert store.repositories.get_status(c.repos[0].id)['changed_at']==first
+    assert len(store.repositories.get_history(c.repos[0].id))==1
 
 
 def test_real_nix_client_through_generated_nginx(tmp_path):
@@ -342,7 +356,7 @@ def test_real_nix_client_through_generated_nginx(tmp_path):
                  verify_signature=True,nix_public_keys=[key])
     c=replace(config(tmp_path,r,purge=False),cache_base_url=f'http://127.0.0.1:{port}')
     c=replace(c,nginx=replace(c.nginx,listen=f'127.0.0.1:{port}'),syslog_listener=replace(c.syslog_listener,enabled=False))
-    text=nginx.render(c,cache_dir=str(tmp_path/'cache'),access_log=str(tmp_path/'access.log'))
+    text=nginx_render.render(c,cache_dir=str(tmp_path/'cache'),access_log=str(tmp_path/'access.log'))
     conf=tmp_path/'nginx.conf';conf.write_text(f'pid {tmp_path}/nginx.pid; error_log {tmp_path}/error.log;\nevents {{}}\nhttp {{\n{text}\n}}')
     process=None
     try:
@@ -353,11 +367,11 @@ def test_real_nix_client_through_generated_nginx(tmp_path):
             try:
                 with socket.create_connection(('127.0.0.1',port),timeout=.1):break
             except OSError:time.sleep(.02)
-        store=StateStore(c.state_db)
-        asyncio.run(watcher.check_repo(c,r,store))
-        warmed=store.get_warmed_packages(r.id)
+        store=ServiceState(c.state_db)
+        asyncio.run(operations_check.check_repo(c,r,store))
+        warmed=store.cache.get_warmed_packages(r.id)
         assert len(warmed)==1 and warmed[0]['status']=='ok',warmed
-        assert len(store.get_nix_artifacts(r.id,warmed[0]['package_key']))==2
+        assert len(store.cache.get_nix_artifacts(r.id,warmed[0]['package_key']))==2
         online=False
         for name in ['nix-cache-info',filename,fields['URL']]:
             with urllib.request.urlopen(c.cache_base_url+'/nix/nix-test/'+name) as response:
@@ -377,9 +391,9 @@ def test_real_nix_client_through_generated_nginx(tmp_path):
 @run_async
 async def test_nix_warming_lists_filter_roots_without_breaking_closure(tmp_path, monkeypatch):
     r = repo(prefetch=False, prefetch_whitelist=['hello:*'], prefetch_blacklist=['*:dev', 'dependency:*'])
-    c = config(tmp_path, r); store = StateStore(c.state_db)
+    c = config(tmp_path, r); store = ServiceState(c.state_db)
     files = {'root': A+'.narinfo', 'blocked': B+'.narinfo'}
-    store.record_snapshot(RepoSnapshot(r.id, files, {'root': 'hello:out', 'blocked': 'hello:dev'}))
+    store.repositories.record_snapshot(RepoSnapshot(r.id, files, {'root': 'hello:out', 'blocked': 'hello:dev'}))
     calls = []
     def handler(request):
         calls.append(str(request.url))
@@ -389,11 +403,11 @@ async def test_nix_warming_lists_filter_roots_without_breaking_closure(tmp_path,
             return httpx.Response(200, content=metadata(B))
         return httpx.Response(200, content=b'archive')
     client_factory(monkeypatch, handler)
-    assert await prefetch.warm_cache(c, r, store, files, force=True) == {'root': True}
+    assert await operations_warm.warm_cache(c, r, store, files, force=True) == {'root': True}
     assert any(B+'.nar' in url for url in calls)
-    assert len(store.get_nix_artifacts(r.id, 'root')) == 4
-    assert not store.get_nix_artifacts(r.id, 'blocked')
+    assert len(store.cache.get_nix_artifacts(r.id, 'root')) == 4
+    assert not store.cache.get_nix_artifacts(r.id, 'blocked')
     calls.clear()
     blocked_repo = replace(r, prefetch_blacklist=['*'])
-    assert await prefetch.warm_cache(c, blocked_repo, store, files, force=True) == {}
+    assert await operations_warm.warm_cache(c, blocked_repo, store, files, force=True) == {}
     assert not calls

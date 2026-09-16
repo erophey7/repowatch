@@ -21,23 +21,20 @@ could swap both). That tradeoff was made explicitly, not overlooked: an
 alternative GPG-signed release was considered and rejected as a heavier
 mechanism than this project needs right now. There is no default keyring or
 "warn and install anyway" fallback either way — a release without a matching
-checksum asset, or a checksum mismatch, refuses the update outright.
-"""
+checksum asset, or a checksum mismatch, refuses the update outright."""
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 import hashlib
-from importlib.metadata import PackageNotFoundError
-from importlib.metadata import version as installed_version
-from pathlib import Path
+import httpx
 import re
 import subprocess
 import sys
 import tempfile
-
-import httpx
+from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version as installed_version
+from pathlib import Path
 
 _GITHUB_API = "https://api.github.com"
 _CHUNK_SIZE = 65536

@@ -1,3 +1,4 @@
+import repowatch.verification.apk as verification_apk
 import gzip
 import io
 import shutil
@@ -6,9 +7,9 @@ import tarfile
 
 import pytest
 
-from repowatch.apkverify import verify_index
-from repowatch.config import RepoConfig
-from repowatch.gpgverify import SignatureError
+from repowatch.verification.apk import verify_index
+from repowatch.config.models import RepoConfig
+from repowatch.errors import SignatureError
 import httpx
 import asyncio
 
@@ -60,44 +61,46 @@ def test_missing_key_tool_and_old_apk(signed, monkeypatch):
 
 
 def test_apk_watcher_preserves_state_and_recovers(signed, tmp_path, monkeypatch):
-    from repowatch.config import Config, StatusServerConfig
-    from repowatch.state import StateStore, RepoSnapshot
-    from repowatch.watcher import check_repo
+    from repowatch.config.models import Config
+    from repowatch.config.models import StatusServerConfig
+    from repowatch.runtime.context import ServiceState
+    from repowatch.models import RepoSnapshot
+    from repowatch.operations.check import check_repo
     keys, payload, sign = signed
     raw = sign()
     repo = RepoConfig(id='apk', type='apk', upstream='https://example.org', arch='x86_64',
                       prefetch=False, verify_signature=True, apk_keys_dir=str(keys))
     config = Config(tmp_path/'state', 300, 'http://cache', StatusServerConfig(), repos=[repo])
-    store = StateStore(config.state_db)
-    store.record_snapshot(RepoSnapshot('apk', {'old':'old.apk'}))
+    store = ServiceState(config.state_db)
+    store.repositories.record_snapshot(RepoSnapshot('apk', {'old':'old.apk'}))
     corrupt = True
     def handler(request):
         if request.method=='HEAD': return httpx.Response(200, headers={'ETag':'new'})
         return httpx.Response(200, content=raw[:-1] if corrupt else raw)
     original = httpx.AsyncClient
-    monkeypatch.setattr('repowatch.watcher.httpx.AsyncClient', lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    monkeypatch.setattr('repowatch.operations.check.httpx.AsyncClient', lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
     asyncio.run(check_repo(config, repo, store))
-    assert store.get_packages('apk')=={'old':'old.apk'}
-    with store._connect() as conn:
+    assert store.repositories.get_packages('apk')=={'old':'old.apk'}
+    with store.database.connect() as conn:
         assert conn.execute('SELECT consecutive_failures FROM failure_state').fetchone()[0]==1
     corrupt=False
     asyncio.run(check_repo(config, repo, store))
-    assert store.get_packages('apk')=={'hello-1.0':'hello-1.0.apk'}
-    with store._connect() as conn:
+    assert store.repositories.get_packages('apk')=={'hello-1.0':'hello-1.0.apk'}
+    with store.database.connect() as conn:
         assert conn.execute('SELECT count(*) FROM failure_state').fetchone()[0]==0
     # Same ETag must not hide loss of a trusted key after successful verification.
     (keys/'test.rsa.pub').unlink()
     asyncio.run(check_repo(config, repo, store))
-    assert store.get_packages('apk')=={'hello-1.0':'hello-1.0.apk'}
-    with store._connect() as conn:
+    assert store.repositories.get_packages('apk')=={'hello-1.0':'hello-1.0.apk'}
+    with store.database.connect() as conn:
         assert conn.execute('SELECT consecutive_failures FROM failure_state').fetchone()[0]==1
 
 
 def test_old_apk_rejected(signed, monkeypatch):
-    import repowatch.apkverify as module
+    import repowatch.verification.apk as module
     keys, _, sign = signed
     raw = sign()
-    monkeypatch.setattr(module, '_run', lambda args: subprocess.CompletedProcess(args, 0, 'apk-tools 2.14.0, compiled for x86_64', ''))
+    monkeypatch.setattr(verification_apk, '_run', lambda args: subprocess.CompletedProcess(args, 0, 'apk-tools 2.14.0, compiled for x86_64', ''))
     with pytest.raises(SignatureError, match='>= 3.0'):
         verify_index(raw, str(keys), 'apk-tools')
 

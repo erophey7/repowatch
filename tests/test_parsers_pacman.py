@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from repowatch.config import RepoConfig
-from repowatch.gpgverify import SignatureError
+from repowatch.config.models import RepoConfig
+from repowatch.errors import SignatureError
 from repowatch.parsers.pacman import PacmanParser
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "pacman"

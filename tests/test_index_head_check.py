@@ -2,7 +2,7 @@ import asyncio
 
 import httpx
 
-from repowatch.config import RepoConfig
+from repowatch.config.models import RepoConfig
 from repowatch.parsers.apk import ApkParser
 
 

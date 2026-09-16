@@ -1,4 +1,6 @@
 """Real process transport regressions; no external crypto tools required."""
+import repowatch.errors as errors
+import repowatch.verification.gpg as verification_gpg
 from pathlib import Path
 import subprocess
 import sys
@@ -87,9 +89,9 @@ def test_missing_binary():
 
 
 def test_gpg_timeout_maps_to_signature_error(monkeypatch):
-    from repowatch import gpgverify
+    import repowatch.verification.gpg as gpgverify
     def fail(*args, **kwargs):
         raise subprocess.TimeoutExpired(['gpgv'], 30)
-    monkeypatch.setattr(gpgverify, 'run', fail)
-    with pytest.raises(gpgverify.SignatureError, match='process failed'):
-        gpgverify._run_gpgv('keyring', Path('signature'), None)
+    monkeypatch.setattr(verification_gpg, 'run', fail)
+    with pytest.raises(errors.SignatureError, match='process failed'):
+        verification_gpg._run_gpgv('keyring', Path('signature'), None)

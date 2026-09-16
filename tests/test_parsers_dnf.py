@@ -13,12 +13,16 @@ import xml.etree.ElementTree as ET
 import httpx
 import pytest
 
-from repowatch.config import Config, ConfigError, RepoConfig, StatusServerConfig
-from repowatch.gpgverify import SignatureError
+from repowatch.config.models import Config
+from repowatch.errors import ConfigError
+from repowatch.config.models import RepoConfig
+from repowatch.config.models import StatusServerConfig
+from repowatch.errors import SignatureError
 from repowatch.parsers import DnfParser, PARSERS
 from repowatch.parsers.dnf import _checked_primary, _open_primary, _parse_primary, _parse_repomd, _relative_path
-from repowatch.state import RepoSnapshot, StateStore
-from repowatch.watcher import check_repo
+from repowatch.models import RepoSnapshot
+from repowatch.runtime.context import ServiceState
+from repowatch.operations.check import check_repo
 
 FIXTURES = Path(__file__).parent / 'fixtures' / 'dnf'
 PRIMARY = (FIXTURES / 'primary.xml').read_bytes()
@@ -219,29 +223,29 @@ def test_empty_repository_is_valid():
 
 
 def test_watcher_preserves_snapshot_on_checksum_failure_and_recovers(tmp_path, monkeypatch):
-    store = StateStore(tmp_path / 'state')
+    store = ServiceState(tmp_path / 'state')
     current = repo()
-    config = Config(state_db=store.db_path, check_interval=300, cache_base_url='http://localhost',
+    config = Config(state_db=store.database.db_path, check_interval=300, cache_base_url='http://localhost',
                     status_server=StatusServerConfig(), repos=[current])
-    store.record_snapshot(RepoSnapshot(current.id, {'old-1': 'old.rpm'}))
+    store.repositories.record_snapshot(RepoSnapshot(current.id, {'old-1': 'old.rpm'}))
     original_client = httpx.AsyncClient
     corrupted = [True]
     def handler(request):
         if request.method == 'HEAD':
             return httpx.Response(200, headers={'ETag': 'new'})
         return httpx.Response(200, content=REPOMD if request.url.path.endswith('repomd.xml') else (b'bad' if corrupted[0] else PACKED))
-    monkeypatch.setattr('repowatch.watcher.httpx.AsyncClient', lambda: original_client(transport=httpx.MockTransport(handler)))
+    monkeypatch.setattr('repowatch.operations.check.httpx.AsyncClient', lambda: original_client(transport=httpx.MockTransport(handler)))
     asyncio.run(check_repo(config, current, store))
-    assert store.get_packages(current.id) == {'old-1': 'old.rpm'}
-    assert store.get_index_meta(current.id) == (None, None)
-    with store._connect() as conn:
+    assert store.repositories.get_packages(current.id) == {'old-1': 'old.rpm'}
+    assert store.repositories.get_index_meta(current.id) == (None, None)
+    with store.database.connect() as conn:
         assert conn.execute('SELECT consecutive_failures FROM failure_state').fetchone()[0] == 1
     corrupted[0] = False
     asyncio.run(check_repo(config, current, store))
-    assert len(store.get_packages(current.id)) == 3
-    with store._connect() as conn:
+    assert len(store.repositories.get_packages(current.id)) == 3
+    with store.database.connect() as conn:
         assert conn.execute('SELECT COUNT(*) FROM failure_state').fetchone()[0] == 0
-    assert store.get_index_meta(current.id)[0] == 'new'
+    assert store.repositories.get_index_meta(current.id)[0] == 'new'
 
 
 def test_dnf_signature_config_requires_keyring():

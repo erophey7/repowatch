@@ -3,10 +3,15 @@ import time
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import httpx
+import pytest
 
-from repowatch.config import Config, RepoConfig, StatusServerConfig
-from repowatch.prefetch import BandwidthLimiter, _repo_url_prefix, warm_cache
-from repowatch.state import StateStore
+from repowatch.config.models import Config
+from repowatch.config.models import RepoConfig
+from repowatch.config.models import StatusServerConfig
+from repowatch.bandwidth import BandwidthLimiter
+from repowatch.routing import repo_prefix
+from repowatch.operations.warm import warm_cache
+from repowatch.runtime.context import ServiceState
 
 
 def _config(prefetch_concurrency: int = 8, prefetch_bandwidth_limit: float | None = None) -> Config:
@@ -20,8 +25,8 @@ def _config(prefetch_concurrency: int = 8, prefetch_bandwidth_limit: float | Non
     )
 
 
-def _store(tmp_path) -> StateStore:
-    return StateStore(tmp_path / "state.sqlite3")
+def _store(tmp_path) -> ServiceState:
+    return ServiceState(tmp_path / "state.sqlite3")
 
 
 def test_pacman_prefix_matches_upstream_layout():
@@ -32,7 +37,7 @@ def test_pacman_prefix_matches_upstream_layout():
         arch="x86_64",
         repo_name="core",
     )
-    assert _repo_url_prefix(repo) == "/arch/core/os/x86_64"
+    assert repo_prefix(repo) == "/arch/core/os/x86_64"
 
 
 def test_apk_prefix_includes_version_and_component_from_upstream():
@@ -44,7 +49,7 @@ def test_apk_prefix_includes_version_and_component_from_upstream():
         upstream="https://dl-cdn.alpinelinux.org/alpine/v3.20/main",
         arch="x86_64",
     )
-    assert _repo_url_prefix(repo) == "/alpine/v3.20/main/x86_64"
+    assert repo_prefix(repo) == "/alpine/v3.20/main/x86_64"
 
 
 def test_apk_prefix_strips_trailing_slash_from_upstream():
@@ -54,7 +59,7 @@ def test_apk_prefix_strips_trailing_slash_from_upstream():
         upstream="https://dl-cdn.alpinelinux.org/alpine/v3.20/community/",
         arch="aarch64",
     )
-    assert _repo_url_prefix(repo) == "/alpine/v3.20/community/aarch64"
+    assert repo_prefix(repo) == "/alpine/v3.20/community/aarch64"
 
 
 def test_apt_prefix_derives_top_segment_from_upstream_not_hardcoded_debian():
@@ -69,8 +74,8 @@ def test_apt_prefix_derives_top_segment_from_upstream_not_hardcoded_debian():
         id="ubuntu-noble", type="apt", upstream="http://archive.ubuntu.com/ubuntu",
         distribution="noble", component="main", arch="amd64",
     )
-    assert _repo_url_prefix(debian_repo) == "/debian/pool/main"
-    assert _repo_url_prefix(ubuntu_repo) == "/ubuntu/pool/main"
+    assert repo_prefix(debian_repo) == "/debian/pool/main"
+    assert repo_prefix(ubuntu_repo) == "/ubuntu/pool/main"
 
 
 def test_apt_prefix_includes_component_to_distinguish_sibling_repos():
@@ -86,7 +91,7 @@ def test_apt_prefix_includes_component_to_distinguish_sibling_repos():
         id="ubuntu-noble-universe", type="apt", upstream="http://archive.ubuntu.com/ubuntu",
         distribution="noble", component="universe", arch="amd64",
     )
-    assert _repo_url_prefix(main_repo) != _repo_url_prefix(universe_repo)
+    assert repo_prefix(main_repo) != repo_prefix(universe_repo)
 
 
 def test_warm_cache_skips_when_prefetch_disabled(tmp_path):
@@ -94,7 +99,7 @@ def test_warm_cache_skips_when_prefetch_disabled(tmp_path):
         id="debian-test", type="apt", upstream="https://example.org", arch="amd64",
         distribution="bookworm", component="main", prefetch=False,
     )
-    with patch("repowatch.prefetch._warm_one") as mock_warm:
+    with patch("repowatch.operations.warm.download_package") as mock_warm:
         asyncio.run(warm_cache(
             _config(), repo, _store(tmp_path), {"bash-1": "pool/main/b/bash/bash_1_amd64.deb"}
         ))
@@ -109,7 +114,7 @@ def test_warm_cache_force_bypasses_prefetch_flag(tmp_path):
         id="debian-test", type="apt", upstream="https://example.org", arch="amd64",
         distribution="bookworm", component="main", prefetch=False,
     )
-    with patch("repowatch.prefetch._warm_one", return_value=(True, 200)) as mock_warm:
+    with patch("repowatch.operations.warm.download_package", return_value=(True, 200)) as mock_warm:
         asyncio.run(warm_cache(
             _config(), repo, _store(tmp_path),
             {"bash-1": "pool/main/b/bash/bash_1_amd64.deb"}, force=True,
@@ -122,13 +127,13 @@ def test_warm_cache_builds_correct_urls_for_apk(tmp_path):
         id="alpine-main", type="apk",
         upstream="https://dl-cdn.alpinelinux.org/alpine/v3.20/main", arch="x86_64",
     )
-    with patch("repowatch.prefetch._warm_one", return_value=(True, 200)) as mock_warm:
+    with patch("repowatch.operations.warm.download_package", return_value=(True, 200)) as mock_warm:
         asyncio.run(warm_cache(
             _config(), repo, _store(tmp_path),
             {"musl-1.2.5-r0": "musl-1.2.5-r0.apk", "zlib-1.3.1-r0": "zlib-1.3.1-r0.apk"},
         ))
 
-    # _warm_one(client, url, limiter) — url is now the second positional argument
+    # download_package(client, url, limiter) — url is now the second positional argument
     called_urls = {c.args[1] for c in mock_warm.call_args_list}
     assert called_urls == {
         "http://127.0.0.1:8080/alpine/v3.20/main/x86_64/musl-1.2.5-r0.apk",
@@ -137,14 +142,14 @@ def test_warm_cache_builds_correct_urls_for_apk(tmp_path):
 
 
 def test_warm_cache_builds_correct_urls_for_apt_non_debian_upstream(tmp_path):
-    """Regression for _apt_top_segment: the warm URL used to hardcode
+    """Regression for apt_prefix: the warm URL used to hardcode
     "/debian/" for ANY apt repo, even Ubuntu."""
     repo = RepoConfig(
         id="ubuntu-noble-main", type="apt",
         upstream="http://archive.ubuntu.com/ubuntu",
         distribution="noble", component="main", arch="amd64",
     )
-    with patch("repowatch.prefetch._warm_one", return_value=(True, 200)) as mock_warm:
+    with patch("repowatch.operations.warm.download_package", return_value=(True, 200)) as mock_warm:
         asyncio.run(warm_cache(
             _config(), repo, _store(tmp_path),
             {"bash-1": "pool/main/b/bash/bash_1_amd64.deb"},
@@ -162,7 +167,7 @@ def test_warm_cache_records_results_in_store(tmp_path):
     store = _store(tmp_path)
 
     with patch(
-        "repowatch.prefetch._warm_one",
+        "repowatch.operations.warm.download_package",
         side_effect=[(True, 200), (False, 404)],
     ):
         asyncio.run(warm_cache(
@@ -170,7 +175,7 @@ def test_warm_cache_records_results_in_store(tmp_path):
             {"musl-1.2.5-r0": "musl-1.2.5-r0.apk", "broken-1.0-r0": "broken-1.0-r0.apk"},
         ))
 
-    warmed = {row["package_key"]: row for row in store.get_warmed_packages("alpine-main")}
+    warmed = {row["package_key"]: row for row in store.cache.get_warmed_packages("alpine-main")}
     assert set(warmed) == {"musl-1.2.5-r0", "broken-1.0-r0"}
     statuses = {row["status"] for row in warmed.values()}
     assert statuses == {"ok", "failed"}
@@ -186,7 +191,7 @@ def test_warm_cache_bumps_prefetch_failure_series_when_any_package_fails(tmp_pat
     )
     store = _store(tmp_path)
 
-    with patch("repowatch.prefetch._warm_one", side_effect=[(True, 200), (False, 404)]):
+    with patch("repowatch.operations.warm.download_package", side_effect=[(True, 200), (False, 404)]):
         asyncio.run(warm_cache(
             _config(), repo, store,
             {"ok-1.0-r0": "ok-1.0-r0.apk", "broken-1.0-r0": "broken-1.0-r0.apk"},
@@ -194,7 +199,7 @@ def test_warm_cache_bumps_prefetch_failure_series_when_any_package_fails(tmp_pat
 
     # bump_failure on an already-existing streak returns count 2 — meaning
     # the run above already recorded this streak's first failure
-    assert store.bump_failure("alpine-main", "prefetch", "peek") == (2, False)
+    assert store.notifications.bump_failure("alpine-main", "prefetch", "peek") == (2, False)
 
 
 def test_warm_cache_resets_prefetch_failure_series_on_fully_successful_run(tmp_path):
@@ -203,13 +208,13 @@ def test_warm_cache_resets_prefetch_failure_series_on_fully_successful_run(tmp_p
         upstream="https://dl-cdn.alpinelinux.org/alpine/v3.20/main", arch="x86_64",
     )
     store = _store(tmp_path)
-    store.bump_failure("alpine-main", "prefetch", "previous failed run")
+    store.notifications.bump_failure("alpine-main", "prefetch", "previous failed run")
 
-    with patch("repowatch.prefetch._warm_one", return_value=(True, 200)):
+    with patch("repowatch.operations.warm.download_package", return_value=(True, 200)):
         asyncio.run(warm_cache(_config(), repo, store, {"ok-1.0-r0": "ok-1.0-r0.apk"}))
 
     # the streak is fully reset — the next failure starts the count at 1 again
-    assert store.bump_failure("alpine-main", "prefetch", "peek") == (1, False)
+    assert store.notifications.bump_failure("alpine-main", "prefetch", "peek") == (1, False)
 
 
 def test_warm_cache_runs_concurrently_not_sequentially(tmp_path):
@@ -232,7 +237,7 @@ def test_warm_cache_runs_concurrently_not_sequentially(tmp_path):
     )
     packages = {f"pkg{i}-1.0-r0": f"pkg{i}-1.0-r0.apk" for i in range(10)}
 
-    with patch("repowatch.prefetch._warm_one", side_effect=fake_warm_one):
+    with patch("repowatch.operations.warm.download_package", side_effect=fake_warm_one):
         asyncio.run(warm_cache(_config(prefetch_concurrency=4), repo, _store(tmp_path), packages))
 
     assert max_active > 1
@@ -243,20 +248,20 @@ def test_warm_cache_empty_packages_is_noop(tmp_path):
         id="alpine-main", type="apk",
         upstream="https://dl-cdn.alpinelinux.org/alpine/v3.20/main", arch="x86_64",
     )
-    with patch("repowatch.prefetch._warm_one") as mock_warm:
+    with patch("repowatch.operations.warm.download_package") as mock_warm:
         asyncio.run(warm_cache(_config(), repo, _store(tmp_path), {}))
     mock_warm.assert_not_called()
 
 
 def test_warm_cache_skips_banned_packages_by_name(tmp_path):
-    from repowatch.state import RepoSnapshot
+    from repowatch.models import RepoSnapshot
 
     repo = RepoConfig(
         id="alpine-main", type="apk",
         upstream="https://dl-cdn.alpinelinux.org/alpine/v3.20/main", arch="x86_64",
     )
     store = _store(tmp_path)
-    store.record_snapshot(
+    store.repositories.record_snapshot(
         RepoSnapshot(
             repo_id="alpine-main",
             packages={
@@ -266,9 +271,9 @@ def test_warm_cache_skips_banned_packages_by_name(tmp_path):
             names={"musl-1.2.5-r0": "musl", "linux-headers-6.11-r0": "linux-headers"},
         )
     )
-    store.ban_package("alpine-main", "linux-headers")
+    store.cache.ban_package("alpine-main", "linux-headers")
 
-    with patch("repowatch.prefetch._warm_one", return_value=(True, 200)) as mock_warm:
+    with patch("repowatch.operations.warm.download_package", return_value=(True, 200)) as mock_warm:
         asyncio.run(warm_cache(
             _config(), repo, store,
             {"musl-1.2.5-r0": "musl-1.2.5-r0.apk", "linux-headers-6.11-r0": "linux-headers-6.11-r0.apk"},
@@ -281,23 +286,23 @@ def test_warm_cache_skips_banned_packages_by_name(tmp_path):
 def test_warm_cache_ban_applies_even_with_force(tmp_path):
     """Manual warming (force=True) must not bypass a ban — to warm a banned
     package on purpose, unban it explicitly first."""
-    from repowatch.state import RepoSnapshot
+    from repowatch.models import RepoSnapshot
 
     repo = RepoConfig(
         id="debian-test", type="apt", upstream="https://example.org", arch="amd64",
         distribution="bookworm", component="main", prefetch=False,
     )
     store = _store(tmp_path)
-    store.record_snapshot(
+    store.repositories.record_snapshot(
         RepoSnapshot(
             repo_id="debian-test",
             packages={"linux-1-2": "pool/main/l/linux/linux_1-2_amd64.deb"},
             names={"linux-1-2": "linux"},
         )
     )
-    store.ban_package("debian-test", "linux")
+    store.cache.ban_package("debian-test", "linux")
 
-    with patch("repowatch.prefetch._warm_one") as mock_warm:
+    with patch("repowatch.operations.warm.download_package") as mock_warm:
         asyncio.run(warm_cache(
             _config(), repo, store,
             {"linux-1-2": "pool/main/l/linux/linux_1-2_amd64.deb"}, force=True,
@@ -356,8 +361,8 @@ def test_bandwidth_limiter_zero_byte_chunk_is_noop():
 
 
 def test_warm_cache_respects_prefetch_bandwidth_limit(tmp_path):
-    """_warm_one really streams and calls limiter.consume() for each chunk
-    (see test_warm_one_streams_body_in_chunks) — here we mock _warm_one
+    """download_package really streams and calls limiter.consume() for each chunk
+    (see test_warm_one_streams_body_in_chunks) — here we mock download_package
     entirely and simulate byte consumption by hand, to check specifically
     that warm_cache builds and passes a SINGLE SHARED limiter for the whole
     pool (see test_bandwidth_limiter_shared_across_concurrent_tasks above —
@@ -373,7 +378,7 @@ def test_warm_cache_respects_prefetch_bandwidth_limit(tmp_path):
         return True, 200
 
     started = time.monotonic()
-    with patch("repowatch.prefetch._warm_one", side_effect=fake_warm_one):
+    with patch("repowatch.operations.warm.download_package", side_effect=fake_warm_one):
         asyncio.run(warm_cache(
             _config(prefetch_concurrency=4, prefetch_bandwidth_limit=20.0),
             repo, _store(tmp_path), packages,
@@ -386,7 +391,7 @@ def test_warm_cache_respects_prefetch_bandwidth_limit(tmp_path):
 
 
 class _FakeStreamResponse:
-    """Mocks just as much of httpx.Response as _warm_one needs:
+    """Mocks just as much of httpx.Response as download_package needs:
     .status_code, raise_for_status(), aiter_bytes(chunk_size) — an async
     generator yielding chunks from a pre-set buffer (like a real stream —
     up to chunk_size bytes at a time, less at the end)."""
@@ -419,7 +424,7 @@ class _FakeStreamCM:
 
 
 class _FakeStreamClient:
-    """Mocks just as much of httpx.AsyncClient as _warm_one needs:
+    """Mocks just as much of httpx.AsyncClient as download_package needs:
     only client.stream(...)."""
 
     def __init__(self, response: _FakeStreamResponse | None = None, raises: Exception | None = None):
@@ -439,13 +444,14 @@ def _fake_limiter() -> MagicMock:
 
 
 def test_warm_one_streams_body_in_chunks():
-    from repowatch.prefetch import _CHUNK_SIZE, _warm_one
+    from repowatch.cache.transport import _CHUNK_SIZE
+    from repowatch.cache.transport import download_package
 
     body = b"x" * (_CHUNK_SIZE + 37)  # one full chunk + a remainder
     fake_limiter = _fake_limiter()
     client = _FakeStreamClient(_FakeStreamResponse(body))
 
-    ok, status = asyncio.run(_warm_one(client, "http://example.org/pkg.apk", fake_limiter))
+    ok, status = asyncio.run(download_package(client, "http://example.org/pkg.apk", fake_limiter))
 
     assert ok is True
     assert status == 200
@@ -454,14 +460,14 @@ def test_warm_one_streams_body_in_chunks():
 
 def test_warm_one_reports_http_status_error():
     """httpx doesn't raise on a non-2xx status by itself — raise_for_status()
-    inside _warm_one does it explicitly, BEFORE streaming the body (so we
+    inside download_package does it explicitly, BEFORE streaming the body (so we
     don't spend the bandwidth budget on an error page's body)."""
-    from repowatch.prefetch import _warm_one
+    from repowatch.cache.transport import download_package
 
     fake_limiter = _fake_limiter()
     client = _FakeStreamClient(_FakeStreamResponse(b"not found", status_code=404))
 
-    ok, status = asyncio.run(_warm_one(client, "http://example.org/pkg.apk", fake_limiter))
+    ok, status = asyncio.run(download_package(client, "http://example.org/pkg.apk", fake_limiter))
 
     assert ok is False
     assert status == 404
@@ -471,12 +477,12 @@ def test_warm_one_reports_http_status_error():
 def test_warm_one_reports_request_error():
     """A connection-level error (not an HTTP status) — httpx.RequestError,
     the counterpart of the old urllib.error.URLError."""
-    from repowatch.prefetch import _warm_one
+    from repowatch.cache.transport import download_package
 
     fake_limiter = _fake_limiter()
     client = _FakeStreamClient(raises=httpx.ConnectError("connection refused"))
 
-    ok, status = asyncio.run(_warm_one(client, "http://example.org/pkg.apk", fake_limiter))
+    ok, status = asyncio.run(download_package(client, "http://example.org/pkg.apk", fake_limiter))
 
     assert ok is False
     assert status is None
@@ -484,8 +490,8 @@ def test_warm_one_reports_request_error():
 
 
 def test_security_and_ppa_keep_distinct_cache_paths_and_matching():
-    from repowatch.prefetch import _build_warm_url
-    from repowatch.syslog_listener import match_repo_id
+    from repowatch.routing import warm_url
+    from repowatch.runtime.syslog import match_repo_id
 
     repos = [
         RepoConfig(id=name, type="apt", upstream=upstream, distribution="noble",
@@ -498,37 +504,37 @@ def test_security_and_ppa_keep_distinct_cache_paths_and_matching():
     ]
     filename = "pool/main/p/python3.13/python3.13_1_amd64.deb"
     for repo, prefix in zip(repos, ("/ubuntu", "/ubuntu-security", "/ppa-deadsnakes-ppa")):
-        assert _repo_url_prefix(repo) == prefix + "/pool/main"
-        assert _build_warm_url(_config(), repo, filename) == "http://127.0.0.1:8080" + prefix + "/" + filename
+        assert repo_prefix(repo) == prefix + "/pool/main"
+        assert warm_url(_config(), repo, filename) == "http://127.0.0.1:8080" + prefix + "/" + filename
         assert match_repo_id(prefix + "/" + filename, repos) == repo.id
 
 
 def test_dnf_prefix_uses_repo_id_and_preserves_relative_package_path():
-    from repowatch.prefetch import _build_warm_url
-    from repowatch.syslog_listener import match_repo_id
+    from repowatch.routing import warm_url
+    from repowatch.runtime.syslog import match_repo_id
     repo = RepoConfig(id='rocky-9-baseos-x86_64', type='dnf',
                       upstream='https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os', arch='x86_64')
     path = '/rpm/rocky-9-baseos-x86_64/Packages/b/bash-1.x86_64.rpm'
-    assert _repo_url_prefix(repo) == '/rpm/rocky-9-baseos-x86_64'
-    assert _build_warm_url(_config(), repo, 'Packages/b/bash-1.x86_64.rpm') == _config().cache_base_url + path
+    assert repo_prefix(repo) == '/rpm/rocky-9-baseos-x86_64'
+    assert warm_url(_config(), repo, 'Packages/b/bash-1.x86_64.rpm') == _config().cache_base_url + path
     assert match_repo_id(path, [repo]) == repo.id
 
 
 def test_xbps_prefix_uses_repo_id_flat_namespace():
-    from repowatch.prefetch import _build_warm_url
-    from repowatch.syslog_listener import match_repo_id
+    from repowatch.routing import warm_url
+    from repowatch.runtime.syslog import match_repo_id
     repo = RepoConfig(id='void-current', type='xbps',
                       upstream='https://repo-default.voidlinux.org/current', arch='x86_64')
     path = '/xbps/void-current/bash-5.3_2.x86_64.xbps'
-    assert _repo_url_prefix(repo) == '/xbps/void-current'
-    assert _build_warm_url(_config(), repo, 'bash-5.3_2.x86_64.xbps') == _config().cache_base_url + path
+    assert repo_prefix(repo) == '/xbps/void-current'
+    assert warm_url(_config(), repo, 'bash-5.3_2.x86_64.xbps') == _config().cache_base_url + path
     assert match_repo_id(path, [repo]) == repo.id
 
 
 # --- active cache purge on package removal (docs_dev/ROADMAP.md item 24) ---
 
 def _purge_config(**overrides):
-    from repowatch.config import NginxConfig
+    from repowatch.config.models import NginxConfig
     return Config(
         state_db="/tmp/unused.sqlite3", check_interval=300,
         cache_base_url="http://127.0.0.1:8080", status_server=StatusServerConfig(),
@@ -538,18 +544,19 @@ def _purge_config(**overrides):
 
 
 def test_purge_url_mirrors_build_warm_url_under_a_purge_prefix():
-    from repowatch.prefetch import _build_warm_url, _purge_url
+    from repowatch.routing import warm_url
+    from repowatch.routing import purge_url
     repo = RepoConfig(id='r', type='pacman', upstream='https://mirror.test/core/os/x86_64',
                        arch='x86_64', repo_name='core')
     config = _purge_config()
-    warm = _build_warm_url(config, repo, 'acl-1-1-x86_64.pkg.tar.zst')
-    purge = _purge_url(config, repo, 'acl-1-1-x86_64.pkg.tar.zst')
+    warm = warm_url(config, repo, 'acl-1-1-x86_64.pkg.tar.zst')
+    purge = purge_url(config, repo, 'acl-1-1-x86_64.pkg.tar.zst')
     assert purge == warm.replace(config.cache_base_url, config.cache_base_url + '/purge', 1)
     assert purge == 'http://127.0.0.1:8080/purge/arch/core/os/x86_64/acl-1-1-x86_64.pkg.tar.zst'
 
 
 def test_purge_removed_is_a_noop_when_disabled():
-    from repowatch.prefetch import purge_removed
+    from repowatch.cache.purge import purge_removed
     repo = RepoConfig(id='r', type='pacman', upstream='https://mirror.test/core/os/x86_64',
                        arch='x86_64', repo_name='core')
     config = Config(state_db="/tmp/unused.sqlite3", check_interval=300,
@@ -559,12 +566,12 @@ def test_purge_removed_is_a_noop_when_disabled():
     def boom(**kwargs):
         raise AssertionError("must not even construct an httpx.AsyncClient when disabled")
 
-    with patch("repowatch.prefetch.httpx.AsyncClient", boom):
+    with patch("repowatch.operations.warm.httpx.AsyncClient", boom):
         asyncio.run(purge_removed(config, repo, {"acl-1-1": "acl-1-1-x86_64.pkg.tar.zst"}))
 
 
 def test_purge_removed_is_a_noop_for_an_empty_batch():
-    from repowatch.prefetch import purge_removed
+    from repowatch.cache.purge import purge_removed
     repo = RepoConfig(id='r', type='pacman', upstream='https://mirror.test/core/os/x86_64',
                        arch='x86_64', repo_name='core')
     # enable_purge=True but nothing removed — must not even try to build a client/URL.
@@ -572,7 +579,7 @@ def test_purge_removed_is_a_noop_for_an_empty_batch():
 
 
 def test_purge_removed_requests_the_purge_url_for_each_removed_file():
-    from repowatch.prefetch import purge_removed
+    from repowatch.cache.purge import purge_removed
     repo = RepoConfig(id='r', type='pacman', upstream='https://mirror.test/core/os/x86_64',
                        arch='x86_64', repo_name='core')
     requested = []
@@ -582,7 +589,7 @@ def test_purge_removed_requests_the_purge_url_for_each_removed_file():
 
     real_async_client = httpx.AsyncClient
     async def run():
-        with patch("repowatch.prefetch.httpx.AsyncClient",
+        with patch("repowatch.operations.warm.httpx.AsyncClient",
                     lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
             await purge_removed(_purge_config(), repo, {
                     "acl-1-1": "acl-1-1-x86_64.pkg.tar.zst",
@@ -600,10 +607,10 @@ def test_purge_removed_sends_the_repowatch_user_agent():
     didn't set User-Agent at all, so nginx's $repowatch_is_prefetch map
     (keyed on this exact header, see nginx.py) classified them as real
     client traffic — every automatic purge polluted "Recent client
-    requests" with its own /purge/... URL. _warm_one already set this
+    requests" with its own /purge/... URL. download_package already set this
     correctly; purge_removed/purge_selected did not."""
     from repowatch.parsers.base import USER_AGENT
-    from repowatch.prefetch import purge_removed
+    from repowatch.cache.purge import purge_removed
     repo = RepoConfig(id='r', type='pacman', upstream='https://mirror.test/core/os/x86_64',
                        arch='x86_64', repo_name='core')
     seen_user_agents = []
@@ -613,7 +620,7 @@ def test_purge_removed_sends_the_repowatch_user_agent():
 
     real_async_client = httpx.AsyncClient
     async def run():
-        with patch("repowatch.prefetch.httpx.AsyncClient",
+        with patch("repowatch.operations.warm.httpx.AsyncClient",
                     lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
             await purge_removed(_purge_config(), repo, {"acl-1-1": "acl-1-1-x86_64.pkg.tar.zst"})
     asyncio.run(run())
@@ -621,7 +628,7 @@ def test_purge_removed_sends_the_repowatch_user_agent():
 
 
 def test_purge_removed_one_failure_does_not_abort_the_rest():
-    from repowatch.prefetch import purge_removed
+    from repowatch.cache.purge import purge_removed
     repo = RepoConfig(id='r', type='pacman', upstream='https://mirror.test/core/os/x86_64',
                        arch='x86_64', repo_name='core')
     requested = []
@@ -633,7 +640,7 @@ def test_purge_removed_one_failure_does_not_abort_the_rest():
 
     real_async_client = httpx.AsyncClient
     async def run():
-        with patch("repowatch.prefetch.httpx.AsyncClient",
+        with patch("repowatch.operations.warm.httpx.AsyncClient",
                     lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
             await purge_removed(_purge_config(), repo, {
                     "acl-1-1": "acl-1-1-x86_64.pkg.tar.zst",
@@ -644,7 +651,7 @@ def test_purge_removed_one_failure_does_not_abort_the_rest():
 
 
 def test_purge_removed_survives_a_connection_error():
-    from repowatch.prefetch import purge_removed
+    from repowatch.cache.purge import purge_removed
     repo = RepoConfig(id='r', type='pacman', upstream='https://mirror.test/core/os/x86_64',
                        arch='x86_64', repo_name='core')
     def handler(request):
@@ -652,21 +659,21 @@ def test_purge_removed_survives_a_connection_error():
 
     real_async_client = httpx.AsyncClient
     async def run():
-        with patch("repowatch.prefetch.httpx.AsyncClient",
+        with patch("repowatch.operations.warm.httpx.AsyncClient",
                     lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
             await purge_removed(_purge_config(), repo, {"acl-1-1": "acl-1-1-x86_64.pkg.tar.zst"})
     asyncio.run(run())  # must not raise
 
 
 def test_purge_selected_is_a_noop_for_an_empty_batch():
-    from repowatch.prefetch import purge_selected
+    from repowatch.cache.purge import purge_selected
     repo = RepoConfig(id='r', type='pacman', upstream='https://mirror.test/core/os/x86_64',
                        arch='x86_64', repo_name='core')
 
     def boom(**kwargs):
         raise AssertionError("must not even construct an httpx.AsyncClient for an empty batch")
 
-    with patch("repowatch.prefetch.httpx.AsyncClient", boom):
+    with patch("repowatch.operations.warm.httpx.AsyncClient", boom):
         result = asyncio.run(purge_selected(_purge_config(), repo, {}))
     assert result == {}
 
@@ -675,7 +682,7 @@ def test_purge_selected_does_not_check_enable_purge_itself():
     """Unlike purge_removed, purge_selected trusts the caller (the API
     payload function) to have already refused the request when
     enable_purge is off — it always attempts the HTTP call it's given."""
-    from repowatch.prefetch import purge_selected
+    from repowatch.cache.purge import purge_selected
     repo = RepoConfig(id='r', type='pacman', upstream='https://mirror.test/core/os/x86_64',
                        arch='x86_64', repo_name='core')
     config = Config(state_db="/tmp/unused.sqlite3", check_interval=300,
@@ -686,14 +693,14 @@ def test_purge_selected_does_not_check_enable_purge_itself():
     def handler(request):
         return httpx.Response(200)
     async def run():
-        with patch("repowatch.prefetch.httpx.AsyncClient",
+        with patch("repowatch.operations.warm.httpx.AsyncClient",
                     lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
             return await purge_selected(config, repo, {"acl-1-1": "acl-1-1-x86_64.pkg.tar.zst"})
     assert asyncio.run(run()) == {"acl-1-1": "purged"}
 
 
 def test_purge_selected_reports_purged_not_cached_and_error_per_item():
-    from repowatch.prefetch import purge_selected
+    from repowatch.cache.purge import purge_selected
     repo = RepoConfig(id='r', type='pacman', upstream='https://mirror.test/core/os/x86_64',
                        arch='x86_64', repo_name='core')
 
@@ -706,7 +713,7 @@ def test_purge_selected_reports_purged_not_cached_and_error_per_item():
 
     real_async_client = httpx.AsyncClient
     async def run():
-        with patch("repowatch.prefetch.httpx.AsyncClient",
+        with patch("repowatch.operations.warm.httpx.AsyncClient",
                     lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
             return await purge_selected(_purge_config(), repo, {
                 "a": "purged-me-1-x86_64.pkg.tar.zst",
@@ -725,7 +732,7 @@ def test_purge_selected_sends_the_repowatch_user_agent():
     "Purge selected" button's own requests must also be marked, or every
     click pollutes "Recent client requests" with /purge/... calls."""
     from repowatch.parsers.base import USER_AGENT
-    from repowatch.prefetch import purge_selected
+    from repowatch.cache.purge import purge_selected
     repo = RepoConfig(id='r', type='pacman', upstream='https://mirror.test/core/os/x86_64',
                        arch='x86_64', repo_name='core')
     seen_user_agents = []
@@ -735,7 +742,7 @@ def test_purge_selected_sends_the_repowatch_user_agent():
 
     real_async_client = httpx.AsyncClient
     async def run():
-        with patch("repowatch.prefetch.httpx.AsyncClient",
+        with patch("repowatch.operations.warm.httpx.AsyncClient",
                     lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
             return await purge_selected(_purge_config(), repo, {"acl-1-1": "acl-1-1-x86_64.pkg.tar.zst"})
     asyncio.run(run())
@@ -743,7 +750,7 @@ def test_purge_selected_sends_the_repowatch_user_agent():
 
 
 def test_purge_selected_reports_error_for_a_connection_failure():
-    from repowatch.prefetch import purge_selected
+    from repowatch.cache.purge import purge_selected
     repo = RepoConfig(id='r', type='pacman', upstream='https://mirror.test/core/os/x86_64',
                        arch='x86_64', repo_name='core')
     def handler(request):
@@ -751,8 +758,32 @@ def test_purge_selected_reports_error_for_a_connection_failure():
 
     real_async_client = httpx.AsyncClient
     async def run():
-        with patch("repowatch.prefetch.httpx.AsyncClient",
+        with patch("repowatch.operations.warm.httpx.AsyncClient",
                     lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
             return await purge_selected(_purge_config(), repo, {"acl-1-1": "acl-1-1-x86_64.pkg.tar.zst"})
     results = asyncio.run(run())
     assert results["acl-1-1"].startswith("error (")
+
+
+@pytest.mark.parametrize('status', [200, 201, 204, 302, 404, 503])
+def test_purge_batch_preserves_manual_results_and_automatic_logging(status, caplog):
+    from repowatch.cache.purge import purge_removed, purge_selected
+    repo = RepoConfig('r', 'pacman', 'https://mirror.test/core/os/x86_64',
+                      'x86_64', repo_name='core')
+    requests = []
+
+    def response(request):
+        requests.append(request)
+        return httpx.Response(status, headers={'Location': 'https://other.test/target'})
+
+    real_client = httpx.AsyncClient
+    with patch('repowatch.cache.purge.httpx.AsyncClient',
+               lambda: real_client(transport=httpx.MockTransport(response))):
+        expected = 'purged' if status == 200 else 'not_cached' if status == 404 else f'error (HTTP {status})'
+        assert asyncio.run(purge_selected(_purge_config(), repo, {'p': 'p.pkg'})) == {'p': expected}
+        assert not caplog.records
+        assert asyncio.run(purge_removed(_purge_config(), repo, {'p': 'p.pkg'})) is None
+    assert len(requests) == 2  # Redirects must not introduce upstream requests.
+    assert len(caplog.records) == int(status >= 400)
+    if status >= 400:
+        assert f'purge failed (HTTP {status}) for p.pkg' in caplog.text

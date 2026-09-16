@@ -1,14 +1,14 @@
 """Local repository path templates, independent of upstream URLs and parsers."""
+
 from __future__ import annotations
 
 import re
+from repowatch.errors import ConfigError
 from string import Formatter
 from typing import TYPE_CHECKING
 
-from repowatch.config import ConfigError
-
 if TYPE_CHECKING:
-    from repowatch.config import RepoConfig
+    from repowatch.config.models import RepoConfig
 
 FIELDS = ('id', 'type', 'repo_name', 'arch', 'distribution', 'component')
 

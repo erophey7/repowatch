@@ -1,7 +1,7 @@
 # Generated Docker builds (experimental packaging)
 
 The generator builds the application image and a companion nginx image.
-Development and standalone release Compose files are included; actual image builds, container integration
+The development Compose file is included; the release Compose draft is ignored until release preparation; actual image builds, container integration
 and multi-architecture validation remain pending.
 Build commands do not start services; starting either Compose stack is explicit.
 
@@ -151,13 +151,22 @@ docker compose -f docker-compose.dev.yml logs -f
 
 The dashboard is at <http://127.0.0.1:18085>; the cache is at
 <http://127.0.0.1:18080>. Published ports bind only to host loopback.
-The seed configuration enables one Debian bookworm/main repository with automatic
-package prefetch disabled. Index checks still contact upstream. Read-only guest
-access is enabled; set the administrator password interactively:
+The seed configuration contains `repos: []`: no upstream is contacted until you
+add a source. Guest access is disabled and host-token repository restrictions
+are enabled. The developer seed sets `allow_insecure_http: true` because Docker
+can forward host-loopback connections with a bridge source address. Published
+ports remain bound to host `127.0.0.1`; use HTTPS and disable that exception
+before exposing the status port remotely. Set the administrator password interactively:
 
 ```sh
 docker compose -f docker-compose.dev.yml exec repowatch repowatch -c /etc/repowatch/config.yaml set-password
 ```
+
+After login, follow [repository management](repositories.md) to add the first
+source, then [client configuration](clients.md). This developer profile keeps
+its smaller cache/bandwidth limits; it is not a production capacity estimate.
+Existing bind-mounted YAML is preserved, so changing the seed does not change
+an already initialized stack.
 
 The default stack uses host bind mounts, relative to `docker-compose.dev.yml`:
 
@@ -233,9 +242,9 @@ a private copy of YAML and calls the existing nginx apply transaction, including
 configuration testing, change detection and rollback. This polling interval is a
 trial default, not a new host timer or a second renderer. nginx master/helper run
 as root inside their container; repowatch runs as UID 10001. No privileged mode,
-host networking or Docker socket is used. The helper needs writable SQLite access
-for existing dedup logic; shared state directories use the selected GID and setgid, and
-helper-created database sidecars are group-writable. Config is mounted read-only
+host networking or Docker socket is used. The helper reads dedup state without migrating or initializing the application's
+schema. Shared state directories use the selected GID and setgid; existing
+SQLite WAL/SHM access still requires appropriate directory/file permissions. Config is mounted read-only
 in nginx; its policy and generated nginx files remain private to that container.
 
 `make docker-compose-build` builds the app first and then the matching companion.

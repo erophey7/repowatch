@@ -1,13 +1,22 @@
+import repowatch.operations.check as operations_check
+import repowatch.operations.warm as operations_warm
 import asyncio
 from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 
-from repowatch.config import Config, ConfigError, RepoConfig, StatusServerConfig, load_config
-from repowatch import notifications, prefetch, watcher
+from repowatch.config.models import Config
+from repowatch.errors import ConfigError
+from repowatch.config.models import RepoConfig
+from repowatch.config.models import StatusServerConfig
+from repowatch.config.load import load_config
+from repowatch import notifications
+import repowatch.operations.warm as prefetch
+import repowatch.operations.check as watcher
 from repowatch.parsers.base import IndexHeadResult
-from repowatch.state import RepoSnapshot, StateStore
+from repowatch.models import RepoSnapshot
+from repowatch.runtime.context import ServiceState
 
 
 def config(**kwargs):
@@ -118,17 +127,17 @@ def test_warm_lifecycle_counts_filters_and_nix_roots(tmp_path, monkeypatch, nix)
     repo = RepoConfig('r', 'nix' if nix else 'apk', 'https://example.org', 'x86_64-linux' if nix else 'x86_64',
                       nix_source='https://example.org/source.tar.xz' if nix else None,
                       prefetch_blacklist=['blocked'])
-    store = StateStore(tmp_path / 'state.db')
+    store = ServiceState(tmp_path / 'state.db')
     packages = {'a': 'a', 'b': 'b', 'c': 'c'}
-    store.record_snapshot(RepoSnapshot('r', packages, {'a': 'allowed', 'b': 'other', 'c': 'blocked'}))
+    store.repositories.record_snapshot(RepoSnapshot('r', packages, {'a': 'allowed', 'b': 'other', 'c': 'blocked'}))
     if nix:
-        monkeypatch.setattr('repowatch.nix_cache.warm', AsyncMock(return_value={'a': True, 'b': False}))
+        monkeypatch.setattr('repowatch.cache.nix.warm', AsyncMock(return_value={'a': True, 'b': False}))
     else:
-        monkeypatch.setattr(prefetch, '_warm_one', AsyncMock(side_effect=[(True, 200), (False, 503)]))
+        monkeypatch.setattr(operations_warm, 'download_package', AsyncMock(side_effect=[(True, 200), (False, 503)]))
     send = AsyncMock(return_value=True)
     monkeypatch.setattr(notifications, '_send', send)
     c = config(repos=[repo], notify_events=['warm.started', 'warm.completed'])
-    outcomes = asyncio.run(prefetch.warm_cache(c, repo, store, packages, force=True))
+    outcomes = asyncio.run(operations_warm.warm_cache(c, repo, store, packages, force=True))
     assert outcomes == {'a': True, 'b': False}
     start, end = [call.args[1] for call in send.call_args_list]
     assert start['event'] == 'warm.started' and end['event'] == 'warm.completed'
@@ -141,27 +150,27 @@ def test_warm_lifecycle_counts_filters_and_nix_roots(tmp_path, monkeypatch, nix)
 def test_no_lifecycle_for_disabled_or_fully_excluded_warm(tmp_path, monkeypatch):
     repo = RepoConfig('r', 'apk', 'https://example.org', 'x86_64', prefetch=False,
                       prefetch_blacklist=['blocked'])
-    store = StateStore(tmp_path / 'state.db')
-    store.record_snapshot(RepoSnapshot('r', {'a': 'a'}, {'a': 'blocked'}))
+    store = ServiceState(tmp_path / 'state.db')
+    store.repositories.record_snapshot(RepoSnapshot('r', {'a': 'a'}, {'a': 'blocked'}))
     send = AsyncMock()
     monkeypatch.setattr(notifications, '_send', send)
     c = config(notify_events=['warm.started', 'warm.completed'])
     for force in (True, False):
-        assert asyncio.run(prefetch.warm_cache(c, repo, store, {'a': 'a'}, force)) == {}
+        assert asyncio.run(operations_warm.warm_cache(c, repo, store, {'a': 'a'}, force)) == {}
     send.assert_not_called()
 
 
 def test_repository_changed_only_after_new_snapshot(tmp_path, monkeypatch):
     repo = RepoConfig('r', 'apk', 'https://example.org', 'x86_64', prefetch=False)
-    store = StateStore(tmp_path / 'state.db')
-    parser = watcher.PARSERS['apk']
+    store = ServiceState(tmp_path / 'state.db')
+    parser = operations_check.PARSERS['apk']
     monkeypatch.setattr(parser, 'check_index_changed', AsyncMock(return_value=IndexHeadResult(False, None, None)))
     monkeypatch.setattr(parser, 'fetch', AsyncMock(return_value=RepoSnapshot('r', {'a': 'a'})))
     send = AsyncMock(return_value=True)
     monkeypatch.setattr(notifications, '_send', send)
     c = config(repos=[repo], notify_events=['repository.changed'])
     for _ in range(2):
-        asyncio.run(watcher.check_repo(c, repo, store))
+        asyncio.run(operations_check.check_repo(c, repo, store))
     assert send.await_count == 1
     event = send.call_args.args[1]
     assert event['added'] == 1 and event['removed'] == event['modified'] == 0
@@ -169,12 +178,12 @@ def test_repository_changed_only_after_new_snapshot(tmp_path, monkeypatch):
 
 def test_warm_error_is_reported_and_reraised(tmp_path, monkeypatch):
     repo = RepoConfig('r', 'apk', 'https://example.org', 'x86_64')
-    store = StateStore(tmp_path / 'state.db')
-    monkeypatch.setattr(prefetch, '_warm_cache', AsyncMock(side_effect=RuntimeError('broken')))
+    store = ServiceState(tmp_path / 'state.db')
+    monkeypatch.setattr(operations_warm, '_warm_cache', AsyncMock(side_effect=RuntimeError('broken')))
     send = AsyncMock(return_value=True)
     monkeypatch.setattr(notifications, '_send', send)
     with pytest.raises(RuntimeError, match='broken'):
-        asyncio.run(prefetch.warm_cache(config(notify_events=['warm.completed']),
+        asyncio.run(operations_warm.warm_cache(config(notify_events=['warm.completed']),
                                        repo, store, {'a': 'a'}))
     assert send.await_count == 1
     assert send.call_args.args[1]['status'] == 'error'
@@ -182,26 +191,26 @@ def test_warm_error_is_reported_and_reraised(tmp_path, monkeypatch):
 
 
 def test_disabling_events_preserves_failure_bookkeeping(tmp_path, monkeypatch):
-    store = StateStore(tmp_path / 'state.db')
+    store = ServiceState(tmp_path / 'state.db')
     send = AsyncMock()
     monkeypatch.setattr(notifications, '_send', send)
     c = config(notify_events=[], notify_after_failures=1)
     asyncio.run(notifications.record_failure_and_maybe_notify(c, store, 'r', 'gpg', 'bad'))
-    assert store.bump_failure('r', 'gpg', 'bad') == (2, False)
+    assert store.notifications.bump_failure('r', 'gpg', 'bad') == (2, False)
     asyncio.run(notifications.record_success_and_maybe_notify(c, store, 'r', 'gpg'))
-    assert store.bump_failure('r', 'gpg', 'bad') == (1, False)
+    assert store.notifications.bump_failure('r', 'gpg', 'bad') == (1, False)
     send.assert_not_called()
 
 
 def test_delivery_failure_does_not_break_warm(tmp_path, monkeypatch):
     repo = RepoConfig('r', 'apk', 'https://example.org', 'x86_64')
-    store = StateStore(tmp_path / 'state.db')
-    monkeypatch.setattr(prefetch, '_warm_one', AsyncMock(return_value=(True, 200)))
+    store = ServiceState(tmp_path / 'state.db')
+    monkeypatch.setattr(operations_warm, 'download_package', AsyncMock(return_value=(True, 200)))
     requests, sleep = delivery(monkeypatch, [503] * 6)
     c = config(notify_events=['warm.started', 'warm.completed'])
-    assert asyncio.run(prefetch.warm_cache(c, repo, store, {'a': 'a'})) == {'a': True}
+    assert asyncio.run(operations_warm.warm_cache(c, repo, store, {'a': 'a'})) == {'a': True}
     assert len(requests) == 6
-    assert store.get_warmed_packages('r')[0]['status'] == 'ok'
+    assert store.cache.get_warmed_packages('r')[0]['status'] == 'ok'
 
 
 def test_real_http_receiver_gets_identical_retries(monkeypatch):

@@ -1,15 +1,15 @@
 """Slackware PACKAGES.TXT with optional signed CHECKSUMS.md5 verification."""
+
 from __future__ import annotations
 
 import asyncio
 import hashlib
-import re
-
 import httpx
-
-from repowatch.gpgverify import SignatureError, verify_detached
-from repowatch.parsers.base import IndexParser, PackageRef, safe_package_path
-
+import re
+from repowatch.errors import SignatureError
+from repowatch.models import PackageRef
+from repowatch.parsers.base import IndexParser, safe_package_path
+from repowatch.verification.gpg import verify_detached
 
 def _parse_packages(raw: bytes, arch: str) -> list[PackageRef]:
     text = raw.decode('utf-8')

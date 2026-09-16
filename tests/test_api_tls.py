@@ -3,7 +3,8 @@
 import pytest
 import yaml
 
-from repowatch.config import ConfigError, load_config
+from repowatch.errors import ConfigError
+from repowatch.config.load import load_config
 
 
 def _config_path(tmp_path, **fields):

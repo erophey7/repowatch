@@ -17,10 +17,12 @@ import tempfile
 import threading
 import time
 
-from repowatch.api import StatusHTTPServer
-from repowatch.config import Config, RepoConfig, StatusServerConfig
-from repowatch.prefetch import warm_cache
-from repowatch.state import StateStore
+from repowatch.web.server import StatusHTTPServer
+from repowatch.config.models import Config
+from repowatch.config.models import RepoConfig
+from repowatch.config.models import StatusServerConfig
+from repowatch.operations.warm import warm_cache
+from repowatch.runtime.context import ServiceState
 
 
 def main() -> int:
@@ -52,8 +54,8 @@ def main() -> int:
             thread.start()
             try:
                 repo = RepoConfig(id='rpm-load', type='dnf', upstream='https://example.invalid/repo', arch='x86_64')
-                store = StateStore(Path(directory) / 'state')
-                config = Config(state_db=store.db_path, check_interval=300,
+                store = ServiceState(Path(directory) / 'state')
+                config = Config(state_db=store.database.db_path, check_interval=300,
                                 cache_base_url=f'http://127.0.0.1:{server.server_port}',
                                 status_server=StatusServerConfig(), repos=[repo])
                 for name, concurrency, count, bandwidth, bad in (
@@ -72,11 +74,11 @@ def main() -> int:
                     started = time.perf_counter()
                     asyncio.run(warm_cache(current, repo, store, packages))
                     elapsed = time.perf_counter() - started
-                    rows = {row['package_key']: row for row in store.get_warmed_packages(repo.id)}
+                    rows = {row['package_key']: row for row in store.cache.get_warmed_packages(repo.id)}
                     failed = sum(rows[key]['status'] == 'failed' for key in packages)
                     expected_failed = 1 if bad else 0
                     assert failed == expected_failed, (name, failed)
-                    with store._connect() as conn:
+                    with store.database.connect() as conn:
                         pending_failure = conn.execute('SELECT COUNT(*) FROM failure_state').fetchone()[0]
                     assert pending_failure == int(bad), (name, pending_failure)
                     transferred = (count - failed) * len(body)

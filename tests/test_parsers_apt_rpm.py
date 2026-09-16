@@ -11,14 +11,18 @@ import subprocess
 import httpx
 import pytest
 
-from repowatch.config import Config, ConfigError, RepoConfig, StatusServerConfig
-from repowatch.gpgverify import SignatureError
+from repowatch.config.models import Config
+from repowatch.errors import ConfigError
+from repowatch.config.models import RepoConfig
+from repowatch.config.models import StatusServerConfig
+from repowatch.errors import SignatureError
 from repowatch.parsers import AptRpmParser, PARSERS
 from repowatch.parsers.apt_rpm import checksums, parse_pkglist, release_body
-from repowatch.prefetch import _build_warm_url
-from repowatch.state import RepoSnapshot, StateStore
-from repowatch.syslog_listener import match_repo_id
-from repowatch.watcher import check_repo
+from repowatch.routing import warm_url
+from repowatch.models import RepoSnapshot
+from repowatch.runtime.context import ServiceState
+from repowatch.runtime.syslog import match_repo_id
+from repowatch.operations.check import check_repo
 from test_gpgverify import gpg_env
 
 
@@ -140,10 +144,10 @@ def test_real_appended_signature(gpg_env,tmp_path):
 def test_custom_alt_routes_warming_and_syslog():
     r=repo(url_template='/{distro}/{branch}/{arch}', url_variables={'distro':'altlinux','branch':'p11'})
     c=Config(Path('/tmp/unused'),300,'http://cache',StatusServerConfig(),repos=[r])
-    url=_build_warm_url(c,r,'RPMS.classic/demo.rpm')
+    url=warm_url(c,r,'RPMS.classic/demo.rpm')
     assert url=='http://cache/altlinux/p11/x86_64/RPMS.classic/demo.rpm'
     assert match_repo_id('/altlinux/p11/x86_64/RPMS.classic/demo.rpm',c.repos)=='alt'
-    from repowatch.nginx import render
+    from repowatch.nginx.render import render
     text=render(c)
     assert 'location ~ ^/altlinux/p11/x86_64/base/' in text
     assert text.count('proxy_cache_valid 200 206 300s;')==2
@@ -153,22 +157,22 @@ def test_custom_alt_routes_warming_and_syslog():
 
 def test_watcher_preserves_snapshot_on_corruption_and_recovers(tmp_path,monkeypatch):
     r=repo();c=Config(tmp_path/'state',300,'http://cache',StatusServerConfig(),repos=[r])
-    store=StateStore(c.state_db);store.record_snapshot(RepoSnapshot('alt',{'old':'old.rpm'}))
+    store=ServiceState(c.state_db);store.repositories.record_snapshot(RepoSnapshot('alt',{'old':'old.rpm'}))
     raw=header();packed=lzma.compress(raw);metadata=release(raw,packed);bad=True
     def handler(request):
         if request.method=='HEAD':return httpx.Response(200,headers={'ETag':'new'})
         return httpx.Response(200,content=metadata if request.url.path.endswith('/release') else packed+(b'x' if bad else b''))
     original=httpx.AsyncClient
-    monkeypatch.setattr('repowatch.watcher.httpx.AsyncClient',lambda **kw:original(transport=httpx.MockTransport(handler),**kw))
+    monkeypatch.setattr('repowatch.operations.check.httpx.AsyncClient',lambda **kw:original(transport=httpx.MockTransport(handler),**kw))
     asyncio.run(check_repo(c,r,store))
-    assert store.get_packages('alt')=={'old':'old.rpm'}
-    with store._connect() as conn:
+    assert store.repositories.get_packages('alt')=={'old':'old.rpm'}
+    with store.database.connect() as conn:
         assert conn.execute('SELECT consecutive_failures FROM failure_state').fetchone()[0]==1
     bad=False
     asyncio.run(check_repo(c,r,store))
-    assert 'old' not in store.get_packages('alt')
-    assert len(store.get_packages('alt'))==1
-    with store._connect() as conn:
+    assert 'old' not in store.repositories.get_packages('alt')
+    assert len(store.repositories.get_packages('alt'))==1
+    with store.database.connect() as conn:
         assert conn.execute('SELECT count(*) FROM failure_state').fetchone()[0]==0
 
 
@@ -185,20 +189,20 @@ def test_alt_config_rejects_bad_component_and_arch(field,value):
 
 
 def test_parsed_alt_packages_warm_through_cache_and_respect_bans(tmp_path,monkeypatch):
-    from repowatch.prefetch import warm_cache
+    from repowatch.operations.warm import warm_cache
     r=repo(url_template='/altlinux/{arch}/',prefetch=True)
     c=Config(tmp_path/'state',300,'http://cache:8080',StatusServerConfig(),repos=[r])
-    store=StateStore(c.state_db)
+    store=ServiceState(c.state_db)
     snapshot,_=fetch(r)
-    store.record_snapshot(snapshot)
+    store.repositories.record_snapshot(snapshot)
     requested=[]
     def handler(request):
         requested.append(str(request.url))
         return httpx.Response(200,content=b'rpm fixture')
     original=httpx.AsyncClient
-    monkeypatch.setattr('repowatch.prefetch.httpx.AsyncClient',lambda **kw:original(transport=httpx.MockTransport(handler),**kw))
+    monkeypatch.setattr('repowatch.operations.warm.httpx.AsyncClient',lambda **kw:original(transport=httpx.MockTransport(handler),**kw))
     asyncio.run(warm_cache(c,r,store,snapshot.packages))
     assert requested==['http://cache:8080/altlinux/x86_64/RPMS.classic/demo-1.2-alt1.x86_64.rpm']
-    store.ban_package(r.id,'demo')
+    store.cache.ban_package(r.id,'demo')
     asyncio.run(warm_cache(c,r,store,snapshot.packages,force=True))
     assert len(requested)==1

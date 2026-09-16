@@ -1,12 +1,25 @@
+import repowatch.operations.check as operations_check
+import repowatch.operations.cleanup as operations_cleanup
+import repowatch.operations.replacements as operations_replacements
+import repowatch.runtime.scheduler as runtime_scheduler
 import asyncio
+import pytest
 from datetime import datetime, timedelta, timezone
 
-from repowatch import watcher
-from repowatch.config import Config, NginxConfig, RepoConfig, StatusServerConfig, SyslogListenerConfig
-from repowatch.gpgverify import SignatureError
+import repowatch.operations.check as watcher
+from repowatch.config.models import Config
+from repowatch.config.models import NginxConfig
+from repowatch.config.models import RepoConfig
+from repowatch.config.models import StatusServerConfig
+from repowatch.config.models import SyslogListenerConfig
+from repowatch.errors import SignatureError
 from repowatch.parsers.base import IndexHeadResult
-from repowatch.state import RepoSnapshot, StateStore
-from repowatch.watcher import _is_due, check_all, check_repo, prune_all
+from repowatch.models import RepoSnapshot
+from repowatch.runtime.context import ServiceState
+from repowatch.runtime.scheduler import _is_due
+from repowatch.runtime.scheduler import check_all
+from repowatch.operations.check import check_repo
+from repowatch.operations.cleanup import prune_all
 
 
 def _config(**overrides) -> Config:
@@ -20,14 +33,14 @@ def _config(**overrides) -> Config:
 
 
 def test_is_due_true_when_never_checked(tmp_path):
-    store = StateStore(tmp_path / "state.sqlite3")
+    store = ServiceState(tmp_path / "state.sqlite3")
     repo = RepoConfig(id="r", type="apk", upstream="https://example.org", arch="x86_64")
     assert _is_due(_config(), repo, store) is True
 
 
 def test_is_due_false_right_after_check(tmp_path):
-    store = StateStore(tmp_path / "state.sqlite3")
-    store.record_snapshot(RepoSnapshot(repo_id="r", packages={}))
+    store = ServiceState(tmp_path / "state.sqlite3")
+    store.repositories.record_snapshot(RepoSnapshot(repo_id="r", packages={}))
     repo = RepoConfig(
         id="r", type="apk", upstream="https://example.org", arch="x86_64", check_interval=300,
     )
@@ -38,10 +51,10 @@ def test_is_due_respects_per_repo_short_interval(tmp_path, monkeypatch):
     """Regression for the feature itself: a repository with a short
     check_interval must be considered "due" even when the global interval
     is much longer and the last check was recent."""
-    store = StateStore(tmp_path / "state.sqlite3")
+    store = ServiceState(tmp_path / "state.sqlite3")
 
     old_check = (datetime.now(timezone.utc) - timedelta(seconds=40)).isoformat(timespec="seconds")
-    with store._connect() as conn:
+    with store.database.connect() as conn:
         conn.execute(
             "INSERT INTO repo_state (repo_id, last_check, changed_at) "
             "VALUES (?, ?, NULL)",
@@ -68,7 +81,7 @@ def test_check_all_checks_due_repos_concurrently(tmp_path, monkeypatch):
     """check_all no longer checks repositories strictly one at a time (see
     watcher.check_all) — a slow/hung upstream for one repo must not delay
     checking the rest in the same tick."""
-    store = StateStore(tmp_path / "state.sqlite3")
+    store = ServiceState(tmp_path / "state.sqlite3")
     repos = [
         RepoConfig(id=f"repo-{i}", type="apk", upstream="https://example.org", arch="x86_64")
         for i in range(4)
@@ -85,7 +98,7 @@ def test_check_all_checks_due_repos_concurrently(tmp_path, monkeypatch):
         await asyncio.sleep(0.05)  # keep the task "busy" so others get a chance to start
         active -= 1
 
-    monkeypatch.setattr("repowatch.watcher.check_repo", fake_check_repo)
+    monkeypatch.setattr("repowatch.runtime.scheduler.check_repo", fake_check_repo)
 
     asyncio.run(check_all(config, store))
 
@@ -93,8 +106,8 @@ def test_check_all_checks_due_repos_concurrently(tmp_path, monkeypatch):
 
 
 def test_check_all_skips_repos_not_due(tmp_path, monkeypatch):
-    store = StateStore(tmp_path / "state.sqlite3")
-    store.record_snapshot(RepoSnapshot(repo_id="r", packages={}))
+    store = ServiceState(tmp_path / "state.sqlite3")
+    store.repositories.record_snapshot(RepoSnapshot(repo_id="r", packages={}))
     repo = RepoConfig(
         id="r", type="apk", upstream="https://example.org", arch="x86_64", check_interval=300,
     )
@@ -105,7 +118,7 @@ def test_check_all_skips_repos_not_due(tmp_path, monkeypatch):
     async def fake_check_repo(cfg, repo, st):
         calls.append(repo.id)
 
-    monkeypatch.setattr("repowatch.watcher.check_repo", fake_check_repo)
+    monkeypatch.setattr("repowatch.runtime.scheduler.check_repo", fake_check_repo)
 
     asyncio.run(check_all(config, store))
 
@@ -134,39 +147,39 @@ class _SucceedingParser:
         return IndexHeadResult(unchanged=False, etag=None, last_modified=None)
 
     async def fetch(self, client):
-        from repowatch.state import RepoSnapshot
+        from repowatch.models import RepoSnapshot
         return RepoSnapshot(repo_id=self.repo.id, packages={})
 
 
 def test_check_repo_records_gpg_failure_on_signature_error(tmp_path, monkeypatch):
-    store = StateStore(tmp_path / "state.sqlite3")
+    store = ServiceState(tmp_path / "state.sqlite3")
     repo = RepoConfig(id="r", type="apk", upstream="https://example.org", arch="x86_64")
     config = _config(repos=[repo])
 
-    monkeypatch.setitem(watcher.PARSERS, "apk", _SignatureErrorParser)
+    monkeypatch.setitem(operations_check.PARSERS, "apk", _SignatureErrorParser)
 
     asyncio.run(check_repo(config, repo, store))
 
     # bump_failure on an already-existing streak returns count 2 — meaning
     # check_repo already recorded this streak's first failure
-    assert store.bump_failure("r", "gpg", "peek") == (2, False)
+    assert store.notifications.bump_failure("r", "gpg", "peek") == (2, False)
 
 
 def test_check_repo_resets_gpg_failure_after_success_when_verify_signature_enabled(tmp_path, monkeypatch):
-    store = StateStore(tmp_path / "state.sqlite3")
-    store.bump_failure("r", "gpg", "previous failure")
+    store = ServiceState(tmp_path / "state.sqlite3")
+    store.notifications.bump_failure("r", "gpg", "previous failure")
     repo = RepoConfig(
         id="r", type="pacman", upstream="https://example.org", arch="x86_64", repo_name="core",
         verify_signature=True, keyring_path="/fake/keyring.gpg",
     )
     config = _config(repos=[repo])
 
-    monkeypatch.setitem(watcher.PARSERS, "pacman", _SucceedingParser)
+    monkeypatch.setitem(operations_check.PARSERS, "pacman", _SucceedingParser)
 
     asyncio.run(check_repo(config, repo, store))
 
     # the streak is fully reset — the next failure starts the count at 1 again
-    assert store.bump_failure("r", "gpg", "peek") == (1, False)
+    assert store.notifications.bump_failure("r", "gpg", "peek") == (1, False)
 
 
 def test_check_repo_success_without_prior_gpg_failure_creates_no_failure_row(tmp_path, monkeypatch):
@@ -174,78 +187,78 @@ def test_check_repo_success_without_prior_gpg_failure_creates_no_failure_row(tmp
     calls reset_failure (see the fix below), but that doesn't create a row
     where there was no streak — bump_failure from scratch afterward still
     returns (1, False), not some inherited counter."""
-    store = StateStore(tmp_path / "state.sqlite3")
+    store = ServiceState(tmp_path / "state.sqlite3")
     repo = RepoConfig(id="r", type="pacman", upstream="https://example.org", arch="x86_64", repo_name="core")
     config = _config(repos=[repo])
 
-    monkeypatch.setitem(watcher.PARSERS, "pacman", _SucceedingParser)
+    monkeypatch.setitem(operations_check.PARSERS, "pacman", _SucceedingParser)
 
     asyncio.run(check_repo(config, repo, store))
 
-    assert store.bump_failure("r", "gpg", "peek") == (1, False)
+    assert store.notifications.bump_failure("r", "gpg", "peek") == (1, False)
 
 
 def test_check_repo_skips_key_expiry_check_for_apk(tmp_path, monkeypatch):
     """apk's embedded RSA keys have no expiry concept (see apkverify.py) —
     soonest_key_expiry must not even be called for an apk repo, regardless
     of verify_signature."""
-    store = StateStore(tmp_path / "state.sqlite3")
+    store = ServiceState(tmp_path / "state.sqlite3")
     repo = RepoConfig(
         id="r", type="apk", upstream="https://example.org", arch="x86_64",
         verify_signature=True, apk_keys_dir="/fake/keys",
     )
     config = _config(repos=[repo])
-    monkeypatch.setitem(watcher.PARSERS, "apk", _SucceedingParser)
+    monkeypatch.setitem(operations_check.PARSERS, "apk", _SucceedingParser)
 
     def _boom(keyring_path):
         raise AssertionError("soonest_key_expiry must not be called for apk")
-    monkeypatch.setattr(watcher, "soonest_key_expiry", _boom)
+    monkeypatch.setattr(operations_check, "soonest_key_expiry", _boom)
 
     asyncio.run(check_repo(config, repo, store))
 
-    assert store.get_repo_summaries()["r"]["key_expires_at"] is None
+    assert store.repositories.get_repo_summaries()["r"]["key_expires_at"] is None
 
 
 def test_check_repo_records_key_expiry_from_keyring(tmp_path, monkeypatch):
-    store = StateStore(tmp_path / "state.sqlite3")
+    store = ServiceState(tmp_path / "state.sqlite3")
     repo = RepoConfig(
         id="r", type="pacman", upstream="https://example.org", arch="x86_64", repo_name="core",
         verify_signature=True, keyring_path="/fake/keyring.gpg",
     )
     config = _config(repos=[repo], key_expiry_warning_days=30)
-    monkeypatch.setitem(watcher.PARSERS, "pacman", _SucceedingParser)
+    monkeypatch.setitem(operations_check.PARSERS, "pacman", _SucceedingParser)
 
     far_future = (datetime.now(timezone.utc) + timedelta(days=200)).isoformat(timespec="seconds")
-    monkeypatch.setattr(watcher, "soonest_key_expiry", lambda keyring_path: far_future)
+    monkeypatch.setattr(operations_check, "soonest_key_expiry", lambda keyring_path: far_future)
 
     asyncio.run(check_repo(config, repo, store))
 
-    assert store.get_repo_summaries()["r"]["key_expires_at"] == far_future
+    assert store.repositories.get_repo_summaries()["r"]["key_expires_at"] == far_future
     # well outside the warning window — no notification streak started
-    assert store.bump_failure("r", "key_expiry", "peek") == (1, False)
+    assert store.notifications.bump_failure("r", "key_expiry", "peek") == (1, False)
 
 
 def test_check_repo_notifies_key_expiry_warning_and_recovery(tmp_path, monkeypatch):
-    store = StateStore(tmp_path / "state.sqlite3")
+    store = ServiceState(tmp_path / "state.sqlite3")
     repo = RepoConfig(
         id="r", type="pacman", upstream="https://example.org", arch="x86_64", repo_name="core",
         verify_signature=True, keyring_path="/fake/keyring.gpg",
     )
     config = _config(repos=[repo], key_expiry_warning_days=30)
-    monkeypatch.setitem(watcher.PARSERS, "pacman", _SucceedingParser)
+    monkeypatch.setitem(operations_check.PARSERS, "pacman", _SucceedingParser)
 
     soon = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat(timespec="seconds")
-    monkeypatch.setattr(watcher, "soonest_key_expiry", lambda keyring_path: soon)
+    monkeypatch.setattr(operations_check, "soonest_key_expiry", lambda keyring_path: soon)
 
     asyncio.run(check_repo(config, repo, store))
     # inside the warning window — a "key_expiry" streak was started
-    assert store.bump_failure("r", "key_expiry", "peek") == (2, False)
+    assert store.notifications.bump_failure("r", "key_expiry", "peek") == (2, False)
 
     far_future = (datetime.now(timezone.utc) + timedelta(days=200)).isoformat(timespec="seconds")
-    monkeypatch.setattr(watcher, "soonest_key_expiry", lambda keyring_path: far_future)
+    monkeypatch.setattr(operations_check, "soonest_key_expiry", lambda keyring_path: far_future)
     asyncio.run(check_repo(config, repo, store))
     # renewed past the threshold — the streak is fully reset
-    assert store.bump_failure("r", "key_expiry", "peek") == (1, False)
+    assert store.notifications.bump_failure("r", "key_expiry", "peek") == (1, False)
 
 
 def test_check_repo_end_to_end_version_churn_updates_packages_and_history(tmp_path, monkeypatch):
@@ -277,23 +290,23 @@ def test_check_repo_end_to_end_version_churn_updates_packages_and_history(tmp_pa
             }
             return RepoSnapshot(repo_id=self.repo.id, packages=packages)
 
-    store = StateStore(tmp_path / "state.sqlite3")
+    store = ServiceState(tmp_path / "state.sqlite3")
     repo = RepoConfig(
         id="r", type="pacman", upstream="https://example.org", arch="x86_64",
         repo_name="core", prefetch=False,
     )
     config = _config(repos=[repo])
-    monkeypatch.setitem(watcher.PARSERS, "pacman", _ChurningParser)
+    monkeypatch.setitem(operations_check.PARSERS, "pacman", _ChurningParser)
 
     asyncio.run(check_repo(config, repo, store))
-    after_first = store.get_packages("r")
+    after_first = store.repositories.get_packages("r")
     assert after_first == {
         "linux-headers-6.11.2-1": "linux-headers-6.11.2-1-x86_64.pkg.tar.zst",
         "stable-pkg-1.0-1": "stable-pkg-1.0-1-x86_64.pkg.tar.zst",
     }
 
     asyncio.run(check_repo(config, repo, store))
-    after_second = store.get_packages("r")
+    after_second = store.repositories.get_packages("r")
     # the old version is genuinely gone, not just shadowed by the new one
     assert "linux-headers-6.11.2-1" not in after_second
     assert after_second == {
@@ -307,14 +320,14 @@ def test_check_repo_end_to_end_version_churn_updates_packages_and_history(tmp_pa
     # aggregate across entries instead of trusting ORDER BY ts to separate
     # them, which is exactly what production never has to do at real
     # check_interval spacing.
-    history = store.get_history("r", limit=10)
+    history = store.repositories.get_history("r", limit=10)
     assert len(history) == 2
     all_new = {pkg for entry in history for pkg in entry["new_packages"]}
     all_removed = {pkg for entry in history for pkg in entry["removed_packages"]}
     assert all_new == {"linux-headers-6.11.2-1", "stable-pkg-1.0-1", "linux-headers-6.12.0-1"}
     assert all_removed == {"linux-headers-6.11.2-1"}
 
-    summary = store.get_repo_summaries()["r"]
+    summary = store.repositories.get_repo_summaries()["r"]
     assert summary["package_count"] == 2
     assert summary["changed_at"] is not None
 
@@ -341,18 +354,18 @@ def test_check_repo_calls_purge_removed_with_removed_filenames(tmp_path, monkeyp
                 packages = {}
             return RepoSnapshot(repo_id=self.repo.id, packages=packages)
 
-    store = StateStore(tmp_path / "state.sqlite3")
+    store = ServiceState(tmp_path / "state.sqlite3")
     repo = RepoConfig(
         id="r", type="pacman", upstream="https://example.org", arch="x86_64",
         repo_name="core", prefetch=False,
     )
     config = _config(repos=[repo])
-    monkeypatch.setitem(watcher.PARSERS, "pacman", _ChurningParser)
+    monkeypatch.setitem(operations_check.PARSERS, "pacman", _ChurningParser)
 
     purge_calls = []
     async def fake_purge_removed(cfg, r, removed):
         purge_calls.append((r.id, removed))
-    monkeypatch.setattr(watcher, "purge_removed", fake_purge_removed)
+    monkeypatch.setattr(operations_check, "purge_removed", fake_purge_removed)
 
     asyncio.run(check_repo(config, repo, store))
     assert purge_calls == []  # nothing removed yet on the first check
@@ -369,9 +382,9 @@ def test_prune_all_skips_warmed_expiry_entirely_when_syslog_listener_disabled(tm
     acting on a timer that doesn't mean what it's supposed to mean. See
     SyslogListenerConfig's own docstring for why enabled defaults to True
     now specifically to avoid this trap."""
-    store = StateStore(tmp_path / "state.sqlite3")
-    store.record_warmed_package("r", "old-1.0", "old-1.0.apk", True, 200)
-    with store._connect() as conn:
+    store = ServiceState(tmp_path / "state.sqlite3")
+    store.cache.record_warmed_package("r", "old-1.0", "old-1.0.apk", True, 200)
+    with store.database.connect() as conn:
         conn.execute("UPDATE warmed_packages SET warmed_at = '2020-01-01T00:00:00+00:00'")
 
     repo = RepoConfig(id="r", type="apk", upstream="https://example.org", arch="x86_64")
@@ -384,16 +397,16 @@ def test_prune_all_skips_warmed_expiry_entirely_when_syslog_listener_disabled(tm
 
     asyncio.run(prune_all(config, store))
 
-    assert [p["package_key"] for p in store.get_warmed_packages("r")] == ["old-1.0"]
+    assert [p["package_key"] for p in store.cache.get_warmed_packages("r")] == ["old-1.0"]
 
 
 def test_prune_all_bookkeeping_only_when_enable_purge_is_off(tmp_path, monkeypatch):
     """syslog_listener on but nginx.enable_purge off — same as before this
     feature existed: the stale row is dropped, but nothing must call out
     to nginx (no purge mechanism to call)."""
-    store = StateStore(tmp_path / "state.sqlite3")
-    store.record_warmed_package("r", "old-1.0", "old-1.0.apk", True, 200)
-    with store._connect() as conn:
+    store = ServiceState(tmp_path / "state.sqlite3")
+    store.cache.record_warmed_package("r", "old-1.0", "old-1.0.apk", True, 200)
+    with store.database.connect() as conn:
         conn.execute("UPDATE warmed_packages SET warmed_at = '2020-01-01T00:00:00+00:00'")
 
     repo = RepoConfig(id="r", type="apk", upstream="https://example.org", arch="x86_64")
@@ -406,11 +419,11 @@ def test_prune_all_bookkeeping_only_when_enable_purge_is_off(tmp_path, monkeypat
 
     def boom(*a, **kw):
         raise AssertionError("purge_selected must not be called when enable_purge is off")
-    monkeypatch.setattr(watcher, "purge_selected", boom)
+    monkeypatch.setattr(operations_cleanup, "purge_selected", boom)
 
     asyncio.run(prune_all(config, store))
 
-    assert store.get_warmed_packages("r") == []
+    assert store.cache.get_warmed_packages("r") == []
 
 
 def test_prune_all_purges_stale_warmed_packages_when_enable_purge_is_on(tmp_path, monkeypatch):
@@ -422,10 +435,10 @@ def test_prune_all_purges_stale_warmed_packages_when_enable_purge_is_on(tmp_path
     Same conservative rule as the manual path: only confirmed-gone keys
     ("purged"/"not_cached") lose their row, an errored one stays tracked
     for the next hourly retry."""
-    store = StateStore(tmp_path / "state.sqlite3")
+    store = ServiceState(tmp_path / "state.sqlite3")
     for key in ("purged-1.0", "already-gone-1.0", "flaky-1.0", "recent-1.0"):
-        store.record_warmed_package("r", key, f"{key}.apk", True, 200)
-    with store._connect() as conn:
+        store.cache.record_warmed_package("r", key, f"{key}.apk", True, 200)
+    with store.database.connect() as conn:
         conn.execute(
             "UPDATE warmed_packages SET warmed_at = '2020-01-01T00:00:00+00:00' "
             "WHERE package_key != 'recent-1.0'"
@@ -443,7 +456,7 @@ def test_prune_all_purges_stale_warmed_packages_when_enable_purge_is_on(tmp_path
     async def fake_purge_selected(cfg, r, items):
         calls.append((r.id, items))
         return {"purged-1.0": "purged", "already-gone-1.0": "not_cached", "flaky-1.0": "error (timeout)"}
-    monkeypatch.setattr(watcher, "purge_selected", fake_purge_selected)
+    monkeypatch.setattr(operations_cleanup, "purge_selected", fake_purge_selected)
 
     asyncio.run(prune_all(config, store))
 
@@ -452,7 +465,7 @@ def test_prune_all_purges_stale_warmed_packages_when_enable_purge_is_on(tmp_path
         "already-gone-1.0": "already-gone-1.0.apk",
         "flaky-1.0": "flaky-1.0.apk",
     })]
-    remaining = {p["package_key"] for p in store.get_warmed_packages("r")}
+    remaining = {p["package_key"] for p in store.cache.get_warmed_packages("r")}
     assert remaining == {"flaky-1.0", "recent-1.0"}  # errored + not-yet-stale survive
 
 
@@ -463,9 +476,9 @@ def test_prune_all_drops_bookkeeping_without_purging_for_a_repo_no_longer_in_con
     so the automatic path just drops the bookkeeping, same as it always
     could for an unreachable repo. Discovering that class of real orphan
     on disk is cache_probe's full inventory scan's job, not this one."""
-    store = StateStore(tmp_path / "state.sqlite3")
-    store.record_warmed_package("gone-repo", "old-1.0", "old-1.0.apk", True, 200)
-    with store._connect() as conn:
+    store = ServiceState(tmp_path / "state.sqlite3")
+    store.cache.record_warmed_package("gone-repo", "old-1.0", "old-1.0.apk", True, 200)
+    with store.database.connect() as conn:
         conn.execute("UPDATE warmed_packages SET warmed_at = '2020-01-01T00:00:00+00:00'")
 
     config = _config(
@@ -477,11 +490,11 @@ def test_prune_all_drops_bookkeeping_without_purging_for_a_repo_no_longer_in_con
 
     def boom(*a, **kw):
         raise AssertionError("purge_selected must not be called for a repo not in config.repos")
-    monkeypatch.setattr(watcher, "purge_selected", boom)
+    monkeypatch.setattr(operations_cleanup, "purge_selected", boom)
 
     asyncio.run(prune_all(config, store))
 
-    assert store.get_warmed_packages("gone-repo") == []
+    assert store.cache.get_warmed_packages("gone-repo") == []
 
 
 def test_run_forever_invokes_check_all_and_prune_all_on_its_own_timer(tmp_path, monkeypatch):
@@ -489,7 +502,7 @@ def test_run_forever_invokes_check_all_and_prune_all_on_its_own_timer(tmp_path, 
     covered individually elsewhere, but nothing previously exercised that
     run_forever's own loop (watcher.py's _SCHEDULER_TICK_SECONDS /
     _PRUNE_INTERVAL_SECONDS) actually calls them on schedule."""
-    store = StateStore(tmp_path / "state.sqlite3")
+    store = ServiceState(tmp_path / "state.sqlite3")
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         f"state_db: {tmp_path / 'state.sqlite3'}\n"
@@ -510,14 +523,14 @@ def test_run_forever_invokes_check_all_and_prune_all_on_its_own_timer(tmp_path, 
     async def fake_prune_all(cfg, st):
         prune_calls.append(1)
 
-    monkeypatch.setattr(watcher, "check_all", fake_check_all)
-    monkeypatch.setattr(watcher, "prune_all", fake_prune_all)
+    monkeypatch.setattr(runtime_scheduler, "check_all", fake_check_all)
+    monkeypatch.setattr(runtime_scheduler, "prune_all", fake_prune_all)
     # Tiny tick/prune intervals so the loop fires several times fast,
     # instead of relying on the real 10s tick / 3600s prune interval or on
     # host uptime (time.monotonic()'s origin is unspecified) to happen to
     # already exceed _PRUNE_INTERVAL_SECONDS on the first iteration.
-    monkeypatch.setattr(watcher, "_SCHEDULER_TICK_SECONDS", 0.001)
-    monkeypatch.setattr(watcher, "_PRUNE_INTERVAL_SECONDS", 0.001)
+    monkeypatch.setattr(runtime_scheduler, "_SCHEDULER_TICK_SECONDS", 0.001)
+    monkeypatch.setattr(runtime_scheduler, "_PRUNE_INTERVAL_SECONDS", 0.001)
 
     async def run():
         stop = asyncio.Event()
@@ -528,7 +541,7 @@ def test_run_forever_invokes_check_all_and_prune_all_on_its_own_timer(tmp_path, 
             stop.set()
 
         await asyncio.gather(
-            watcher.run_forever(str(config_path), store, stop=stop),
+            runtime_scheduler.run_forever(str(config_path), store, stop=stop),
             stop_after_a_few_prunes(),
         )
 
@@ -546,17 +559,17 @@ def test_check_repo_resets_gpg_failure_after_success_even_without_verify_signatu
     repositories the "gpg" streak never cleared after a failure, even once
     the repository fetched successfully again. repo.verify_signature=False
     here is deliberate."""
-    store = StateStore(tmp_path / "state.sqlite3")
-    store.bump_failure("r", "gpg", "previous failure (e.g. SHA256 mismatch)")
+    store = ServiceState(tmp_path / "state.sqlite3")
+    store.notifications.bump_failure("r", "gpg", "previous failure (e.g. SHA256 mismatch)")
     repo = RepoConfig(id="r", type="pacman", upstream="https://example.org", arch="x86_64", repo_name="core")
     config = _config(repos=[repo])
 
-    monkeypatch.setitem(watcher.PARSERS, "pacman", _SucceedingParser)
+    monkeypatch.setitem(operations_check.PARSERS, "pacman", _SucceedingParser)
 
     asyncio.run(check_repo(config, repo, store))
 
     # the streak is fully reset — the next failure starts the count at 1 again
-    assert store.bump_failure("r", "gpg", "peek") == (1, False)
+    assert store.notifications.bump_failure("r", "gpg", "peek") == (1, False)
 
 
 def test_signed_unchanged_indexes_are_reverified_after_trust_changes(tmp_path, monkeypatch):
@@ -565,56 +578,169 @@ def test_signed_unchanged_indexes_are_reverified_after_trust_changes(tmp_path, m
                         ('apt', {'distribution': 'stable', 'component': 'main'}),
                         ('dnf', {}), ('apt-rpm', {'component': 'classic'}),
                         ('slackware', {'component': 'patches'})]:
-        store = StateStore(tmp_path / f'{kind}.sqlite3')
+        store = ServiceState(tmp_path / f'{kind}.sqlite3')
         repo = RepoConfig('r', kind, 'https://example.org/repo', 'x86_64',
                           verify_signature=True, keyring_path='/missing/keyring', **extra)
-        store.record_snapshot(RepoSnapshot('r', {'foo-1': 'foo.pkg'}), index_etag='same')
-        before = store.get_status('r')['last_check']
-        parser = watcher.PARSERS[kind]
+        store.repositories.record_snapshot(RepoSnapshot('r', {'foo-1': 'foo.pkg'}), index_etag='same')
+        before = store.repositories.get_status('r')['last_check']
+        parser = operations_check.PARSERS[kind]
         fetch = AsyncMock(side_effect=SignatureError('keyring changed'))
         with monkeypatch.context() as patcher:
             patcher.setattr(parser, 'check_index_changed', AsyncMock(return_value=IndexHeadResult(True, 'same', None)))
             patcher.setattr(parser, 'fetch', fetch)
-            patcher.setattr(watcher, 'soonest_key_expiry', lambda _: None)
+            patcher.setattr(operations_check, 'soonest_key_expiry', lambda _: None)
             asyncio.run(check_repo(_config(repos=[repo]), repo, store))
         assert fetch.await_count == 1
-        assert store.get_status('r')['last_check'] == before
-        assert store.get_packages('r') == {'foo-1': 'foo.pkg'}
-        assert store.bump_failure('r', 'gpg', 'peek') == (2, False)
+        assert store.repositories.get_status('r')['last_check'] == before
+        assert store.repositories.get_packages('r') == {'foo-1': 'foo.pkg'}
+        assert store.notifications.bump_failure('r', 'gpg', 'peek') == (2, False)
 
 
 def test_unknown_key_expiry_does_not_report_recovery(tmp_path, monkeypatch):
     from unittest.mock import AsyncMock
-    store = StateStore(tmp_path / 'state.sqlite3')
+    store = ServiceState(tmp_path / 'state.sqlite3')
     repo = RepoConfig('r', 'pacman', 'https://example.org', 'x86_64',
                       repo_name='core', verify_signature=True, keyring_path='/missing')
-    store.bump_failure('r', 'key_expiry', 'expiring')
-    store.mark_failure_notified('r', 'key_expiry')
+    store.notifications.bump_failure('r', 'key_expiry', 'expiring')
+    store.notifications.mark_failure_notified('r', 'key_expiry')
     sent = AsyncMock(return_value=True)
     monkeypatch.setattr('repowatch.notifications._send', sent)
-    monkeypatch.setattr(watcher, 'soonest_key_expiry', lambda _: None)
+    monkeypatch.setattr(operations_check, 'soonest_key_expiry', lambda _: None)
     config = _config(repos=[repo], notify_webhook_url='https://example.org/webhook')
-    asyncio.run(watcher._check_key_expiry(config, repo, store))
+    asyncio.run(operations_check._check_key_expiry(config, repo, store))
     sent.assert_not_called()
-    assert store.bump_failure('r', 'key_expiry', 'peek') == (2, True)
+    assert store.notifications.bump_failure('r', 'key_expiry', 'peek') == (2, True)
     future = (datetime.now(timezone.utc) + timedelta(days=200)).isoformat()
-    monkeypatch.setattr(watcher, 'soonest_key_expiry', lambda _: future)
-    asyncio.run(watcher._check_key_expiry(config, repo, store))
+    monkeypatch.setattr(operations_check, 'soonest_key_expiry', lambda _: future)
+    asyncio.run(operations_check._check_key_expiry(config, repo, store))
     assert sent.call_args.args[1]['status'] == 'recovered'
 
 
 def test_first_failed_check_has_no_success_timestamp_and_remains_due(tmp_path, monkeypatch):
-    from repowatch.api import _repo_staleness
-    store = StateStore(tmp_path / 'state.sqlite3')
+    from repowatch.reporting.status import _repo_staleness
+    store = ServiceState(tmp_path / 'state.sqlite3')
     repo = RepoConfig('r', 'pacman', 'https://example.org', 'x86_64', repo_name='core')
     config = _config(repos=[repo])
-    monkeypatch.setitem(watcher.PARSERS, 'pacman', _SignatureErrorParser)
+    monkeypatch.setitem(operations_check.PARSERS, 'pacman', _SignatureErrorParser)
     asyncio.run(check_repo(config, repo, store))
-    assert store.get_status('r')['last_check'] is None
-    assert store.get_repo_summaries()['r']['last_check'] is None
+    assert store.repositories.get_status('r')['last_check'] is None
+    assert store.repositories.get_repo_summaries()['r']['last_check'] is None
     assert _is_due(config, repo, store)
     assert not _repo_staleness(config, store)
-    monkeypatch.setitem(watcher.PARSERS, 'pacman', _SucceedingParser)
+    monkeypatch.setitem(operations_check.PARSERS, 'pacman', _SucceedingParser)
     asyncio.run(check_repo(config, repo, store))
-    assert store.get_status('r')['last_check']
+    assert store.repositories.get_status('r')['last_check']
     assert not _is_due(config, repo, store)
+
+
+@pytest.mark.parametrize('broken', ['check_interval: oops\n', 'check_concurrency: 0\n', 'invalid_utf8', 'missing'])
+def test_scheduler_keeps_last_valid_config_after_bad_reload(tmp_path, monkeypatch, broken):
+    from repowatch.config.load import load_config
+    path = tmp_path / 'config.yaml'
+    valid = (f'state_db: {tmp_path / "state.db"}\n'
+             'cache_base_url: http://127.0.0.1:8080\n'
+             'repos:\n  - id: r\n    type: apk\n'
+             '    upstream: https://example.org\n    arch: x86_64\n')
+    path.write_text(valid)
+    initial = load_config(path)
+    store = ServiceState(initial.state_db)
+    observed = []
+
+    async def run():
+        stop = asyncio.Event()
+        async def check(config, state):
+            observed.append(config)
+            if len(observed) == 1:
+                if broken == 'missing':
+                    path.unlink()
+                elif broken == 'invalid_utf8':
+                    path.write_bytes(b'\xff')
+                else:
+                    path.write_text(valid + broken)
+            else:
+                stop.set()
+        async def prune(*args):
+            pass
+        monkeypatch.setattr(runtime_scheduler, 'check_all', check)
+        monkeypatch.setattr(runtime_scheduler, 'prune_all', prune)
+        monkeypatch.setattr(runtime_scheduler, '_SCHEDULER_TICK_SECONDS', 0.001)
+        await asyncio.wait_for(runtime_scheduler.run_forever(
+            str(path), store, initial_config=initial, stop=stop), timeout=2)
+    asyncio.run(run())
+    assert len(observed) == 2
+    assert observed[1] is observed[0]
+    assert observed[1].check_concurrency == 8
+
+
+def test_check_all_isolates_repo_operation_failures(tmp_path, monkeypatch):
+    config = _config(repos=[RepoConfig(id=name, type='apk',
+        upstream='https://example.org', arch='x86_64', prefetch=False)
+        for name in ('bad', 'good')])
+    store = ServiceState(tmp_path / 'state.db')
+    completed = []
+    async def check(config, repo, store):
+        if repo.id == 'bad':
+            raise RuntimeError('operation failure')
+        completed.append(repo.id)
+    monkeypatch.setattr(runtime_scheduler, 'check_repo', check)
+    assert asyncio.run(check_all(config, store)) == ['bad']
+    assert completed == ['good']
+
+
+def test_check_all_database_failure_cancels_other_checks(tmp_path, monkeypatch):
+    import sqlite3
+    config = _config(repos=[RepoConfig(id=name, type='apk',
+        upstream='https://example.org', arch='x86_64', prefetch=False)
+        for name in ('bad', 'slow')])
+    store = ServiceState(tmp_path / 'state.db')
+    stopped = []
+    async def run():
+        started = asyncio.Event()
+        async def check(config, repo, store):
+            if repo.id == 'bad':
+                await started.wait()
+                raise sqlite3.OperationalError('database unavailable')
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.append(repo.id)
+        monkeypatch.setattr(runtime_scheduler, 'check_repo', check)
+        with pytest.raises(sqlite3.OperationalError):
+            await asyncio.wait_for(check_all(config, store), timeout=2)
+    asyncio.run(run())
+    assert stopped == ['slow']
+
+
+def test_source_edit_fetches_even_if_new_origin_reuses_validator(tmp_path, monkeypatch):
+    store = ServiceState(tmp_path / 'state.sqlite3')
+    repo = RepoConfig(id='r', type='apk', upstream='https://new.example', arch='x86_64', prefetch=False)
+    store.repositories.record_snapshot(RepoSnapshot('r', {'old': 'old.apk'}), index_etag='same', source_identity='old-origin')
+    class Parser:
+        def __init__(self, repo):
+            self.repo = repo
+        async def check_index_changed(self, client, prev_etag, prev_last_modified):
+            assert prev_etag is None
+            return IndexHeadResult(unchanged=False, etag='same', last_modified=None)
+        async def fetch(self, client):
+            return RepoSnapshot('r', {'new': 'new.apk'})
+    monkeypatch.setitem(watcher.PARSERS, 'apk', Parser)
+    asyncio.run(check_repo(_config(repos=[repo]), repo, store))
+    assert store.repositories.get_packages('r') == {'new': 'new.apk'}
+    assert store.repositories.get_index_meta('r', repo.catalog_identity()) == ('same', None)
+
+
+def test_retention_uses_raw_purge_and_keeps_concurrently_refreshed_record(tmp_path, monkeypatch):
+    store = ServiceState(tmp_path / 'state.sqlite3')
+    repo = RepoConfig(id='r', type='apk', upstream='https://example.org', arch='x86_64')
+    config = _config(repos=[repo], nginx=NginxConfig(enabled=True, enable_purge=True, enable_cache_probe=True))
+    store.cache.record_warmed_package('r', 'a', 'a.apk', True, 200)
+    with store.database.connect() as conn:
+        conn.execute("UPDATE warmed_packages SET warmed_at='2020-01-01'")
+    async def purge(cfg, repo, items):
+        assert items == {'a': 'a.apk'}
+        store.cache.record_warmed_package('r', 'a', 'a.apk', True, 200)
+        return {'a': 'purged'}
+    monkeypatch.setattr(operations_cleanup.cache_probe, 'purge_selected_raw', purge)
+    asyncio.run(prune_all(config, store))
+    assert store.cache.get_warmed_filenames('r', ['a']) == {'a': 'a.apk'}

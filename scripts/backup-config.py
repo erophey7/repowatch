@@ -6,7 +6,8 @@ from pathlib import Path
 import subprocess
 import sys
 
-from repowatch.config import ConfigError, load_config
+from repowatch.errors import ConfigError
+from repowatch.config.load import load_config
 
 
 def main() -> int:

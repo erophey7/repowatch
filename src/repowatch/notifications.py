@@ -1,27 +1,24 @@
 """Opt-in repository events and bounded, idempotency-aware webhook delivery.
 
 Existing failure streak bookkeeping remains in SQLite. Delivery retries are
-in memory, not a durable outbox. See docs/webhooks.md for guarantees.
-"""
+in memory, not a durable outbox. See docs/webhooks.md for guarantees."""
 
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
+import httpx
 import logging
 import uuid
-
-import httpx
-
-from repowatch.config import Config
-from repowatch.state import StateStore
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from repowatch.config.models import Config
+from repowatch.runtime.context import ServiceState
 
 logger = logging.getLogger(__name__)
 
 
 async def record_failure_and_maybe_notify(
-    config: Config, store: StateStore, repo_id: str, kind: str, message: str
+    config: Config, store: ServiceState, repo_id: str, kind: str, message: str
 ) -> None:
     """Record another failure in the (repo_id, kind) streak and, if the
     threshold was just reached (and this streak hasn't been notified yet),
@@ -29,8 +26,8 @@ async def record_failure_and_maybe_notify(
     docs_dev/ROADMAP.md item 20 — behaves slightly differently in spirit
     from the other two: it's not a transient failure but "still within the
     expiry warning window", reassessed once per check_repo cycle by
-    watcher._check_key_expiry; the mechanism itself is identical)."""
-    count, already_notified = store.bump_failure(repo_id, kind, message)
+    operations.check._check_key_expiry; the mechanism itself is identical)."""
+    count, already_notified = store.notifications.bump_failure(repo_id, kind, message)
 
     if (not enabled(config, "repository.failing") or already_notified
             or count < config.notify_after_failures):
@@ -48,16 +45,16 @@ async def record_failure_and_maybe_notify(
         },
     )
     if sent:
-        store.mark_failure_notified(repo_id, kind)
+        store.notifications.mark_failure_notified(repo_id, kind)
 
 
 async def record_success_and_maybe_notify(
-    config: Config, store: StateStore, repo_id: str, kind: str
+    config: Config, store: ServiceState, repo_id: str, kind: str
 ) -> None:
     """Reset the (repo_id, kind) failure streak after a success; if a
     failure notification was already sent for this streak, send a separate
     recovery notification."""
-    was_notified = store.reset_failure(repo_id, kind)
+    was_notified = store.notifications.reset_failure(repo_id, kind)
     if not was_notified or not enabled(config, "repository.recovered"):
         return
 

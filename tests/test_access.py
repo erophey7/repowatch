@@ -9,13 +9,18 @@ import httpx
 import pytest
 import yaml
 
-from repowatch.access import AccessStore, client_context
-from repowatch.api import StatusHTTPServer, make_handler
+from repowatch.storage.access import AccessStore
+from repowatch.web.access import client_context
+from repowatch.web.server import StatusHTTPServer
+from repowatch.web.handler import make_handler
 from repowatch.auth import hash_password, verify_password
-from repowatch.cli import main
-from repowatch.config import ConfigError, StatusServerConfig, load_config
-from repowatch.config_edit import config_lock, set_password_hash
-from repowatch.state import StateStore
+from repowatch.cli.main import main
+from repowatch.errors import ConfigError
+from repowatch.config.models import StatusServerConfig
+from repowatch.config.load import load_config
+from repowatch.config.edit import config_lock
+from repowatch.config.edit import set_password_hash
+from repowatch.runtime.context import ServiceState
 
 
 @pytest.fixture
@@ -26,7 +31,7 @@ def api(tmp_path):
            'repos': [{'id': 'r', 'type': 'apk', 'arch': 'x86_64', 'upstream': 'https://example.org'}]}
     path.write_text(yaml.safe_dump(raw))
     config = load_config(path)
-    store = StateStore(config.state_db)
+    store = ServiceState(config.state_db)
     server = StatusHTTPServer(('127.0.0.1', 0), make_handler(config, store, path))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -72,7 +77,7 @@ def test_login_session_csrf_and_logout(api):
     assert client.post('/api/config', json={'check_interval': 60}, headers={'X-CSRF-Token': csrf}).status_code == 200
     assert client.post('/api/auth/logout', headers={'X-CSRF-Token': csrf}).status_code == 200
     assert client.get('/api/repos').status_code == 401
-    with store._connect() as conn:
+    with store.database.connect() as conn:
         assert conn.execute('SELECT count(*) FROM admin_sessions').fetchone()[0] == 0
 
 
@@ -84,7 +89,7 @@ def test_token_permissions_expiry_and_revocation(api):
     token = response.json()
     listed = client.get('/api/tokens').json()
     assert 'token' not in listed[0] and 'secret_hash' not in listed[0]
-    with store._connect() as conn:
+    with store.database.connect() as conn:
         secret_hash = conn.execute('SELECT secret_hash FROM host_tokens').fetchone()[0]
         assert token['token'] != secret_hash and len(secret_hash) == 64
     cookies = httpx.Cookies(client.cookies)
@@ -95,21 +100,21 @@ def test_token_permissions_expiry_and_revocation(api):
     for route in ('/api/repos', '/api/tokens', '/status/r/history', '/api/repos/r/packages'):
         assert client.get(route, headers=header).status_code == 401
     assert client.post('/api/config', json={}, headers=header).status_code == 401
-    assert AccessStore(store).tokens()[0]['last_used_at'] is not None
+    assert AccessStore(store.database).tokens()[0]['last_used_at'] is not None
     client.cookies = cookies
     assert client.post(f"/api/tokens/{token['id']}/revoke", headers={'X-CSRF-Token': csrf}).status_code == 200
     client.cookies.clear()
     assert client.get('/status.json', headers=header).status_code == 401
-    expired = AccessStore(store).create_token('expire', time.time() + 100)
-    with store._connect() as conn:
+    expired = AccessStore(store.database).create_token('expire', time.time() + 100)
+    with store.database.connect() as conn:
         conn.execute('UPDATE host_tokens SET expires_at=0 WHERE id=?', (expired['id'],))
-    assert AccessStore(store).token_access(expired['token']) is None
+    assert AccessStore(store.database).token_access(expired['token']) is None
 
 
 def test_password_change_revokes_sessions_preserves_tokens(api):
     client, path, store = api
     login(client)
-    token = AccessStore(store).create_token('host')['token']
+    token = AccessStore(store.database).create_token('host')['token']
     set_password_hash(path, hash_password('new', iterations=1000))
     assert client.get('/api/repos').status_code == 401
     client.cookies.clear()
@@ -120,11 +125,11 @@ def test_password_change_revokes_sessions_preserves_tokens(api):
 def test_sessions_expire_and_secure_sessions_cannot_downgrade(api):
     client, _, store = api
     login(client)
-    with store._connect() as conn:
+    with store.database.connect() as conn:
         conn.execute('UPDATE admin_sessions SET expires_at=0')
     assert client.get('/api/repos').status_code == 401
     login(client)
-    with store._connect() as conn:
+    with store.database.connect() as conn:
         conn.execute('UPDATE admin_sessions SET secure=1')
     assert client.get('/api/repos').status_code == 401
 
@@ -314,8 +319,8 @@ def test_guest_setting_requires_boolean(setting):
 
 def test_guest_reads_and_live_disable_without_password(api):
     client, path, store = api
-    from repowatch.state import RepoSnapshot
-    store.record_snapshot(RepoSnapshot("r", {"pkg-1": "pkg-1.apk"}))
+    from repowatch.models import RepoSnapshot
+    store.repositories.record_snapshot(RepoSnapshot("r", {"pkg-1": "pkg-1.apk"}))
     raw = yaml.safe_load(path.read_text())
     raw.pop('admin_password_hash')
     raw['status_server'] = {'guest_read_only': True}
@@ -334,7 +339,7 @@ def test_guest_reads_and_live_disable_without_password(api):
     assert client.get('/metrics').status_code == 200
     for route in ['/api/tokens']:
         assert client.get(route).status_code == 401
-    with store._connect() as conn:
+    with store.database.connect() as conn:
         assert conn.execute('SELECT count(*) FROM admin_sessions').fetchone()[0] == 0
     raw['status_server']['guest_read_only'] = False
     path.write_text(yaml.safe_dump(raw))
@@ -382,7 +387,7 @@ def test_guest_safe_config_excludes_secrets_and_security_settings(api):
     before = path.read_bytes()
     response = client.get('/api/config')
     assert response.status_code == 200
-    from repowatch.api import SAFE_CONFIG_FIELDS
+    from repowatch.web.settings import SAFE_CONFIG_FIELDS
     assert set(response.json()) == set(SAFE_CONFIG_FIELDS)
     assert response.json()['cache_base_url'] == raw['cache_base_url']
     for secret in (raw['admin_password_hash'], raw['notify_webhook_url'], 'trusted_proxies', 'guest_read_only'):
@@ -413,9 +418,9 @@ def test_scoped_tokens_filter_and_live_policy(api):
     assert client.get('/status/private.json', headers=headers).status_code == 403
     assert client.get('/status/missing.json', headers=headers).status_code == 403
     assert client.get('/status/private/history', headers=headers).status_code == 401
-    empty = AccessStore(store).create_token('none', repo_ids=[])['token']
+    empty = AccessStore(store.database).create_token('none', repo_ids=[])['token']
     assert client.get('/status.json', headers={'Authorization': 'Bearer ' + empty}).json() == {}
-    all_token = AccessStore(store).create_token('all')['token']
+    all_token = AccessStore(store.database).create_token('all')['token']
     assert set(client.get('/status.json', headers={'Authorization': 'Bearer ' + all_token}).json()) == {'r', 'private'}
     raw['status_server']['token_repo_restrictions'] = False
     path.write_text(yaml.safe_dump(raw))
@@ -434,11 +439,48 @@ def test_scoped_issuance_requires_policy(api):
 
 def test_legacy_tokens_migrate_to_all(tmp_path):
     import sqlite3
-    from repowatch.access import digest
+    from repowatch.storage.access import digest
     db = tmp_path / 'old.sqlite'
     with sqlite3.connect(db) as conn:
         conn.execute('CREATE TABLE host_tokens(id TEXT PRIMARY KEY, name TEXT, secret_hash TEXT UNIQUE, created_at REAL, expires_at REAL, last_used_at REAL, revoked_at REAL)')
         conn.execute('INSERT INTO host_tokens VALUES (?, ?, ?, ?, NULL, NULL, NULL)', ('id', 'legacy', digest('rw_legacy'), time.time()))
-    access = AccessStore(StateStore(db))
+    access = AccessStore(ServiceState(db).database)
     assert access.token_access('rw_legacy') == {'repo_ids': None}
     assert access.tokens()[0]['repo_ids'] is None
+
+
+@pytest.mark.parametrize('asset,content_type', [
+    ('js/api.js', 'text/javascript'),
+    ('js/dashboard.js', 'text/javascript'),
+    ('css/dashboard.css', 'text/css'),
+])
+def test_shipped_static_assets_are_available_without_a_session(api, asset, content_type):
+    client, _, _ = api
+    response = client.get('/static/' + asset)
+    expected = Path(__file__).parents[1] / 'src/repowatch/static' / asset
+    assert response.status_code == 200
+    assert response.content == expected.read_bytes()
+    assert response.headers['content-type'].startswith(content_type)
+    assert response.headers['x-content-type-options'] == 'nosniff'
+
+
+@pytest.mark.parametrize('path', [
+    '/static/js/missing.js', '/static/../config.yaml',
+    '/static/%2e%2e/config.yaml', '/static/js/%2e%2e/%2e%2e/config.yaml',
+])
+def test_static_route_does_not_expose_other_files(api, path):
+    client, _, _ = api
+    response = client.get(path)
+    assert response.status_code in (401, 404)
+    assert 'state_db:' not in response.text
+
+
+@pytest.mark.parametrize('field,value', [('check_interval', 'oops'), ('check_concurrency', 0)])
+def test_bad_operational_config_is_unavailable_not_bad_headers(api, field, value):
+    client, path, _ = api
+    raw = yaml.safe_load(path.read_text())
+    raw[field] = value
+    path.write_text(yaml.safe_dump(raw))
+    response = client.get('/api/repos')
+    assert response.status_code == 503
+    assert response.json() == {'error': 'configuration unavailable'}

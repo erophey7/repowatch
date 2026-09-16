@@ -2,24 +2,24 @@
 
 Binary layout is the RPM header format (big endian index and data sections).
 Only package identity/location tags are decoded; no RPM library or command is
-needed. Compressed indexes are parsed as streams, not inflated into one blob.
-"""
+needed. Compressed indexes are parsed as streams, not inflated into one blob."""
+
 from __future__ import annotations
 
 import asyncio
 import bz2
 import gzip
 import hashlib
+import httpx
 import io
 import lzma
 import re
 import struct
+from repowatch.errors import SignatureError
+from repowatch.models import PackageRef
+from repowatch.parsers.base import IndexParser
+from repowatch.verification.gpg import verify_detached
 from typing import BinaryIO
-
-import httpx
-
-from repowatch.gpgverify import SignatureError, verify_detached
-from repowatch.parsers.base import IndexParser, PackageRef
 
 _MAGIC = b'\x8e\xad\xe8\x01\x00\x00\x00\x00'
 # rpm tag numbers and APT-RPM custom filename/directory tags.

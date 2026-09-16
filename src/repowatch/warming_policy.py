@@ -1,4 +1,5 @@
 """Package-name selection shared by automatic, manual and replacement warming."""
+
 from __future__ import annotations
 
 import fnmatch
@@ -6,8 +7,8 @@ import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from repowatch.config import RepoConfig
-    from repowatch.state import StateStore
+    from repowatch.config.models import RepoConfig
+    from repowatch.runtime.context import ServiceState
 
 
 def validate_patterns(name: str, patterns: object) -> None:
@@ -26,12 +27,12 @@ class WarmingPolicy:
     Nix callers apply this to roots and retain each allowed root's closure.
     """
 
-    def __init__(self, repo: RepoConfig, store: StateStore):
+    def __init__(self, repo: RepoConfig, store: ServiceState):
         self.whitelist = tuple(re.compile(fnmatch.translate(p)) for p in repo.prefetch_whitelist)
         self.blacklist = tuple(re.compile(fnmatch.translate(p)) for p in repo.prefetch_blacklist)
-        self.banned = set(store.get_banned_packages(repo.id))
+        self.banned = set(store.cache.get_banned_packages(repo.id))
         self.filtered = bool(self.whitelist or self.blacklist or self.banned)
-        self.names = store.get_names(repo.id) if self.filtered else {}
+        self.names = store.repositories.get_names(repo.id) if self.filtered else {}
 
     def allows(self, package_key: str) -> bool:
         if not self.filtered:

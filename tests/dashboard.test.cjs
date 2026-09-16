@@ -3,7 +3,13 @@ const {test} = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const {JSDOM} = require('jsdom');
-const html = fs.readFileSync(require('node:path').join(__dirname, '../src/repowatch/static/dashboard.html'), 'utf8');
+const sourceHtml = fs.readFileSync(require('node:path').join(__dirname, '../src/repowatch/static/dashboard.html'), 'utf8');
+const path = require('node:path');
+const staticDir = path.join(__dirname, '../src/repowatch/static');
+const styledHtml = sourceHtml.replace(/<link rel="stylesheet" href="\/static\/([^"]+)">/g,
+  (_, asset) => '<style>' + fs.readFileSync(path.join(staticDir, asset), 'utf8') + '</style>');
+const html = styledHtml.replace(/<script defer src="\/static\/([^"]+)"><\/script>/g,
+  (_, asset) => '<script>' + fs.readFileSync(path.join(staticDir, asset), 'utf8') + '</script>');
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 test('dashboard searches, appends pages, keeps selection and ignores stale responses', async () => {
@@ -693,3 +699,28 @@ for (const [type, component] of [['gentoo', null], ['slackware', 'patches'], ['s
     } finally {dom.window.close();}
   });
 }
+
+
+test('empty repository list explains how administrators add the first source', async () => {
+  const dom = new JSDOM(html, {
+    url: 'http://localhost/', runScripts: 'dangerously',
+    beforeParse(w) {
+      w.fetch = async raw => {
+        const url = new URL(raw, 'http://localhost');
+        const data = url.pathname === '/api/auth/session'
+          ? {role: 'admin', csrf_token: 'csrf'} : [];
+        return {ok: true, json: async () => data};
+      };
+    }
+  });
+  try {
+    await delay(40);
+    const doc = dom.window.document;
+    assert.match(doc.body.textContent, /No repositories configured/);
+    assert.match(doc.body.textContent, /Use \+ Add repository/);
+    assert.equal(doc.querySelectorAll('.repo-row').length, 0);
+    assert.equal(doc.getElementById('toggle-add-form').hidden, false);
+  } finally {
+    dom.window.close();
+  }
+});

@@ -8,7 +8,8 @@ import tarfile
 import httpx
 import pytest
 
-from repowatch.config import ConfigError, RepoConfig
+from repowatch.errors import ConfigError
+from repowatch.config.models import RepoConfig
 from repowatch.parsers import PARSERS, XbpsParser
 from repowatch.parsers.xbps import _parse_repodata
 

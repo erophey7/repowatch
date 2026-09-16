@@ -1,16 +1,11 @@
-"""Common interface for repository index parsers."""
-
 from __future__ import annotations
 
+import httpx
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-
-import re
-
-import httpx
-
-from repowatch.config import RepoConfig
-from repowatch.state import RepoSnapshot
+from repowatch.config.models import RepoConfig
+from repowatch.models import RepoSnapshot, PackageRef
 
 USER_AGENT = "repowatch/0.1 (+https://github.com/you/repowatch)"
 
@@ -28,39 +23,13 @@ class IndexHeadResult:
     last_modified: str | None
 
 
-@dataclass
-class PackageRef:
-    """One package from the index — everything needed to (a) build the
-    snapshot key and (b) optionally build the file URL for cache warming."""
-
-    name: str
-    version: str
-    # relative path of the package file from the repository's upstream URL, if known
-    filename: str | None = None
-    # SHA256 hex digest of the package file, when the index publishes one
-    # (docs_dev/ROADMAP.md item 29 — cross-repository dedup). Deliberately
-    # left None for formats where a same-algorithm whole-file hash isn't
-    # available without downloading the file itself: apk's APKINDEX `C:`
-    # field is a different digest (SHA1, base64, "Q1" prefix) that would
-    # never match a SHA256 value from apt/pacman/dnf even for a genuinely
-    # identical file, and apt-rpm's pkglist RPM headers (parsers/apt_rpm.py)
-    # don't currently carry a verified whole-file digest tag — guessing
-    # either would risk a false-positive match (serving one package's bytes
-    # under a different one's name), so both stay unfilled rather than wrong.
-    content_hash: str | None = None
-
-    @property
-    def key(self) -> str:
-        return f"{self.name}-{self.version}"
-
-
 class IndexParser(ABC):
     """Implementations: AptParser, PacmanParser, ApkParser, DnfParser (see
     parsers/*.py).
 
     All network methods take an already-created httpx.AsyncClient as an
     explicit parameter (they never create or hold their own — the caller
-    owns the client and its lifecycle, see watcher.check_repo), in keeping
+    owns the client and its lifecycle, see operations.check.check_repo), in keeping
     with the project's general "no global state" principle.
     """
 
@@ -79,7 +48,7 @@ class IndexParser(ABC):
         Must not silently swallow exceptions — let it raise, the watcher
         decides how to log and retry. CPU-heavy parsing of already-downloaded
         bytes (gzip/tarfile) should go through asyncio.to_thread — otherwise
-        concurrent checking of other repositories (see watcher.check_all)
+        concurrent checking of other repositories (see runtime.scheduler.check_all)
         would stall for the whole duration of parsing.
         """
 

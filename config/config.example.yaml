@@ -1,175 +1,87 @@
-# repowatch example configuration.
-#
-# A minimal, working starting point — one repository per major index format
-# (pacman, apt, dnf). apk and apt-rpm follow the same shape; see
-# docs/configuration.md for the full field reference.
-#
-# Copy this file and edit it for your own mirrors:
-#
-#   cp config/config.example.yaml config/config.yaml
-#
-# The repo ids/paths below line up with the nginx cache layer repowatch
-# generates itself (`repowatch nginx-render`/`nginx-apply`, see
-# docs/configuration.md#nginx) — there's no hand-written nginx config to
-# maintain separately.
+# Standard installation profile. See docs/quick-start.md before activation.
+# Fresh installs copy this file; upgrades preserve the existing config.yaml.
+# Add only the repository families/releases your clients actually use.
+# Every configured repository downloads metadata, even with a warming whitelist.
+# The cache serves arbitrary client requests within these repository routes;
+# warming lists only limit proactive downloads, not normal client downloads.
 
-# SQLite file for snapshots, history, and warmed-package state.
-# Must be on local disk, not NFS.
-#
-# NOTE FOR CONTRIBUTORS: the literal string "/var/lib/repowatch" here is
-# pattern-matched and substituted by scripts/install.py (see its
-# config_text = ... .replace('/var/lib/repowatch', ...) line) when this
-# file is installed as the real system config — it's not just an example
-# value. Don't change it casually; see README.md's Quick Start below for
-# what to do instead if you're running locally without a system install.
+# These path prefixes are substituted by the installer for custom layouts.
 state_db: /var/lib/repowatch/state.sqlite3
-
-# Where repowatch itself sends warm-up requests — the address of your nginx
-# cache (see docs/configuration.md#nginx), from repowatch's own point of view.
 cache_base_url: http://127.0.0.1:8080
+# Set this to your LAN address for useful dashboard links, e.g.
+# public_cache_url: http://cache.example.lan:8080
+public_cache_url: null
 
-# How often each repository's index is checked, unless overridden per-repo
-# (repos[].check_interval).
-check_interval: 300
-
-# One shared warm-body budget across repositories and manual/automatic runs.
-# Repository limits are additional ceilings. Rates are bytes/sec; null is unlimited.
-prefetch_bandwidth_limit: null
+# Bound metadata concurrency and proactive traffic for a shared cache host.
+check_interval: 900
+check_concurrency: 4
+prefetch_concurrency: 4
+prefetch_bandwidth_limit: 10485760  # 10 MiB/s across this process's warm tasks
 prefetch_bandwidth_timezone: UTC
 prefetch_bandwidth_schedule: []
-# Example: limit daytime warming to 5 MiB/s and use 50 MiB/s overnight.
-# prefetch_bandwidth_limit: 5242880
-# prefetch_bandwidth_timezone: Asia/Vladivostok
+# Example overnight override; weekdays refer to the start of the window.
 # prefetch_bandwidth_schedule:
 #   - days: [mon, tue, wed, thu, fri, sat, sun]
-#     start: "20:00"
-#     end: "09:00"
+#     start: "22:00"
+#     end: "07:00"
 #     limit: 52428800
 
-status_server:
-  bind: 0.0.0.0
-  port: 8085
-  # The dashboard and administrative API stay closed until admin_password_hash
-  # is set below (generate it with `repowatch hash-password`) — see
-  # docs/access.md.
+# Time and row caps are enforced by the periodic cleanup cycle.
+event_retention_days: 90
+request_retention_days: 7
+warmed_retention_days: 180
+event_max_rows_per_repo: 10000
+request_max_rows: 1000000
+key_expiry_warning_days: 30
 
-# Generates and (via `repowatch nginx-apply`, a separate root-run step) can
-# apply a complete nginx cache `server` block for the repos below — see
-# docs/configuration.md#nginx. `listen` matches cache_base_url above so the
-# two already agree; `repowatch nginx-render` alone just prints the config
-# to review, without touching any files or running nginx.
-#
-# `nginx-apply` needs a root-owned policy.json (real cache/log paths, the
-# nginx binary, the site-enabled symlink) that only `make install && sudo
-# make activate` creates — see docs/deployment.md. Until that's done,
-# `nginx.enabled: true` here only affects what `nginx-render` prints; it
-# doesn't start or reconfigure any nginx on its own.
-#
-# Further opt-in features layer on top, each requiring a separate system
-# package/module and each off by default — see docs/configuration.md#nginx:
-# `enable_purge` (active cache eviction, needs `ngx_cache_purge`),
-# `enable_dedup` (cross-repo byte-identical file sharing), `enable_cache_probe`
-# (read-only cache introspection via njs, needs `ngx_http_js_module`).
+# Set after activation: sudo -u repowatch /usr/local/bin/repowatch set-password
+# Start through an SSH tunnel, or configure HTTPS using docs/access.md.
+admin_password_hash: null
+status_server:
+  bind: 127.0.0.1
+  port: 8085
+  guest_read_only: false
+  token_repo_restrictions: true
+  allow_insecure_http: false
+  trusted_proxies: []
+  metrics_allowed_networks: [127.0.0.1/32, '::1/128']
+  tls_cert_path: null
+  tls_key_path: null
+
+# Full cache features. Install AND load matching nginx modules before activation:
+# ngx_http_cache_purge_module and ngx_http_js_module (njs).
+# Dedup needs no extra module. Missing modules are errors, not silent downgrades.
+# The root-owned installation policy controls cache/log paths, not this YAML.
 nginx:
   enabled: true
   listen: '8080'
+  server_name: repo-cache.local
+  resolvers: [1.1.1.1, 9.9.9.9]  # replace with reachable LAN DNS if required
+  cache_max_size: 100g            # disk budget, not a preallocation or hard quota
+  cache_key_version: ''
+  index_ttl: 300
+  package_ttl: 15552000
+  enable_purge: true
+  enable_dedup: true
+  enable_cache_probe: true
 
-# Listens for nginx's syslog access_log (loopback UDP) — the source of "what
-# was actually requested" for the dashboard, and the signal that keeps a
-# package's warmed_packages entry from aging out while real clients still
-# want it (see docs/configuration.md). Defaults to true; spelled out here so
-# it isn't easy to miss. If nginx isn't sending its access_log there yet
-# (nginx.enabled generates the matching directive automatically; a
-# hand-written nginx config needs one added manually), this is harmless —
-# just an idle loopback socket.
 syslog_listener:
   enabled: true
   bind: 127.0.0.1
   port: 1514
-  # Point nginx's own `access_log syslog:server=127.0.0.1:1514,...` at this
-  # bind/port (the generator does this automatically when nginx.enabled is
-  # set; a hand-written nginx config needs the directive added by hand).
 
-repos:
-  # Arch Linux (pacman) — the [core] repository, official geo-balanced mirror.
-  - id: arch-core-x86_64
-    type: pacman
-    upstream: https://geo.mirror.pkgbuild.com/core/os/x86_64
-    repo_name: core
-    arch: x86_64
+# All supported webhook events are selected; delivery starts only after you
+# supply your own receiver URL. Never put an example credential into service.
+notify_webhook_url: null
+notify_after_failures: 3
+notify_events:
+  - repository.failing
+  - repository.recovered
+  - repository.changed
+  - warm.started
+  - warm.completed
 
-  # Debian (apt) — bookworm main, official round-robin mirror.
-  - id: debian-bookworm-main
-    type: apt
-    upstream: https://deb.debian.org/debian
-    distribution: bookworm
-    component: main
-    arch: amd64
-
-  # Rocky Linux (dnf / RPM-MD) — 9 BaseOS, x86_64.
-  - id: rocky-9-baseos-x86_64
-    type: dnf
-    upstream: https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os
-    arch: x86_64
-
-# admin_password_hash: <paste the output of `repowatch hash-password` here>
-
-  # Optional Nix repository. Install Nix CLI and make its store usable by the
-  # repowatch service user before enabling this entry; see docs/nix.md.
-  # Keep an explicit selection initially: evaluating all nixpkgs outputs and
-  # warming their dependency closures can require substantial resources.
-  # - id: nix-unstable
-  #   type: nix
-  #   upstream: https://cache.nixos.org
-  #   arch: x86_64-linux
-  #   nix_source: https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz
-  #   nix_attributes: [hello, jq]
-  #   verify_signature: true
-  #   nix_public_keys:
-  #     - "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
-  #   prefetch: true
-
-  # Gentoo and Slackware examples: docs/gentoo-slackware.md.
-  # Select a compatible Gentoo profile/CPU binhost; Portage verifies GPKG signatures.
-  # - id: gentoo-amd64
-  #   type: gentoo
-  #   upstream: https://distfiles.gentoo.org/releases/amd64/binpackages/23.0/x86-64
-  #   arch: amd64
-  #   prefetch: false
-  # Slackware components share a release root and, here, a local cache prefix.
-  # Provision a trusted exported keyring before enabling verification.
-  # - id: slackware64-15
-  #   type: slackware
-  #   upstream: https://mirrors.kernel.org/slackware/slackware64-15.0
-  #   arch: x86_64
-  #   url_template: /slackware/15.0
-  #   prefetch: false
-  #   verify_signature: true
-  #   keyring_path: /etc/repowatch/keys/slackware.gpg
-  # - id: slackware64-15-patches
-  #   type: slackware
-  #   upstream: https://mirrors.kernel.org/slackware/slackware64-15.0
-  #   arch: x86_64
-  #   component: patches
-  #   url_template: /slackware/15.0
-  #   prefetch: false
-  #   verify_signature: true
-  #   keyring_path: /etc/repowatch/keys/slackware.gpg
-
-  # Optional per-repository warming lists (one or more quoted name globs).
-  # Empty whitelist allows all; blacklist and existing exact bans take priority.
-  # These fields also apply to manual warming. See docs/warming-policy.md.
-  #   prefetch_whitelist: ["linux-*", "bash"]
-  #   prefetch_blacklist: ["*-debug", "*-doc"]
-
-# Webhook delivery is disabled until a secret URL is configured.
-# notify_webhook_url: https://receiver.example/hooks/your-token
-# Defaults preserve failure/recovery alerts; lifecycle events are opt-in.
-# notify_events:
-#   - repository.failing
-#   - repository.recovered
-#   - repository.changed
-#   - warm.started
-#   - warm.completed
-# Delivery: at most 3 attempts with one stable event ID, no persistent outbox.
-# See docs/webhooks.md for receiver deduplication and retry limits.
+# Add your own sources through the dashboard or YAML. No upstream is contacted
+# until a repository is configured. See docs/repositories.md for both workflows,
+# tested route shapes, release/architecture selection and signature setup.
+repos: []

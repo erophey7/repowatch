@@ -1,3 +1,7 @@
+import repowatch.nginx.apply as nginx_apply
+import repowatch.nginx.policy as nginx_policy
+import repowatch.nginx.render as nginx_render
+import repowatch.routing as routing
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -5,8 +9,13 @@ import subprocess
 
 import pytest
 
-from repowatch.config import Config, ConfigError, NginxConfig, RepoConfig, StatusServerConfig, load_config
-from repowatch import nginx
+from repowatch.config.models import Config
+from repowatch.errors import ConfigError
+from repowatch.config.models import NginxConfig
+from repowatch.config.models import RepoConfig
+from repowatch.config.models import StatusServerConfig
+from repowatch.config.load import load_config
+import repowatch.nginx.render as nginx
 
 
 def config(repos):
@@ -27,7 +36,7 @@ def test_routes_match_parsers_and_warming():
         RepoConfig('rpm', 'dnf', 'https://rpm.test/9/BaseOS/x86_64/os', 'x86_64'),
         RepoConfig('void', 'xbps', 'https://xbps.test/current', 'x86_64'),
     ])
-    text = nginx.render(c)
+    text = nginx_render.render(c)
     assert 'rewrite ^/arch/core/os/x86_64/(.*)$ /core/os/x86_64/$1 break;' in text
     assert '/core/os/x86_64/core/os/' not in text
     assert 'location /alpine/v3.20/main/x86_64/' in text
@@ -37,17 +46,17 @@ def test_routes_match_parsers_and_warming():
     assert 'location ~ ^/xbps/void/[^/]+-repodata$' in text
     assert 'arch-index-v2:$scheme$proxy_host$request_uri' in text
     assert 'location ~ ^/debian/dists/' in text
-    assert nginx.render(replace(c, repos=list(reversed(c.repos)))) == text
+    assert nginx_render.render(replace(c, repos=list(reversed(c.repos)))) == text
 
 
 def test_shared_apt_prefix_minimum_interval_and_conflicts():
-    text = nginx.render(config([apt(), replace(apt('updates'), distribution='bookworm-updates', check_interval=60)]))
+    text = nginx_render.render(config([apt(), replace(apt('updates'), distribution='bookworm-updates', check_interval=60)]))
     assert text.count('location /debian/') == 1
     assert 'proxy_cache_valid 200 206 60s;' in text
     with pytest.raises(ConfigError, match='conflicting'):
-        nginx.render(config([apt(), apt('other', 'http://other.test/debian')]))
+        nginx_render.render(config([apt(), apt('other', 'http://other.test/debian')]))
     with pytest.raises(ConfigError, match='overlapping'):
-        nginx.render(config([apt(), apt('other', 'http://other.test/debian/extra')]))
+        nginx_render.render(config([apt(), apt('other', 'http://other.test/debian/extra')]))
 
 
 @pytest.mark.parametrize('upstream', ['http://evil/;include', 'http://evil/$arg_url',
@@ -55,7 +64,7 @@ def test_shared_apt_prefix_minimum_interval_and_conflicts():
     'http://evil/debian/../root', 'http://evil:99999/debian'])
 def test_reject_upstream_injection(upstream):
     with pytest.raises(ConfigError):
-        nginx.render(config([apt(upstream=upstream)]))
+        nginx_render.render(config([apt(upstream=upstream)]))
 
 
 @pytest.mark.parametrize('settings', [dict(listen='8080;include'), dict(listen='99999'),
@@ -67,15 +76,15 @@ def test_reject_nginx_parameter_injection(settings):
 
 
 def setup_apply(tmp_path, monkeypatch):
-    monkeypatch.setattr(nginx, '_check_policy_owner', lambda p: None)
+    monkeypatch.setattr(nginx_apply, '_check_policy_owner', lambda p: None)
     c = config([apt()])
-    monkeypatch.setattr(nginx, 'load_config', lambda p: c)
+    monkeypatch.setattr(nginx_apply, 'load_config', lambda p: c)
     policy = tmp_path / 'policy.json'
     (tmp_path / 'site.conf').symlink_to(tmp_path / 'active.conf')
     policy.write_text(json.dumps(dict(site_link=str(tmp_path / 'site.conf'), cache_dir='/var/cache/nginx/repo', access_log='/var/log/nginx/repo.log',
                                      nginx_conf='/etc/nginx/nginx.conf', nginx_binary='/usr/sbin/nginx')))
     calls = []
-    monkeypatch.setattr(nginx.subprocess, 'run', lambda args, **kw: calls.append(args))
+    monkeypatch.setattr(nginx_apply.subprocess, 'run', lambda args, **kw: calls.append(args))
     return policy, calls
 
 
@@ -83,10 +92,10 @@ def test_apply_noop_and_previous(tmp_path, monkeypatch):
     policy, calls = setup_apply(tmp_path, monkeypatch)
     active = tmp_path / 'active.conf'
     active.write_text('# previous working\n')
-    assert nginx.apply('config', str(policy))
+    assert nginx_apply.apply('config', str(policy))
     assert len(calls) == 2
     assert (tmp_path / 'previous.conf').read_text() == '# previous working\n'
-    assert not nginx.apply('config', str(policy))
+    assert not nginx_apply.apply('config', str(policy))
     assert len(calls) == 2
     assert json.loads((tmp_path / 'status.json').read_text())['ok']
 
@@ -100,9 +109,9 @@ def test_apply_failure_restores_old_and_reloads(tmp_path, monkeypatch, fail_at):
         calls.append(args)
         if len(calls) == fail_at:
             raise subprocess.CalledProcessError(1, args)
-    monkeypatch.setattr(nginx.subprocess, 'run', run)
+    monkeypatch.setattr(nginx_apply.subprocess, 'run', run)
     with pytest.raises(ConfigError, match='restored'):
-        nginx.apply('config', str(policy))
+        nginx_apply.apply('config', str(policy))
     assert active.read_text() == '# previous working\n'
     assert calls[-1] == ['systemctl', 'reload', 'nginx.service']
     assert not (tmp_path / 'previous.conf').exists()
@@ -110,30 +119,30 @@ def test_apply_failure_restores_old_and_reloads(tmp_path, monkeypatch, fail_at):
 
 
 def test_apply_writes_purge_conf_and_includes_it_when_enabled(tmp_path, monkeypatch):
-    monkeypatch.setattr(nginx, '_check_policy_owner', lambda p: None)
+    monkeypatch.setattr(nginx_apply, '_check_policy_owner', lambda p: None)
     c = config([apt()])
     c = replace(c, nginx=replace(c.nginx, enable_purge=True))
-    monkeypatch.setattr(nginx, 'load_config', lambda p: c)
+    monkeypatch.setattr(nginx_apply, 'load_config', lambda p: c)
     policy = tmp_path / 'policy.json'
     (tmp_path / 'site.conf').symlink_to(tmp_path / 'active.conf')
     policy.write_text(json.dumps(dict(site_link=str(tmp_path / 'site.conf'), cache_dir='/var/cache/nginx/repo', access_log='/var/log/nginx/repo.log',
                                      nginx_conf='/etc/nginx/nginx.conf', nginx_binary='/usr/sbin/nginx')))
-    monkeypatch.setattr(nginx.subprocess, 'run', lambda args, **kw: None)
+    monkeypatch.setattr(nginx_apply.subprocess, 'run', lambda args, **kw: None)
 
-    assert nginx.apply('config', str(policy))
+    assert nginx_apply.apply('config', str(policy))
     purge_path = tmp_path / 'purge.conf'
     active = tmp_path / 'active.conf'
     assert f'include {purge_path};' in active.read_text()
     assert 'proxy_cache_purge' in purge_path.read_text()
     # A real no-op on the next run — both files, not just active.conf, are compared.
-    assert not nginx.apply('config', str(policy))
+    assert not nginx_apply.apply('config', str(policy))
 
 
 def test_apply_rolls_back_purge_conf_together_with_active_conf(tmp_path, monkeypatch):
-    monkeypatch.setattr(nginx, '_check_policy_owner', lambda p: None)
+    monkeypatch.setattr(nginx_apply, '_check_policy_owner', lambda p: None)
     c = config([apt()])
     c = replace(c, nginx=replace(c.nginx, enable_purge=True))
-    monkeypatch.setattr(nginx, 'load_config', lambda p: c)
+    monkeypatch.setattr(nginx_apply, 'load_config', lambda p: c)
     policy = tmp_path / 'policy.json'
     (tmp_path / 'site.conf').symlink_to(tmp_path / 'active.conf')
     policy.write_text(json.dumps(dict(site_link=str(tmp_path / 'site.conf'), cache_dir='/var/cache/nginx/repo', access_log='/var/log/nginx/repo.log',
@@ -147,17 +156,17 @@ def test_apply_rolls_back_purge_conf_together_with_active_conf(tmp_path, monkeyp
         calls.append(args)
         if len(calls) == 1:
             raise subprocess.CalledProcessError(1, args)
-    monkeypatch.setattr(nginx.subprocess, 'run', run)
+    monkeypatch.setattr(nginx_apply.subprocess, 'run', run)
 
     with pytest.raises(ConfigError, match='restored'):
-        nginx.apply('config', str(policy))
+        nginx_apply.apply('config', str(policy))
     assert active.read_text() == '# previous working\n'
     assert purge_path.read_text() == '# previous purge\n'
 
 
 def test_apply_use_systemctl_false_reloads_via_nginx_binary(tmp_path, monkeypatch):
     policy, calls = setup_apply(tmp_path, monkeypatch)
-    assert nginx.apply('config', str(policy), use_systemctl=False)
+    assert nginx_apply.apply('config', str(policy), use_systemctl=False)
     assert calls[-1] == ['/usr/sbin/nginx', '-s', 'reload', '-c', '/etc/nginx/nginx.conf']
 
 
@@ -165,15 +174,16 @@ def test_policy_rejects_unprivileged_path(tmp_path):
     path = tmp_path / 'policy.json'
     path.write_text('{}')
     with pytest.raises(ConfigError, match='root-owned'):
-        nginx._check_policy_owner(path)
+        nginx_policy._check_policy_owner(path)
 
 
 def test_example_renders_and_cli_without_database(tmp_path, capsys):
-    from repowatch.cli import main
+    from repowatch.cli.main import main
     assert main(['-c', 'config/config.example.yaml', 'nginx-render']) == 0
     assert 'server {' in capsys.readouterr().out
     c = load_config('config/config.example.yaml')
-    assert 'location /debian/' in nginx.render(c)
+    assert 'location / { return 404; }' in nginx_render.render(c)
+    assert 'proxy_pass' not in nginx_render.render(c)
 
 
 def test_real_nginx_proxy_routes_and_cache(tmp_path):
@@ -215,7 +225,7 @@ def test_real_nginx_proxy_routes_and_cache(tmp_path):
         RepoConfig('void', 'xbps', host + '/current', 'x86_64'),
     ])
     c = replace(c, nginx=replace(c.nginx, listen=f'127.0.0.1:{port}'))
-    text = nginx.render(c, cache_dir=str(tmp_path / 'cache'), access_log=str(tmp_path / 'access.log'))
+    text = nginx_render.render(c, cache_dir=str(tmp_path / 'cache'), access_log=str(tmp_path / 'access.log'))
     conf = tmp_path / 'nginx.conf'
     conf.write_text(f'pid {tmp_path}/nginx.pid; error_log {tmp_path}/error.log;\n'
                     'events {}\nhttp {\n' + text + '\n}\n')
@@ -299,10 +309,10 @@ def test_real_nginx_dedup_shares_the_canonical_cache_entry(tmp_path):
     ])
     c = replace(c, nginx=replace(c.nginx, enable_dedup=True, listen=f'127.0.0.1:{port}'))
     dedup_conf = tmp_path / 'dedup.map'
-    text = nginx.render(c, cache_dir=str(tmp_path / 'cache'), access_log=str(tmp_path / 'access.log'),
+    text = nginx_render.render(c, cache_dir=str(tmp_path / 'cache'), access_log=str(tmp_path / 'access.log'),
                          dedup_conf=str(dedup_conf))
-    pairs = nginx.resolve_dedup_pairs(c, [('ubuntu', 'debian', 'pool/main/a/a.deb')])
-    dedup_conf.write_text(nginx.render_dedup(c, pairs))
+    pairs = nginx_render.resolve_dedup_pairs(c, [('ubuntu', 'debian', 'pool/main/a/a.deb')])
+    dedup_conf.write_text(nginx_render.render_dedup(c, pairs))
     conf = tmp_path / 'nginx.conf'
     conf.write_text(f'pid {tmp_path}/nginx.pid; error_log {tmp_path}/error.log;\n'
                     'events {}\nhttp {\n' + text + '\n}\n')
@@ -350,7 +360,7 @@ def test_real_nginx_dedup_shares_the_canonical_cache_entry(tmp_path):
 
 def test_cache_version_and_resolver_types():
     c = config([apt()])
-    assert 'proxy_cache_key "migration-2:$scheme$proxy_host$request_uri";' in nginx.render(
+    assert 'proxy_cache_key "migration-2:$scheme$proxy_host$request_uri";' in nginx_render.render(
         replace(c, nginx=replace(c.nginx, cache_key_version='migration-2')))
     with pytest.raises(ConfigError):
         NginxConfig(resolvers=[0])
@@ -377,9 +387,9 @@ def test_nginx_config_enable_purge_defaults_to_false_and_validates_type():
 
 
 def test_apply_accepts_matching_cache_dir(tmp_path, monkeypatch):
-    monkeypatch.setattr(nginx, '_check_policy_owner', lambda p: None)
+    monkeypatch.setattr(nginx_apply, '_check_policy_owner', lambda p: None)
     c = replace(config([apt()]), nginx=NginxConfig(enabled=True, cache_dir='/var/cache/nginx/repo'))
-    monkeypatch.setattr(nginx, 'load_config', lambda p: c)
+    monkeypatch.setattr(nginx_apply, 'load_config', lambda p: c)
     policy = tmp_path / 'policy.json'
     (tmp_path / 'site.conf').symlink_to(tmp_path / 'active.conf')
     policy.write_text(json.dumps(dict(
@@ -387,9 +397,9 @@ def test_apply_accepts_matching_cache_dir(tmp_path, monkeypatch):
         access_log='/var/log/nginx/repo.log', nginx_conf='/etc/nginx/nginx.conf',
         nginx_binary='/usr/sbin/nginx',
     )))
-    monkeypatch.setattr(nginx.subprocess, 'run', lambda args, **kw: None)
+    monkeypatch.setattr(nginx_apply.subprocess, 'run', lambda args, **kw: None)
 
-    assert nginx.apply('config', str(policy))
+    assert nginx_apply.apply('config', str(policy))
 
 
 def test_apply_rejects_cache_dir_mismatch_without_touching_anything(tmp_path, monkeypatch):
@@ -397,9 +407,9 @@ def test_apply_rejects_cache_dir_mismatch_without_touching_anything(tmp_path, mo
     policy actually enforces — a mismatch must refuse before writing
     active.conf or running nginx -t/reload at all, not apply the real
     (policy) path silently while the declared one lies."""
-    monkeypatch.setattr(nginx, '_check_policy_owner', lambda p: None)
+    monkeypatch.setattr(nginx_apply, '_check_policy_owner', lambda p: None)
     c = replace(config([apt()]), nginx=NginxConfig(enabled=True, cache_dir='/var/cache/nginx/wrong-path'))
-    monkeypatch.setattr(nginx, 'load_config', lambda p: c)
+    monkeypatch.setattr(nginx_apply, 'load_config', lambda p: c)
     policy = tmp_path / 'policy.json'
     (tmp_path / 'site.conf').symlink_to(tmp_path / 'active.conf')
     policy.write_text(json.dumps(dict(
@@ -408,10 +418,10 @@ def test_apply_rejects_cache_dir_mismatch_without_touching_anything(tmp_path, mo
         nginx_binary='/usr/sbin/nginx',
     )))
     calls = []
-    monkeypatch.setattr(nginx.subprocess, 'run', lambda args, **kw: calls.append(args))
+    monkeypatch.setattr(nginx_apply.subprocess, 'run', lambda args, **kw: calls.append(args))
 
     with pytest.raises(ConfigError, match='cache_dir'):
-        nginx.apply('config', str(policy))
+        nginx_apply.apply('config', str(policy))
 
     assert calls == []
     assert not (tmp_path / 'active.conf').exists()
@@ -420,7 +430,7 @@ def test_apply_rejects_cache_dir_mismatch_without_touching_anything(tmp_path, mo
 # --- active cache purge on package removal (docs_dev/ROADMAP.md item 24) ---
 
 def test_purge_disabled_by_default_renders_no_purge_locations():
-    text = nginx.render(config([apt()]))
+    text = nginx_render.render(config([apt()]))
     assert 'proxy_cache_purge' not in text
     assert '/purge' not in text
 
@@ -428,7 +438,7 @@ def test_purge_disabled_by_default_renders_no_purge_locations():
 def test_purge_enabled_adds_an_include_line_pointing_at_the_default_purge_conf():
     c = config([apt()])
     c = replace(c, nginx=replace(c.nginx, enable_purge=True))
-    text = nginx.render(c)
+    text = nginx_render.render(c)
     assert 'include /etc/nginx/repowatch/purge.conf;' in text
     assert 'proxy_cache_purge' not in text
 
@@ -436,20 +446,20 @@ def test_purge_enabled_adds_an_include_line_pointing_at_the_default_purge_conf()
 def test_purge_include_path_is_configurable_and_validated():
     c = config([apt()])
     c = replace(c, nginx=replace(c.nginx, enable_purge=True))
-    text = nginx.render(c, purge_conf='/etc/nginx/repowatch/custom-purge.conf')
+    text = nginx_render.render(c, purge_conf='/etc/nginx/repowatch/custom-purge.conf')
     assert 'include /etc/nginx/repowatch/custom-purge.conf;' in text
     with pytest.raises(ConfigError):
-        nginx.render(c, purge_conf='relative/purge.conf')
+        nginx_render.render(c, purge_conf='relative/purge.conf')
 
 
 def test_purge_disabled_renders_no_include_line():
-    text = nginx.render(config([apt()]))
+    text = nginx_render.render(config([apt()]))
     assert 'include' not in text
     assert '/purge' not in text
 
 
 def test_render_purge_empty_comment_only_when_disabled():
-    text = nginx.render_purge(config([apt()]))
+    text = nginx_render.render_purge(config([apt()]))
     assert text == '# Generated by repowatch; edit YAML parameters, not this file.\n'
 
 
@@ -459,7 +469,7 @@ def test_render_purge_renders_a_loopback_only_location_per_repo():
         apt(),
     ])
     c = replace(c, nginx=replace(c.nginx, enable_purge=True))
-    text = nginx.render_purge(c)
+    text = nginx_render.render_purge(c)
 
     assert 'location ~ ^/purge/arch/core/os/x86_64/(.*)$ {' in text
     assert 'location ~ ^/purge/debian/(.*)$ {' in text
@@ -480,9 +490,9 @@ def test_render_purge_key_matches_the_real_content_locations_key_format():
     purges a key nothing ever used and silently does nothing."""
     c = config([apt()])
     c = replace(c, nginx=replace(c.nginx, enable_purge=True, cache_key_version='v7'))
-    text = nginx.render(c)
+    text = nginx_render.render(c)
     assert 'proxy_cache_key "v7:$scheme$proxy_host$request_uri";' in text
-    assert 'proxy_cache_purge repo_cache "v7:${scheme}deb.debian.org/debian/$1";' in nginx.render_purge(c)
+    assert 'proxy_cache_purge repo_cache "v7:${scheme}deb.debian.org/debian/$1";' in nginx_render.render_purge(c)
 
 
 def test_render_purge_key_matches_dedup_uri_basis_when_dedup_is_also_enabled():
@@ -497,7 +507,7 @@ def test_render_purge_key_matches_dedup_uri_basis_when_dedup_is_also_enabled():
     file)."""
     c = config([apt()])
     c = replace(c, nginx=replace(c.nginx, enable_purge=True, enable_dedup=True, cache_key_version='v7'))
-    text = nginx.render(c)
+    text = nginx_render.render(c)
     assert 'proxy_cache_key "v7:$scheme$proxy_host$uri";' in text
     # NOT .../debian/$1 (the local prefix) — /debian/pool/main is the local
     # prefix, but $uri after the location's own rewrite is the upstream
@@ -507,10 +517,10 @@ def test_render_purge_key_matches_dedup_uri_basis_when_dedup_is_also_enabled():
     pacman_repo = RepoConfig('core', 'pacman', 'https://mirror.test/core/os/x86_64', 'x86_64', repo_name='core')
     c2 = config([pacman_repo])
     c2 = replace(c2, nginx=replace(c2.nginx, enable_purge=True, enable_dedup=True))
-    rendered = nginx.render(c2)
+    rendered = nginx_render.render(c2)
     assert 'rewrite ^/arch/core/os/x86_64/(.*)$ /core/os/x86_64/$1 break;' in rendered
     assert 'proxy_cache_key "$scheme$proxy_host$uri";' in rendered
-    purge_text = nginx.render_purge(c2)
+    purge_text = nginx_render.render_purge(c2)
     # Local prefix (/arch/core/os/x86_64) must NOT appear as the key basis —
     # that was the bug. The upstream-relative path (/core/os/x86_64, what
     # $uri actually holds post-rewrite) must.
@@ -521,8 +531,8 @@ def test_render_purge_key_matches_dedup_uri_basis_when_dedup_is_also_enabled():
 def test_purge_location_omitted_entirely_when_disabled_even_with_cache_key_version():
     c = config([apt()])
     c = replace(c, nginx=replace(c.nginx, cache_key_version='v7'))
-    assert 'proxy_cache_purge' not in nginx.render(c)
-    assert 'proxy_cache_purge' not in nginx.render_purge(c)
+    assert 'proxy_cache_purge' not in nginx_render.render(c)
+    assert 'proxy_cache_purge' not in nginx_render.render_purge(c)
 
 
 # --- cross-repository dedup of byte-identical files (docs_dev/ROADMAP.md item 29) ---
@@ -535,7 +545,7 @@ def test_nginx_config_enable_dedup_defaults_to_false_and_validates_type():
 
 
 def test_dedup_disabled_renders_no_map_block_or_rewrite_check():
-    text = nginx.render(config([apt()]))
+    text = nginx_render.render(config([apt()]))
     assert 'map $request_uri' not in text
     assert 'repowatch_canonical_uri' not in text
 
@@ -543,7 +553,7 @@ def test_dedup_disabled_renders_no_map_block_or_rewrite_check():
 def test_dedup_enabled_adds_a_map_block_and_a_rewrite_check_in_content_locations_only():
     c = config([apt()])
     c = replace(c, nginx=replace(c.nginx, enable_dedup=True))
-    text = nginx.render(c)
+    text = nginx_render.render(c)
     # Keyed on $uri, not $request_uri: $request_uri never changes across an
     # internal rewrite, which caused a real "rewrite or internal redirection
     # cycle" (nginx re-matches on $uri, so the map must be too — see nginx.py).
@@ -578,23 +588,23 @@ def test_dedup_enabled_adds_a_map_block_and_a_rewrite_check_in_content_locations
 def test_dedup_include_path_is_configurable_and_validated():
     c = config([apt()])
     c = replace(c, nginx=replace(c.nginx, enable_dedup=True))
-    text = nginx.render(c, dedup_conf='/etc/nginx/repowatch/custom-dedup.map')
+    text = nginx_render.render(c, dedup_conf='/etc/nginx/repowatch/custom-dedup.map')
     assert 'include /etc/nginx/repowatch/custom-dedup.map;' in text
     with pytest.raises(ConfigError):
-        nginx.render(c, dedup_conf='relative/dedup.map')
+        nginx_render.render(c, dedup_conf='relative/dedup.map')
 
 
 def test_render_dedup_empty_by_default():
-    assert nginx.render_dedup(config([apt()]), []) == '# Generated by repowatch; edit YAML parameters, not this file.\n'
+    assert nginx_render.render_dedup(config([apt()]), []) == '# Generated by repowatch; edit YAML parameters, not this file.\n'
 
 
 def test_render_dedup_renders_quoted_key_value_pairs():
-    text = nginx.render_dedup(config([apt()]), [('/ubuntu/pool/main/a/a.deb', '/debian/pool/main/a/a.deb')])
+    text = nginx_render.render_dedup(config([apt()]), [('/ubuntu/pool/main/a/a.deb', '/debian/pool/main/a/a.deb')])
     assert '"/ubuntu/pool/main/a/a.deb" "/debian/pool/main/a/a.deb";' in text
 
 
 def test_render_dedup_escapes_quotes_and_backslashes():
-    text = nginx.render_dedup(config([apt()]), [('/a"b\\c', '/x')])
+    text = nginx_render.render_dedup(config([apt()]), [('/a"b\\c', '/x')])
     assert r'"/a\"b\\c" "/x";' in text
 
 
@@ -604,41 +614,41 @@ def test_resolve_dedup_pairs_uses_the_same_local_path_as_warm_and_purge_urls():
         apt('ubuntu', 'http://archive.ubuntu.com/ubuntu'),
     ])
     rows = [('ubuntu', 'debian', 'pool/main/a/a.deb')]
-    pairs = nginx.resolve_dedup_pairs(c, rows)
+    pairs = nginx_render.resolve_dedup_pairs(c, rows)
     assert pairs == [('/ubuntu/pool/main/a/a.deb', '/debian/pool/main/a/a.deb')]
 
 
 def test_resolve_dedup_pairs_skips_rows_for_repos_no_longer_in_config():
     c = config([apt('debian')])
     rows = [('removed-repo', 'debian', 'a.deb'), ('debian', 'removed-repo', 'a.deb')]
-    assert nginx.resolve_dedup_pairs(c, rows) == []
+    assert nginx_render.resolve_dedup_pairs(c, rows) == []
 
 
 def test_apply_writes_dedup_map_and_includes_it_when_enabled(tmp_path, monkeypatch):
-    monkeypatch.setattr(nginx, '_check_policy_owner', lambda p: None)
+    monkeypatch.setattr(nginx_apply, '_check_policy_owner', lambda p: None)
     c = config([apt()])
     c = replace(c, nginx=replace(c.nginx, enable_dedup=True))
-    monkeypatch.setattr(nginx, 'load_config', lambda p: c)
+    monkeypatch.setattr(nginx_apply, 'load_config', lambda p: c)
     policy = tmp_path / 'policy.json'
     (tmp_path / 'site.conf').symlink_to(tmp_path / 'active.conf')
     policy.write_text(json.dumps(dict(site_link=str(tmp_path / 'site.conf'), cache_dir='/var/cache/nginx/repo', access_log='/var/log/nginx/repo.log',
                                      nginx_conf='/etc/nginx/nginx.conf', nginx_binary='/usr/sbin/nginx')))
-    monkeypatch.setattr(nginx.subprocess, 'run', lambda args, **kw: None)
+    monkeypatch.setattr(nginx_apply.subprocess, 'run', lambda args, **kw: None)
 
-    assert nginx.apply('config', str(policy))
+    assert nginx_apply.apply('config', str(policy))
     dedup_path = tmp_path / 'dedup.map'
     active = tmp_path / 'active.conf'
     assert f'include {dedup_path};' in active.read_text()
     assert dedup_path.exists()
     # A real no-op on the next run — all three files, not just active.conf, are compared.
-    assert not nginx.apply('config', str(policy))
+    assert not nginx_apply.apply('config', str(policy))
 
 
 def test_apply_rolls_back_dedup_map_together_with_active_conf(tmp_path, monkeypatch):
-    monkeypatch.setattr(nginx, '_check_policy_owner', lambda p: None)
+    monkeypatch.setattr(nginx_apply, '_check_policy_owner', lambda p: None)
     c = config([apt()])
     c = replace(c, nginx=replace(c.nginx, enable_dedup=True))
-    monkeypatch.setattr(nginx, 'load_config', lambda p: c)
+    monkeypatch.setattr(nginx_apply, 'load_config', lambda p: c)
     policy = tmp_path / 'policy.json'
     (tmp_path / 'site.conf').symlink_to(tmp_path / 'active.conf')
     policy.write_text(json.dumps(dict(site_link=str(tmp_path / 'site.conf'), cache_dir='/var/cache/nginx/repo', access_log='/var/log/nginx/repo.log',
@@ -652,10 +662,10 @@ def test_apply_rolls_back_dedup_map_together_with_active_conf(tmp_path, monkeypa
         calls.append(args)
         if len(calls) == 1:
             raise subprocess.CalledProcessError(1, args)
-    monkeypatch.setattr(nginx.subprocess, 'run', run)
+    monkeypatch.setattr(nginx_apply.subprocess, 'run', run)
 
     with pytest.raises(ConfigError, match='restored'):
-        nginx.apply('config', str(policy))
+        nginx_apply.apply('config', str(policy))
     assert active.read_text() == '# previous working\n'
     assert dedup_path.read_text() == '# previous dedup\n'
 
@@ -664,48 +674,49 @@ def test_apply_finds_real_duplicates_via_state_store_when_enabled(tmp_path, monk
     """apply() must query the real repo_packages table for duplicates when
     enable_dedup is on — not just render an empty map, which would make the
     whole feature a no-op in production."""
-    from repowatch.state import RepoSnapshot, StateStore
+    from repowatch.models import RepoSnapshot
+    from repowatch.runtime.context import ServiceState
 
-    monkeypatch.setattr(nginx, '_check_policy_owner', lambda p: None)
+    monkeypatch.setattr(nginx_apply, '_check_policy_owner', lambda p: None)
     db_path = tmp_path / 'state.sqlite3'
     c = config([
         apt('debian', 'http://deb.debian.org/debian'),
         apt('ubuntu', 'http://archive.ubuntu.com/ubuntu'),
     ])
     c = replace(c, state_db=db_path, nginx=replace(c.nginx, enable_dedup=True))
-    store = StateStore(db_path)
-    store.record_snapshot(RepoSnapshot('debian', packages={'a-1': 'pool/main/a/a.deb'},
+    store = ServiceState(db_path)
+    store.repositories.record_snapshot(RepoSnapshot('debian', packages={'a-1': 'pool/main/a/a.deb'},
                                         content_hashes={'a-1': 'f' * 64}))
-    store.record_snapshot(RepoSnapshot('ubuntu', packages={'a-1': 'pool/main/a/a.deb'},
+    store.repositories.record_snapshot(RepoSnapshot('ubuntu', packages={'a-1': 'pool/main/a/a.deb'},
                                         content_hashes={'a-1': 'f' * 64}))
-    monkeypatch.setattr(nginx, 'load_config', lambda p: c)
+    monkeypatch.setattr(nginx_apply, 'load_config', lambda p: c)
     policy = tmp_path / 'policy.json'
     (tmp_path / 'site.conf').symlink_to(tmp_path / 'active.conf')
     policy.write_text(json.dumps(dict(site_link=str(tmp_path / 'site.conf'), cache_dir='/var/cache/nginx/repo', access_log='/var/log/nginx/repo.log',
                                      nginx_conf='/etc/nginx/nginx.conf', nginx_binary='/usr/sbin/nginx')))
-    monkeypatch.setattr(nginx.subprocess, 'run', lambda args, **kw: None)
+    monkeypatch.setattr(nginx_apply.subprocess, 'run', lambda args, **kw: None)
 
-    assert nginx.apply('config', str(policy))
+    assert nginx_apply.apply('config', str(policy))
     dedup_text = (tmp_path / 'dedup.map').read_text()
     assert '"/ubuntu/pool/main/a/a.deb" "/debian/pool/main/a/a.deb";' in dedup_text
 
 
 def test_apply_never_queries_state_store_when_dedup_disabled(tmp_path, monkeypatch):
-    monkeypatch.setattr(nginx, '_check_policy_owner', lambda p: None)
+    monkeypatch.setattr(nginx_apply, '_check_policy_owner', lambda p: None)
     c = config([apt()])
-    monkeypatch.setattr(nginx, 'load_config', lambda p: c)
+    monkeypatch.setattr(nginx_apply, 'load_config', lambda p: c)
 
     def boom(*a, **kw):
-        raise AssertionError('StateStore must not be constructed when enable_dedup is off')
-    monkeypatch.setattr(nginx, 'StateStore', boom)
+        raise AssertionError('ServiceState must not be constructed when enable_dedup is off')
+    monkeypatch.setattr(nginx_apply, 'Database', boom)
 
     policy = tmp_path / 'policy.json'
     (tmp_path / 'site.conf').symlink_to(tmp_path / 'active.conf')
     policy.write_text(json.dumps(dict(site_link=str(tmp_path / 'site.conf'), cache_dir='/var/cache/nginx/repo', access_log='/var/log/nginx/repo.log',
                                      nginx_conf='/etc/nginx/nginx.conf', nginx_binary='/usr/sbin/nginx')))
-    monkeypatch.setattr(nginx.subprocess, 'run', lambda args, **kw: None)
+    monkeypatch.setattr(nginx_apply.subprocess, 'run', lambda args, **kw: None)
 
-    assert nginx.apply('config', str(policy))
+    assert nginx_apply.apply('config', str(policy))
 
 
 # --- distinguishing repowatch's own traffic in the syslog access_log ---
@@ -715,7 +726,7 @@ def test_prefetch_marker_omitted_when_syslog_listener_disabled():
     # explicitly turned off here to actually test the disabled case.
     c = config([apt()])
     c = replace(c, syslog_listener=replace(c.syslog_listener, enabled=False))
-    text = nginx.render(c)
+    text = nginx_render.render(c)
     assert 'repowatch_is_prefetch' not in text
     assert 'log_format repowatch_requests' not in text
 
@@ -723,7 +734,7 @@ def test_prefetch_marker_omitted_when_syslog_listener_disabled():
 def test_prefetch_marker_map_and_log_format_present_when_syslog_listener_enabled():
     c = config([apt()])
     c = replace(c, syslog_listener=replace(c.syslog_listener, enabled=True))
-    text = nginx.render(c)
+    text = nginx_render.render(c)
     assert 'map $http_user_agent $repowatch_is_prefetch { default 0; "~*^repowatch/" 1; }' in text
     assert ("log_format repowatch_requests '$remote_addr $request_method $request_uri $status "
             "$upstream_cache_status $repowatch_is_prefetch';") in text
@@ -741,14 +752,14 @@ def test_nginx_config_enable_cache_probe_defaults_to_false_and_validates_type():
 
 
 def test_render_probe_js_empty_comment_only_when_disabled():
-    text = nginx.render_probe_js(config([apt()]))
+    text = nginx_render.render_probe_js(config([apt()]))
     assert text == '// Generated by repowatch; edit YAML parameters, not this file.\n'
 
 
 def test_render_probe_js_embeds_cache_dir_and_both_handlers():
     c = config([apt()])
     c = replace(c, nginx=replace(c.nginx, enable_cache_probe=True))
-    text = nginx.render_probe_js(c, cache_dir='/var/cache/nginx/repo')
+    text = nginx_render.render_probe_js(c, cache_dir='/var/cache/nginx/repo')
     assert "const CACHE_DIR = '/var/cache/nginx/repo';" in text
     assert "require('crypto').createHash('md5')" in text
     assert 'function probe(r) {' in text
@@ -761,19 +772,19 @@ def test_render_probe_js_embeds_cache_dir_and_both_handlers():
 def test_render_probe_js_escapes_cache_dir_for_js_string_literal():
     c = config([apt()])
     c = replace(c, nginx=replace(c.nginx, enable_cache_probe=True))
-    text = nginx.render_probe_js(c, cache_dir="/var/cache/it's\\special")
+    text = nginx_render.render_probe_js(c, cache_dir="/var/cache/it's\\special")
     assert "const CACHE_DIR = '/var/cache/it\\'s\\\\special';" in text
 
 
 def test_render_probe_conf_empty_comment_only_when_disabled():
-    text = nginx.render_probe_conf(config([apt()]))
+    text = nginx_render.render_probe_conf(config([apt()]))
     assert text == '# Generated by repowatch; edit YAML parameters, not this file.\n'
 
 
 def test_render_probe_conf_renders_loopback_only_locations():
     c = config([apt()])
     c = replace(c, nginx=replace(c.nginx, enable_cache_probe=True))
-    text = nginx.render_probe_conf(c)
+    text = nginx_render.render_probe_conf(c)
     assert 'location = /cache-probe {' in text
     assert 'js_content cache_probe.probe;' in text
     assert 'location = /cache-scan {' in text
@@ -785,12 +796,12 @@ def test_render_probe_conf_renders_loopback_only_locations():
 
 
 def test_render_adds_js_import_before_server_block_only_when_enabled():
-    disabled = nginx.render(config([apt()]))
+    disabled = nginx_render.render(config([apt()]))
     assert 'js_import' not in disabled
 
     c = config([apt()])
     c = replace(c, nginx=replace(c.nginx, enable_cache_probe=True))
-    text = nginx.render(c)
+    text = nginx_render.render(c)
     assert 'js_import cache_probe from /etc/nginx/repowatch/probe.js;' in text
     assert text.index('js_import') < text.index('server {')
 
@@ -798,22 +809,22 @@ def test_render_adds_js_import_before_server_block_only_when_enabled():
 def test_render_includes_probe_conf_in_server_block_only_when_enabled():
     c = config([apt()])
     c = replace(c, nginx=replace(c.nginx, enable_cache_probe=True))
-    text = nginx.render(c, probe_conf='/etc/nginx/repowatch/custom-probe.conf')
+    text = nginx_render.render(c, probe_conf='/etc/nginx/repowatch/custom-probe.conf')
     assert 'include /etc/nginx/repowatch/custom-probe.conf;' in text
     with pytest.raises(ConfigError):
-        nginx.render(c, probe_conf='relative/probe.conf')
+        nginx_render.render(c, probe_conf='relative/probe.conf')
     with pytest.raises(ConfigError):
-        nginx.render(c, probe_js='relative/probe.js')
+        nginx_render.render(c, probe_js='relative/probe.js')
 
 
 def test_purge_raw_location_requires_both_enable_purge_and_enable_cache_probe():
     c = config([apt()])
     only_probe = replace(c, nginx=replace(c.nginx, enable_cache_probe=True))
-    assert 'purge-raw' not in nginx.render_purge(only_probe)
+    assert 'purge-raw' not in nginx_render.render_purge(only_probe)
     only_purge = replace(c, nginx=replace(c.nginx, enable_purge=True))
-    assert 'purge-raw' not in nginx.render_purge(only_purge)
+    assert 'purge-raw' not in nginx_render.render_purge(only_purge)
     both = replace(c, nginx=replace(c.nginx, enable_purge=True, enable_cache_probe=True))
-    text = nginx.render_purge(both)
+    text = nginx_render.render_purge(both)
     assert 'location = /purge-raw {' in text
     assert 'proxy_cache_purge repo_cache $arg_key;' in text
     purge_raw_block = text[text.index('location = /purge-raw'):]
@@ -827,10 +838,10 @@ def test_compute_cache_key_matches_render_purge_basis_when_dedup_off():
     dedup-basis drift bug documented on render_purge() itself."""
     c = config([apt()])
     c = replace(c, nginx=replace(c.nginx, enable_purge=True, cache_key_version='v7'))
-    key = nginx.compute_cache_key(c, apt(), 'pool/main/b/bash/bash_1_amd64.deb')
+    key = routing.compute_cache_key(c, apt(), 'pool/main/b/bash/bash_1_amd64.deb')
     assert key == 'v7:httpdeb.debian.org/debian/pool/main/b/bash/bash_1_amd64.deb'
     # Cross-check against render_purge()'s own emitted key format for the same repo.
-    purge_text = nginx.render_purge(c)
+    purge_text = nginx_render.render_purge(c)
     assert 'proxy_cache_purge repo_cache "v7:${scheme}deb.debian.org/debian/$1";' in purge_text
 
 
@@ -841,7 +852,7 @@ def test_compute_cache_key_matches_render_purge_basis_when_dedup_on():
     pacman_repo = RepoConfig('core', 'pacman', 'https://mirror.test/core/os/x86_64', 'x86_64', repo_name='core')
     c = config([pacman_repo])
     c = replace(c, nginx=replace(c.nginx, enable_purge=True, enable_dedup=True))
-    key = nginx.compute_cache_key(c, pacman_repo, 'bash-1-x86_64.pkg.tar.zst')
+    key = routing.compute_cache_key(c, pacman_repo, 'bash-1-x86_64.pkg.tar.zst')
     # Must use the upstream-relative (remote) path, NOT the local
     # /arch/core/os/x86_64 prefix — that was the exact production bug.
     assert key == 'httpmirror.test/core/os/x86_64/bash-1-x86_64.pkg.tar.zst'
@@ -852,21 +863,21 @@ def test_compute_cache_key_raises_for_a_repo_not_in_the_configs_routes():
     c = config([apt()])
     stray = RepoConfig('other', 'apt', 'http://other.test/other', 'amd64', distribution='x', component='main')
     with pytest.raises(ValueError):
-        nginx.compute_cache_key(c, stray, 'pool/main/a/a.deb')
+        routing.compute_cache_key(c, stray, 'pool/main/a/a.deb')
 
 
 def test_apply_writes_probe_files_and_includes_them_when_enabled(tmp_path, monkeypatch):
-    monkeypatch.setattr(nginx, '_check_policy_owner', lambda p: None)
+    monkeypatch.setattr(nginx_apply, '_check_policy_owner', lambda p: None)
     c = config([apt()])
     c = replace(c, nginx=replace(c.nginx, enable_cache_probe=True))
-    monkeypatch.setattr(nginx, 'load_config', lambda p: c)
+    monkeypatch.setattr(nginx_apply, 'load_config', lambda p: c)
     policy = tmp_path / 'policy.json'
     (tmp_path / 'site.conf').symlink_to(tmp_path / 'active.conf')
     policy.write_text(json.dumps(dict(site_link=str(tmp_path / 'site.conf'), cache_dir='/var/cache/nginx/repo', access_log='/var/log/nginx/repo.log',
                                      nginx_conf='/etc/nginx/nginx.conf', nginx_binary='/usr/sbin/nginx')))
-    monkeypatch.setattr(nginx.subprocess, 'run', lambda args, **kw: None)
+    monkeypatch.setattr(nginx_apply.subprocess, 'run', lambda args, **kw: None)
 
-    assert nginx.apply('config', str(policy))
+    assert nginx_apply.apply('config', str(policy))
     probe_conf_path = tmp_path / 'probe.conf'
     probe_js_path = tmp_path / 'probe.js'
     active = tmp_path / 'active.conf'
@@ -875,14 +886,14 @@ def test_apply_writes_probe_files_and_includes_them_when_enabled(tmp_path, monke
     assert 'js_content cache_probe.probe;' in probe_conf_path.read_text()
     assert "const CACHE_DIR = '/var/cache/nginx/repo';" in probe_js_path.read_text()
     # A real no-op on the next run — all five files, not just active.conf, are compared.
-    assert not nginx.apply('config', str(policy))
+    assert not nginx_apply.apply('config', str(policy))
 
 
 def test_apply_rolls_back_probe_files_together_with_active_conf(tmp_path, monkeypatch):
-    monkeypatch.setattr(nginx, '_check_policy_owner', lambda p: None)
+    monkeypatch.setattr(nginx_apply, '_check_policy_owner', lambda p: None)
     c = config([apt()])
     c = replace(c, nginx=replace(c.nginx, enable_cache_probe=True))
-    monkeypatch.setattr(nginx, 'load_config', lambda p: c)
+    monkeypatch.setattr(nginx_apply, 'load_config', lambda p: c)
     policy = tmp_path / 'policy.json'
     (tmp_path / 'site.conf').symlink_to(tmp_path / 'active.conf')
     policy.write_text(json.dumps(dict(site_link=str(tmp_path / 'site.conf'), cache_dir='/var/cache/nginx/repo', access_log='/var/log/nginx/repo.log',
@@ -898,10 +909,10 @@ def test_apply_rolls_back_probe_files_together_with_active_conf(tmp_path, monkey
         calls.append(args)
         if len(calls) == 1:
             raise subprocess.CalledProcessError(1, args)
-    monkeypatch.setattr(nginx.subprocess, 'run', run)
+    monkeypatch.setattr(nginx_apply.subprocess, 'run', run)
 
     with pytest.raises(ConfigError, match='restored'):
-        nginx.apply('config', str(policy))
+        nginx_apply.apply('config', str(policy))
     assert active.read_text() == '# previous working\n'
     assert probe_conf_path.read_text() == '# previous probe conf\n'
     assert probe_js_path.read_text() == '// previous probe js\n'
@@ -914,21 +925,21 @@ def test_apply_detects_a_probe_only_content_change_not_just_active_conf(tmp_path
     probe-only change must not be missed either) would silently never
     apply — the same class of bug purge/dedup's own noop checks already
     guard against."""
-    monkeypatch.setattr(nginx, '_check_policy_owner', lambda p: None)
+    monkeypatch.setattr(nginx_apply, '_check_policy_owner', lambda p: None)
     c = config([apt()])
-    monkeypatch.setattr(nginx, 'load_config', lambda p: c)
+    monkeypatch.setattr(nginx_apply, 'load_config', lambda p: c)
     policy = tmp_path / 'policy.json'
     (tmp_path / 'site.conf').symlink_to(tmp_path / 'active.conf')
     policy.write_text(json.dumps(dict(site_link=str(tmp_path / 'site.conf'), cache_dir='/var/cache/nginx/repo', access_log='/var/log/nginx/repo.log',
                                      nginx_conf='/etc/nginx/nginx.conf', nginx_binary='/usr/sbin/nginx')))
-    monkeypatch.setattr(nginx.subprocess, 'run', lambda args, **kw: None)
-    assert nginx.apply('config', str(policy))
-    assert not nginx.apply('config', str(policy))
+    monkeypatch.setattr(nginx_apply.subprocess, 'run', lambda args, **kw: None)
+    assert nginx_apply.apply('config', str(policy))
+    assert not nginx_apply.apply('config', str(policy))
 
     c2 = replace(c, nginx=replace(c.nginx, enable_cache_probe=True))
-    monkeypatch.setattr(nginx, 'load_config', lambda p: c2)
-    assert nginx.apply('config', str(policy))
-    assert not nginx.apply('config', str(policy))
+    monkeypatch.setattr(nginx_apply, 'load_config', lambda p: c2)
+    assert nginx_apply.apply('config', str(policy))
+    assert not nginx_apply.apply('config', str(policy))
 
 
 def test_generated_probe_distinguishes_missing_files_from_io_errors(tmp_path):
@@ -938,7 +949,7 @@ def test_generated_probe_distinguishes_missing_files_from_io_errors(tmp_path):
         pytest.skip('node is required to execute generated JavaScript')
     c = config([apt()])
     c = replace(c, nginx=replace(c.nginx, enable_cache_probe=True))
-    source = nginx.render_probe_js(c).replace('export default {probe, scan};', '')
+    source = nginx_render.render_probe_js(c).replace('export default {probe, scan};', '')
     script = r'''
 const vm = require('vm');
 const assert = require('assert/strict');
@@ -979,7 +990,7 @@ def test_generated_scan_bounds_reads_and_closes_files(tmp_path):
         pytest.skip('node is required to execute generated JavaScript')
     c = config([apt()])
     c = replace(c, nginx=replace(c.nginx, enable_cache_probe=True))
-    source = nginx.render_probe_js(c).replace('export default {probe, scan};', '')
+    source = nginx_render.render_probe_js(c).replace('export default {probe, scan};', '')
     script = r'''
 const vm = require('vm');
 const assert = require('assert/strict');
@@ -1035,3 +1046,25 @@ assert.ok(run(Buffer.alloc(10), {readError: true}).response.error);
     path = tmp_path / 'bounded-scan-test.cjs'
     path.write_text(script)
     subprocess.run([node, str(path)], check=True, capture_output=True, text=True)
+
+
+@pytest.mark.parametrize('fail_at', range(1, 6))
+def test_apply_file_failure_restores_entire_generation(tmp_path, monkeypatch, fail_at):
+    policy, calls = setup_apply(tmp_path, monkeypatch)
+    names = ['purge.conf', 'dedup.map', 'probe.conf', 'probe.js', 'active.conf']
+    for name in names:
+        (tmp_path / name).write_text('# old ' + name)
+    write = nginx_apply._write
+    count = 0
+    def fail_once(path, data):
+        nonlocal count
+        count += 1
+        if count == fail_at:
+            raise OSError('simulated write failure')
+        write(path, data)
+    monkeypatch.setattr(nginx_apply, '_write', fail_once)
+    with pytest.raises(ConfigError, match='restored'):
+        nginx_apply.apply('config', str(policy))
+    for name in names:
+        assert (tmp_path / name).read_text() == '# old ' + name
+    assert json.loads((tmp_path / 'status.json').read_text())['rollback_failed'] is False

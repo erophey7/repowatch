@@ -8,33 +8,33 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from repowatch.api import (
-    STATIC_DIR,
-    add_repo_payload,
-    ban_package_payload,
-    banned_packages_payload,
-    cache_dir_stats,
-    delete_repo_payload,
-    healthz_payload,
-    metrics_payload,
-    prefetch_efficiency_payload,
-    purge_candidates_payload,
-    purge_selected_payload,
-    remove_warmed_package_payload,
-    repos_list_payload,
-    requests_summary_payload,
-    safe_config_payload,
-    stats_payload,
-    status_payload,
-    unban_package_payload,
-    update_repo_payload,
-    update_safe_config_payload,
-    warm_packages_payload,
-)
+from repowatch.web.handler import STATIC_DIR
+from repowatch.web.repositories import add_repo_payload
+from repowatch.web.packages import ban_package_payload
+from repowatch.web.packages import banned_packages_payload
+from repowatch.reporting.statistics import cache_dir_stats
+from repowatch.web.repositories import delete_repo_payload
+from repowatch.reporting.status import healthz_payload
+from repowatch.reporting.metrics import metrics_payload
+from repowatch.reporting.statistics import prefetch_efficiency_payload
+from repowatch.web.packages import purge_candidates_payload
+from repowatch.web.packages import purge_selected_payload
+from repowatch.web.packages import remove_warmed_package_payload
+from repowatch.reporting.status import repos_list_payload
+from repowatch.reporting.statistics import requests_summary_payload
+from repowatch.web.settings import safe_config_payload
+from repowatch.reporting.statistics import stats_payload
+from repowatch.reporting.status import status_payload
+from repowatch.web.packages import unban_package_payload
+from repowatch.web.repositories import update_repo_payload
+from repowatch.web.settings import update_safe_config_payload
+from repowatch.web.packages import warm_packages_payload
 from repowatch.auth import hash_password, verify_password
-from repowatch.access import AdminSession, digest
-from repowatch.config import load_config
-from repowatch.state import RepoSnapshot, StateStore
+from repowatch.storage.access import AdminSession
+from repowatch.storage.access import digest
+from repowatch.config.load import load_config
+from repowatch.models import RepoSnapshot
+from repowatch.runtime.context import ServiceState
 
 
 def _write_config(tmp_path, repos_yaml: str, admin_password: str | None = None):
@@ -70,7 +70,7 @@ def _setup(tmp_path, admin_password: str | None = None):
         admin_password=admin_password,
     )
     config = load_config(config_path)
-    store = StateStore(config.state_db)
+    store = ServiceState(config.state_db)
     return config_path, store
 
 
@@ -103,13 +103,13 @@ def test_repos_list_payload_exposes_key_expiry_and_warning_flag(tmp_path):
     assert data[0]["key_expiring_soon"] is False
 
     far_future = (datetime.now(timezone.utc) + timedelta(days=200)).isoformat(timespec="seconds")
-    store.record_key_expiry("alpine-test", far_future)
+    store.repositories.record_key_expiry("alpine-test", far_future)
     status, data = repos_list_payload(config_path, store)
     assert data[0]["key_expires_at"] == far_future
     assert data[0]["key_expiring_soon"] is False
 
     soon = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat(timespec="seconds")
-    store.record_key_expiry("alpine-test", soon)
+    store.repositories.record_key_expiry("alpine-test", soon)
     status, data = repos_list_payload(config_path, store)
     assert data[0]["key_expires_at"] == soon
     assert data[0]["key_expiring_soon"] is True
@@ -117,7 +117,7 @@ def test_repos_list_payload_exposes_key_expiry_and_warning_flag(tmp_path):
 
 def test_repos_list_payload_reflects_recorded_snapshot(tmp_path):
     config_path, store = _setup(tmp_path)
-    store.record_snapshot(
+    store.repositories.record_snapshot(
         RepoSnapshot(repo_id="alpine-test", packages={"musl-1.2.5-r0": "musl-1.2.5-r0.apk"})
     )
 
@@ -133,7 +133,7 @@ def test_repos_list_payload_falls_back_to_computed_count_when_package_count_is_n
     hand via SQL) read it as NULL — repos_list_payload must compute
     package_count from packages_json instead of returning None/0."""
     config_path, store = _setup(tmp_path)
-    with store._connect() as conn:
+    with store.database.connect() as conn:
         conn.execute(
             "INSERT INTO repo_state (repo_id, last_check, changed_at, package_count) "
             "VALUES (?, ?, NULL, NULL)",
@@ -270,14 +270,14 @@ def test_warm_packages_payload_unknown_repo_404(tmp_path):
 
 def test_warm_packages_payload_warms_only_known_keys(tmp_path):
     config_path, store = _setup(tmp_path, admin_password="secret123")
-    store.record_snapshot(
+    store.repositories.record_snapshot(
         RepoSnapshot(
             repo_id="alpine-test",
             packages={"musl-1.2.5-r0": "musl-1.2.5-r0.apk", "zlib-1.3-r0": "zlib-1.3-r0.apk"},
         )
     )
 
-    with patch("repowatch.api.warm_cache", return_value={"musl-1.2.5-r0": True}) as mock_warm_cache:
+    with patch("repowatch.operations.warm.warm_cache", return_value={"musl-1.2.5-r0": True}) as mock_warm_cache:
         status, data = warm_packages_payload(
             config_path, store, "alpine-test", _session(config_path, "secret123"),
             {"package_keys": ["musl-1.2.5-r0", "does-not-exist-1.0-r0"]},
@@ -301,7 +301,7 @@ def test_banned_packages_payload_unknown_repo_404(tmp_path):
 
 def test_banned_packages_payload_empty_by_default(tmp_path):
     config_path, store = _setup(tmp_path)
-    store.record_snapshot(RepoSnapshot(repo_id="alpine-test", packages={}))
+    store.repositories.record_snapshot(RepoSnapshot(repo_id="alpine-test", packages={}))
 
     status, data = banned_packages_payload(config_path, store, "alpine-test")
 
@@ -398,7 +398,7 @@ def test_remove_warmed_package_disabled_without_admin_password(tmp_path):
 
 def test_remove_warmed_package_removes_existing_entry(tmp_path):
     config_path, store = _setup(tmp_path, admin_password="secret123")
-    store.record_warmed_package("alpine-test", "musl-1.2.5-r0", "musl-1.2.5-r0.apk", True, 200)
+    store.cache.record_warmed_package("alpine-test", "musl-1.2.5-r0", "musl-1.2.5-r0.apk", True, 200)
 
     status, data = remove_warmed_package_payload(
         config_path, store, "alpine-test", _session(config_path, "secret123"), {"package_keys": ["musl-1.2.5-r0"]}
@@ -406,14 +406,14 @@ def test_remove_warmed_package_removes_existing_entry(tmp_path):
 
     assert status == 200
     assert data["removed"] == 1
-    assert store.get_warmed_packages("alpine-test") == []
+    assert store.cache.get_warmed_packages("alpine-test") == []
 
 
 def test_remove_multiple_warmed_packages_at_once(tmp_path):
     config_path, store = _setup(tmp_path, admin_password="secret123")
-    store.record_warmed_package("alpine-test", "a-1", "a-1.apk", True, 200)
-    store.record_warmed_package("alpine-test", "b-1", "b-1.apk", True, 200)
-    store.record_warmed_package("alpine-test", "c-1", "c-1.apk", True, 200)
+    store.cache.record_warmed_package("alpine-test", "a-1", "a-1.apk", True, 200)
+    store.cache.record_warmed_package("alpine-test", "b-1", "b-1.apk", True, 200)
+    store.cache.record_warmed_package("alpine-test", "c-1", "c-1.apk", True, 200)
 
     status, data = remove_warmed_package_payload(
         config_path, store, "alpine-test", _session(config_path, "secret123"),
@@ -422,7 +422,7 @@ def test_remove_multiple_warmed_packages_at_once(tmp_path):
 
     assert status == 200
     assert data["removed"] == 2  # only a-1/c-1 actually existed
-    assert {p["package_key"] for p in store.get_warmed_packages("alpine-test")} == {"b-1"}
+    assert {p["package_key"] for p in store.cache.get_warmed_packages("alpine-test")} == {"b-1"}
 
 
 @pytest.mark.parametrize("body", [{}, {"package_key": "x"}, {"package_keys": []}, {"package_keys": "x"}])
@@ -437,7 +437,7 @@ def test_remove_warmed_package_requires_a_nonempty_package_keys_list(tmp_path, b
 
 def test_remove_warmed_package_stays_bookkeeping_only_when_purge_is_off(tmp_path):
     config_path, store = _setup_purge(tmp_path, enable_purge=False)
-    store.record_warmed_package("alpine-test", "musl-1.2.5-r0", "musl-1.2.5-r0.apk", True, 200)
+    store.cache.record_warmed_package("alpine-test", "musl-1.2.5-r0", "musl-1.2.5-r0.apk", True, 200)
 
     status, data = remove_warmed_package_payload(
         config_path, store, "alpine-test", _session(config_path, "secret123"),
@@ -446,7 +446,7 @@ def test_remove_warmed_package_stays_bookkeeping_only_when_purge_is_off(tmp_path
 
     assert status == 200
     assert data == {"removed": 1}  # no purge_results — no purge mechanism to call
-    assert store.get_warmed_packages("alpine-test") == []
+    assert store.cache.get_warmed_packages("alpine-test") == []
 
 
 def test_remove_warmed_package_also_purges_when_enable_purge_is_on(tmp_path, monkeypatch):
@@ -461,9 +461,9 @@ def test_remove_warmed_package_also_purges_when_enable_purge_is_on(tmp_path, mon
     confirmed-gone keys ("purged"/"not_cached") lose their tracking row, an
     errored one stays trackable for a retry."""
     config_path, store = _setup_purge(tmp_path)
-    store.record_warmed_package("alpine-test", "purged-1", "purged-1.apk", True, 200)
-    store.record_warmed_package("alpine-test", "already-gone-1", "already-gone-1.apk", True, 200)
-    store.record_warmed_package("alpine-test", "flaky-1", "flaky-1.apk", True, 200)
+    store.cache.record_warmed_package("alpine-test", "purged-1", "purged-1.apk", True, 200)
+    store.cache.record_warmed_package("alpine-test", "already-gone-1", "already-gone-1.apk", True, 200)
+    store.cache.record_warmed_package("alpine-test", "flaky-1", "flaky-1.apk", True, 200)
 
     async def fake_purge_selected(config, repo, items):
         assert items == {
@@ -473,7 +473,7 @@ def test_remove_warmed_package_also_purges_when_enable_purge_is_on(tmp_path, mon
         }
         return {"purged-1": "purged", "already-gone-1": "not_cached", "flaky-1": "error (timeout)"}
 
-    monkeypatch.setattr("repowatch.api.purge_selected", fake_purge_selected)
+    monkeypatch.setattr("repowatch.operations.cleanup.purge_selected", fake_purge_selected)
 
     status, data = remove_warmed_package_payload(
         config_path, store, "alpine-test", _session(config_path, "secret123"),
@@ -483,22 +483,22 @@ def test_remove_warmed_package_also_purges_when_enable_purge_is_on(tmp_path, mon
     assert status == 200
     assert data["purge_results"] == {"purged-1": "purged", "already-gone-1": "not_cached", "flaky-1": "error (timeout)"}
     assert data["removed"] == 2  # purged-1, already-gone-1 (+ not-actually-warmed, never tracked)
-    remaining = {p["package_key"] for p in store.get_warmed_packages("alpine-test")}
+    remaining = {p["package_key"] for p in store.cache.get_warmed_packages("alpine-test")}
     assert remaining == {"flaky-1"}  # only the errored one survives for a retry
 
 
 def test_remove_warmed_package_uses_cache_probe_when_enable_cache_probe_is_on(tmp_path, monkeypatch):
     """Same mechanism-selection as purge_selected_payload (2026-09-14)."""
     config_path, store = _setup_purge(tmp_path, enable_cache_probe=True)
-    store.record_warmed_package("alpine-test", "a-1", "a-1.apk", True, 200)
+    store.cache.record_warmed_package("alpine-test", "a-1", "a-1.apk", True, 200)
 
     def boom(*a, **kw):
         raise AssertionError("prefetch.purge_selected must not be called when enable_cache_probe is on")
-    monkeypatch.setattr("repowatch.api.purge_selected", boom)
+    monkeypatch.setattr("repowatch.operations.cleanup.purge_selected", boom)
 
     async def fake_purge_selected_raw(config, repo, items):
         return {"a-1": "purged"}
-    monkeypatch.setattr("repowatch.cache_probe.purge_selected_raw", fake_purge_selected_raw)
+    monkeypatch.setattr("repowatch.cache.probe.purge_selected_raw", fake_purge_selected_raw)
 
     status, data = remove_warmed_package_payload(
         config_path, store, "alpine-test", _session(config_path, "secret123"), {"package_keys": ["a-1"]},
@@ -506,7 +506,7 @@ def test_remove_warmed_package_uses_cache_probe_when_enable_cache_probe_is_on(tm
 
     assert status == 200
     assert data["purge_results"] == {"a-1": "purged"}
-    assert store.get_warmed_packages("alpine-test") == []
+    assert store.cache.get_warmed_packages("alpine-test") == []
 
 
 def test_remove_warmed_package_unknown_repo_404(tmp_path):
@@ -532,7 +532,7 @@ def test_healthz_ok_when_never_checked(tmp_path):
 
 def test_healthz_ok_right_after_check(tmp_path):
     config_path, store = _setup(tmp_path)
-    store.record_snapshot(RepoSnapshot(repo_id="alpine-test", packages={}))
+    store.repositories.record_snapshot(RepoSnapshot(repo_id="alpine-test", packages={}))
 
     status, data = healthz_payload(config_path, store)
 
@@ -541,7 +541,7 @@ def test_healthz_ok_right_after_check(tmp_path):
 
 
 def _set_last_check(store, repo_id: str, when) -> None:
-    with store._connect() as conn:
+    with store.database.connect() as conn:
         conn.execute(
             "INSERT INTO repo_state (repo_id, last_check, changed_at) "
             "VALUES (?, ?, NULL) "
@@ -585,10 +585,10 @@ def test_healthz_ok_on_broken_config(tmp_path):
 
 def test_metrics_payload_includes_repo_gauges(tmp_path):
     config_path, store = _setup(tmp_path)
-    store.record_snapshot(
+    store.repositories.record_snapshot(
         RepoSnapshot(repo_id="alpine-test", packages={"musl-1.2.5-r0": "musl-1.2.5-r0.apk"})
     )
-    store.record_warmed_package("alpine-test", "musl-1.2.5-r0", "musl-1.2.5-r0.apk", True, 200)
+    store.cache.record_warmed_package("alpine-test", "musl-1.2.5-r0", "musl-1.2.5-r0.apk", True, 200)
 
     status, body = metrics_payload(config_path, store)
 
@@ -603,7 +603,7 @@ def test_metrics_payload_includes_repo_gauges(tmp_path):
 
 def test_metrics_payload_falls_back_to_computed_count_when_package_count_is_null(tmp_path):
     config_path, store = _setup(tmp_path)
-    with store._connect() as conn:
+    with store.database.connect() as conn:
         conn.execute(
             "INSERT INTO repo_state (repo_id, last_check, changed_at, package_count) "
             "VALUES (?, ?, NULL, NULL)",
@@ -636,9 +636,9 @@ def test_metrics_payload_extended_gauges(tmp_path):
     # off explicitly to test the "no request gauges" case below.
     config_path.write_text(config_path.read_text() + "\nsyslog_listener:\n  enabled: false\n")
     _set_last_check(store, "alpine-test", datetime.now(timezone.utc) - timedelta(seconds=1000))
-    store.bump_failure("alpine-test", "gpg", "bad signature")
-    store.bump_failure("alpine-test", "gpg", "bad signature")
-    store.ban_package("alpine-test", "musl")
+    store.notifications.bump_failure("alpine-test", "gpg", "bad signature")
+    store.notifications.bump_failure("alpine-test", "gpg", "bad signature")
+    store.cache.ban_package("alpine-test", "musl")
 
     status, body = metrics_payload(config_path, store)
 
@@ -663,13 +663,13 @@ def test_metrics_payload_key_expiry_gauges(tmp_path):
     assert 'repowatch_repo_key_expiring_soon{repo_id="alpine-test"}' not in body
 
     soon = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat(timespec="seconds")
-    store.record_key_expiry("alpine-test", soon)
+    store.repositories.record_key_expiry("alpine-test", soon)
     status, body = metrics_payload(config_path, store)
     assert 'repowatch_repo_key_expires_at_timestamp_seconds{repo_id="alpine-test"}' in body
     assert 'repowatch_repo_key_expiring_soon{repo_id="alpine-test"} 1' in body
 
     far_future = (datetime.now(timezone.utc) + timedelta(days=200)).isoformat(timespec="seconds")
-    store.record_key_expiry("alpine-test", far_future)
+    store.repositories.record_key_expiry("alpine-test", far_future)
     status, body = metrics_payload(config_path, store)
     assert 'repowatch_repo_key_expiring_soon{repo_id="alpine-test"} 0' in body
 
@@ -679,7 +679,7 @@ def test_metrics_payload_includes_request_gauges_only_when_syslog_listener_enabl
     # syslog_listener.enabled defaults to True since 2026-09-14 — start
     # from explicitly off to actually exercise the "disabled" half below.
     config_path.write_text(config_path.read_text() + "\nsyslog_listener:\n  enabled: false\n")
-    with store._connect() as conn:
+    with store.database.connect() as conn:
         conn.execute(
             "INSERT INTO request_events (ts, repo_id, client_ip, method, path, status, cache_status) "
             "VALUES (?, ?, ?, 'GET', '/alpine/x', '200', ?)",
@@ -738,9 +738,9 @@ repos:
 
 def test_requests_summary_payload_shape(tmp_path):
     _config_path, store = _setup(tmp_path)
-    store.record_request("alpine-test", "1.1.1.1", "GET", "/x.apk", "200", "HIT")
-    store.record_request("alpine-test", "1.1.1.1", "GET", "/x.apk", "200", "HIT")
-    store.record_request("alpine-test", "2.2.2.2", "GET", "/y.apk", "200", "MISS")
+    store.requests.record_request("alpine-test", "1.1.1.1", "GET", "/x.apk", "200", "HIT")
+    store.requests.record_request("alpine-test", "1.1.1.1", "GET", "/x.apk", "200", "HIT")
+    store.requests.record_request("alpine-test", "2.2.2.2", "GET", "/y.apk", "200", "MISS")
 
     status, data = requests_summary_payload(store, repo_id=None)
 
@@ -755,8 +755,8 @@ def test_requests_summary_payload_shape(tmp_path):
 
 def test_requests_summary_payload_timeline_respects_repo_filter(tmp_path):
     _config_path, store = _setup(tmp_path)
-    store.record_request("alpine-test", "1.1.1.1", "GET", "/x.apk", "200", "HIT")
-    store.record_request("other-repo", "9.9.9.9", "GET", "/z.apk", "200", "HIT")
+    store.requests.record_request("alpine-test", "1.1.1.1", "GET", "/x.apk", "200", "HIT")
+    store.requests.record_request("other-repo", "9.9.9.9", "GET", "/z.apk", "200", "HIT")
 
     status, data = requests_summary_payload(store, repo_id="alpine-test")
 
@@ -768,7 +768,7 @@ def test_prefetch_efficiency_payload(tmp_path):
     _config_path, store = _setup(tmp_path)
     assert prefetch_efficiency_payload(store) == (200, {"items": []})
 
-    store.record_warmed_package("alpine-test", "musl-1.2.5-r0", "musl-1.2.5-r0.apk", True, 200, source="prefetch")
+    store.cache.record_warmed_package("alpine-test", "musl-1.2.5-r0", "musl-1.2.5-r0.apk", True, 200, source="prefetch")
     status, data = prefetch_efficiency_payload(store)
     assert status == 200
     assert data == {"items": [{"repo_id": "alpine-test", "prefetched": 1, "used": 0, "ratio": 0.0}]}
@@ -776,8 +776,8 @@ def test_prefetch_efficiency_payload(tmp_path):
 
 def test_requests_summary_payload_filters_by_repo(tmp_path):
     _config_path, store = _setup(tmp_path)
-    store.record_request("alpine-test", "1.1.1.1", "GET", "/x.apk", "200", "HIT")
-    store.record_request("other-repo", "9.9.9.9", "GET", "/z.apk", "200", "HIT")
+    store.requests.record_request("alpine-test", "1.1.1.1", "GET", "/x.apk", "200", "HIT")
+    store.requests.record_request("other-repo", "9.9.9.9", "GET", "/z.apk", "200", "HIT")
 
     status, data = requests_summary_payload(store, repo_id="alpine-test")
 
@@ -900,16 +900,18 @@ def test_delete_repo_unknown_repo_404(tmp_path):
     assert status == 404
 
 
-def test_delete_repo_rejects_deleting_last_repo(tmp_path):
+def test_delete_last_repo_leaves_valid_empty_configuration(tmp_path):
     config_path, _store = _setup(tmp_path, admin_password="secret123")
 
     status, data = delete_repo_payload(config_path, _session(config_path, "secret123"), "alpine-test")
 
-    assert status == 400
-    assert "error" in data
-    # the config must be left untouched
-    reloaded = load_config(config_path)
-    assert reloaded.repo_by_id("alpine-test") is not None
+    assert status == 200
+    assert data == {"deleted": "alpine-test"}
+    assert load_config(config_path).repos == []
+    assert repos_list_payload(config_path, _store) == (200, [])
+    add_status, _ = add_repo_payload(config_path, _session(config_path, "secret123"), NEW_REPO_BODY)
+    assert add_status == 201
+    assert load_config(config_path).repo_by_id(NEW_REPO_BODY['id']) is not None
 
 
 def test_delete_repo_succeeds_and_persists(tmp_path):
@@ -1054,7 +1056,7 @@ def test_update_safe_config_clears_optional_field_with_empty_string(tmp_path):
 
 def test_sustained_gets_from_same_ip_have_no_request_quota(tmp_path):
     from unittest.mock import Mock
-    from repowatch.api import make_handler
+    from repowatch.web.handler import make_handler
     config_path, store = _setup(tmp_path)
     handler_class = make_handler(load_config(config_path), store, config_path)
     handler = object.__new__(handler_class)
@@ -1062,10 +1064,10 @@ def test_sustained_gets_from_same_ip_have_no_request_quota(tmp_path):
     handler.path = '/status.json'
     handler._json = Mock()
     from email.message import Message
-    from repowatch.access import AccessStore
+    from repowatch.storage.access import AccessStore
     handler.headers = Message()
     handler.headers['Host'] = 'localhost'
-    handler.headers['Authorization'] = 'Bearer ' + AccessStore(store).create_token('test')['token']
+    handler.headers['Authorization'] = 'Bearer ' + AccessStore(store.database).create_token('test')['token']
     handler.client_address = ('127.0.0.1', 1234)
     handler.connection = object()
 
@@ -1090,10 +1092,10 @@ def test_dnf_repo_can_be_added_and_has_cache_browse_url(tmp_path):
 
 def test_dashboard_health_and_metrics_do_not_read_package_change_lists(tmp_path, monkeypatch):
     config_path, store = _setup(tmp_path)
-    store.record_snapshot(RepoSnapshot('alpine-test', {'one-1': 'one.apk'}))
+    store.repositories.record_snapshot(RepoSnapshot('alpine-test', {'one-1': 'one.apk'}))
     def unexpected_full_status(*args, **kwargs):
         raise AssertionError('lightweight API must not fetch full event lists')
-    monkeypatch.setattr(store, 'get_status', unexpected_full_status)
+    monkeypatch.setattr(store.repositories, 'get_status', unexpected_full_status)
     assert repos_list_payload(config_path, store)[0] == 200
     assert healthz_payload(config_path, store)[0] == 200
     assert metrics_payload(config_path, store)[0] == 200
@@ -1104,17 +1106,17 @@ def test_minimal_status_lifecycle(tmp_path):
     assert status_payload(config_path, store) == (200, {
         'alpine-test': {'last_check': None, 'changed_at': None, 'stale': True, 'pending_replacements': 0},
     })
-    store.record_snapshot(RepoSnapshot('alpine-test', {'one-1': 'one.apk'}))
+    store.repositories.record_snapshot(RepoSnapshot('alpine-test', {'one-1': 'one.apk'}))
     code, first = status_payload(config_path, store, 'alpine-test')
     assert code == 200
     assert set(first) == {'last_check', 'changed_at', 'stale', 'pending_replacements'}
     assert first['changed_at'] and first['stale'] is False
-    store.touch_last_check('alpine-test')
+    store.repositories.touch_last_check('alpine-test')
     assert status_payload(config_path, store, 'alpine-test')[1]['changed_at'] == first['changed_at']
-    with store._connect() as conn:
+    with store.database.connect() as conn:
         conn.execute('UPDATE repo_state SET last_check = ?', ('2000-01-01T00:00:00+00:00',))
     assert status_payload(config_path, store, 'alpine-test')[1]['stale'] is True
-    store.record_snapshot(RepoSnapshot('orphan', {'one': 'one.apk'}))
+    store.repositories.record_snapshot(RepoSnapshot('orphan', {'one': 'one.apk'}))
     assert set(status_payload(config_path, store)[1]) == {'alpine-test'}
     assert status_payload(config_path, store, 'orphan')[0] == 404
     config_path.write_text('repos: [')
@@ -1124,22 +1126,22 @@ def test_minimal_status_lifecycle(tmp_path):
 def test_status_routes_ignore_large_history(tmp_path, monkeypatch):
     import json
     from unittest.mock import Mock
-    from repowatch.api import make_handler
+    from repowatch.web.handler import make_handler
     config_path, store = _setup(tmp_path)
-    store.record_snapshot(RepoSnapshot('alpine-test', {'one': 'one.apk'}))
+    store.repositories.record_snapshot(RepoSnapshot('alpine-test', {'one': 'one.apk'}))
     # A million historical keys must not be loaded by either status route.
-    with store._connect() as conn:
+    with store.database.connect() as conn:
         conn.execute('UPDATE repo_events SET new_pkgs_json = ?', (json.dumps(['package'] * 1_000_000),))
     def forbidden(*args, **kwargs):
         raise AssertionError('status must not load full history')
-    monkeypatch.setattr(store, 'get_status', forbidden)
+    monkeypatch.setattr(store.repositories, 'get_status', forbidden)
     handler = object.__new__(make_handler(load_config(config_path), store, config_path))
     handler._json = Mock()
     from email.message import Message
-    from repowatch.access import AccessStore
+    from repowatch.storage.access import AccessStore
     handler.headers = Message()
     handler.headers['Host'] = 'localhost'
-    handler.headers['Authorization'] = 'Bearer ' + AccessStore(store).create_token('test')['token']
+    handler.headers['Authorization'] = 'Bearer ' + AccessStore(store.database).create_token('test')['token']
     handler.client_address = ('127.0.0.1', 1234)
     handler.connection = object()
 
@@ -1175,7 +1177,7 @@ def test_alt_schema_saved_and_conflicting_route_rejected_atomically(tmp_path):
 
 def test_stats_payload_reports_db_size_without_walking_the_cache_dir_by_default(tmp_path):
     config_path, store = _setup(tmp_path)
-    store.record_snapshot(RepoSnapshot("alpine-test", {"a-1": "a.apk"}))
+    store.repositories.record_snapshot(RepoSnapshot("alpine-test", {"a-1": "a.apk"}))
 
     status, payload = stats_payload(config_path, store)
 
@@ -1210,7 +1212,7 @@ nginx:
   cache_dir: {cache_dir}
 """,
     )
-    store = StateStore(load_config(config_path).state_db)
+    store = ServiceState(load_config(config_path).state_db)
 
     status, payload = stats_payload(config_path, store, include_cache_dir=True)
 
@@ -1260,7 +1262,7 @@ nginx:
   cache_dir: {missing}
 """,
     )
-    store = StateStore(load_config(config_path).state_db)
+    store = ServiceState(load_config(config_path).state_db)
 
     status, payload = stats_payload(config_path, store, include_cache_dir=True)
 
@@ -1288,7 +1290,7 @@ nginx:
   enable_cache_probe: true
 """,
     )
-    store = StateStore(load_config(config_path).state_db)
+    store = ServiceState(load_config(config_path).state_db)
 
     def handler(request):
         if request.url.params.get("dir") == "c/29":
@@ -1299,7 +1301,7 @@ nginx:
         return httpx.Response(200, json=[])
 
     real_async_client = httpx.AsyncClient
-    with patch("repowatch.cache_probe.httpx.AsyncClient",
+    with patch("repowatch.cache.probe.httpx.AsyncClient",
                lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
         status, payload = stats_payload(config_path, store, include_cache_dir=True)
 
@@ -1333,13 +1335,13 @@ nginx:
   enable_cache_probe: true
 """,
     )
-    store = StateStore(load_config(config_path).state_db)
+    store = ServiceState(load_config(config_path).state_db)
 
     def handler(request):
         raise httpx.ConnectError("refused", request=request)
 
     real_async_client = httpx.AsyncClient
-    with patch("repowatch.cache_probe.httpx.AsyncClient",
+    with patch("repowatch.cache.probe.httpx.AsyncClient",
                lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
         status, payload = stats_payload(config_path, store, include_cache_dir=True)
 
@@ -1361,15 +1363,15 @@ nginx:
 """,
         admin_password=admin_password,
     )
-    store = StateStore(load_config(config_path).state_db)
+    store = ServiceState(load_config(config_path).state_db)
     return config_path, store
 
 
 def test_purge_candidates_payload_lists_stale_warmed_entries_and_enable_purge_flag(tmp_path):
     config_path, store = _setup_purge(tmp_path)
-    store.record_snapshot(RepoSnapshot("alpine-test", {"keep-1": "keep-1.apk"}))
-    store.record_warmed_package("alpine-test", "keep-1", "keep-1.apk", True, 200)
-    store.record_warmed_package("alpine-test", "gone-1", "gone-1.apk", True, 200)
+    store.repositories.record_snapshot(RepoSnapshot("alpine-test", {"keep-1": "keep-1.apk"}))
+    store.cache.record_warmed_package("alpine-test", "keep-1", "keep-1.apk", True, 200)
+    store.cache.record_warmed_package("alpine-test", "gone-1", "gone-1.apk", True, 200)
 
     status, payload = purge_candidates_payload(config_path, store, "alpine-test")
 
@@ -1417,7 +1419,7 @@ def test_purge_selected_payload_unknown_repo_404(tmp_path):
 
 def test_purge_selected_payload_400_when_enable_purge_is_off(tmp_path):
     config_path, store = _setup_purge(tmp_path, enable_purge=False)
-    store.record_warmed_package("alpine-test", "gone-1", "gone-1.apk", True, 200)
+    store.cache.record_warmed_package("alpine-test", "gone-1", "gone-1.apk", True, 200)
 
     status, payload = purge_selected_payload(
         config_path, store, "alpine-test", _session(config_path, "secret123"), {"package_keys": ["gone-1"]}
@@ -1442,9 +1444,9 @@ def test_purge_selected_payload_purges_and_cleans_up_warmed_bookkeeping(tmp_path
     request body, and a confirmed outcome (purged/not_cached) removes the
     now-meaningless warmed_packages row so a re-scan doesn't show it again."""
     config_path, store = _setup_purge(tmp_path)
-    store.record_warmed_package("alpine-test", "purged-1", "purged-1.apk", True, 200)
-    store.record_warmed_package("alpine-test", "already-gone-1", "already-gone-1.apk", True, 200)
-    store.record_warmed_package("alpine-test", "flaky-1", "flaky-1.apk", True, 200)
+    store.cache.record_warmed_package("alpine-test", "purged-1", "purged-1.apk", True, 200)
+    store.cache.record_warmed_package("alpine-test", "already-gone-1", "already-gone-1.apk", True, 200)
+    store.cache.record_warmed_package("alpine-test", "flaky-1", "flaky-1.apk", True, 200)
 
     async def fake_purge_selected(config, repo, items):
         assert items == {
@@ -1457,7 +1459,7 @@ def test_purge_selected_payload_purges_and_cleans_up_warmed_bookkeeping(tmp_path
         }
         return {"purged-1": "purged", "already-gone-1": "not_cached", "flaky-1": "error (timeout)"}
 
-    monkeypatch.setattr("repowatch.api.purge_selected", fake_purge_selected)
+    monkeypatch.setattr("repowatch.operations.cleanup.purge_selected", fake_purge_selected)
 
     status, payload = purge_selected_payload(
         config_path, store, "alpine-test", _session(config_path, "secret123"),
@@ -1467,7 +1469,7 @@ def test_purge_selected_payload_purges_and_cleans_up_warmed_bookkeeping(tmp_path
     assert status == 200
     assert payload["results"] == {"purged-1": "purged", "already-gone-1": "not_cached", "flaky-1": "error (timeout)"}
     assert payload["not_found"] == ["not-actually-warmed"]
-    remaining = {p["package_key"] for p in store.get_warmed_packages("alpine-test")}
+    remaining = {p["package_key"] for p in store.cache.get_warmed_packages("alpine-test")}
     assert remaining == {"flaky-1"}  # only the errored one survives for a retry
 
 
@@ -1476,17 +1478,17 @@ def test_purge_selected_payload_uses_cache_probe_when_enable_cache_probe_is_on(t
     cache_probe.purge_selected_raw() instead of
     prefetch.purge_selected(), not just fall back to it."""
     config_path, store = _setup_purge(tmp_path, enable_cache_probe=True)
-    store.record_warmed_package("alpine-test", "a-1", "a-1.apk", True, 200)
+    store.cache.record_warmed_package("alpine-test", "a-1", "a-1.apk", True, 200)
 
     def boom(*a, **kw):
         raise AssertionError("prefetch.purge_selected must not be called when enable_cache_probe is on")
-    monkeypatch.setattr("repowatch.api.purge_selected", boom)
+    monkeypatch.setattr("repowatch.operations.cleanup.purge_selected", boom)
 
     calls = []
     async def fake_purge_selected_raw(config, repo, items):
         calls.append((repo.id, items))
         return {"a-1": "purged"}
-    monkeypatch.setattr("repowatch.cache_probe.purge_selected_raw", fake_purge_selected_raw)
+    monkeypatch.setattr("repowatch.cache.probe.purge_selected_raw", fake_purge_selected_raw)
 
     status, payload = purge_selected_payload(
         config_path, store, "alpine-test", _session(config_path, "secret123"), {"package_keys": ["a-1"]},
@@ -1495,7 +1497,7 @@ def test_purge_selected_payload_uses_cache_probe_when_enable_cache_probe_is_on(t
     assert status == 200
     assert payload["results"] == {"a-1": "purged"}
     assert calls == [("alpine-test", {"a-1": "a-1.apk"})]
-    assert store.get_warmed_packages("alpine-test") == []
+    assert store.cache.get_warmed_packages("alpine-test") == []
 
 
 @pytest.mark.parametrize('action', [purge_selected_payload, remove_warmed_package_payload])
@@ -1512,31 +1514,32 @@ nginx:
   enable_cache_probe: true
   enable_dedup: true
 ''', admin_password='secret123')
-    store = StateStore(load_config(config_path).state_db)
-    store.record_warmed_package('core', 'foo', 'foo.pkg.tar.zst', True, 200)
+    store = ServiceState(load_config(config_path).state_db)
+    store.cache.record_warmed_package('core', 'foo', 'foo.pkg.tar.zst', True, 200)
     responses = iter([404, 503, 404, 200])
     def handler(request):
         return httpx.Response(next(responses))
     real_client = httpx.AsyncClient
-    monkeypatch.setattr('repowatch.cache_probe.httpx.AsyncClient',
+    monkeypatch.setattr('repowatch.cache.probe.httpx.AsyncClient',
                         lambda **kw: real_client(transport=httpx.MockTransport(handler)))
     session = _session(config_path, 'secret123')
     status, payload = action(config_path, store, 'core', session, {'package_keys': ['foo']})
     result_field = 'results' if action is purge_selected_payload else 'purge_results'
     assert status == 200
     assert payload[result_field]['foo'] == 'error (HTTP 503)'
-    assert [row['package_key'] for row in store.get_warmed_packages('core')] == ['foo']
+    assert [row['package_key'] for row in store.cache.get_warmed_packages('core')] == ['foo']
     status, payload = action(config_path, store, 'core', session, {'package_keys': ['foo']})
     assert status == 200
     assert payload[result_field]['foo'] == 'purged'
-    assert store.get_warmed_packages('core') == []
+    assert store.cache.get_warmed_packages('core') == []
 
 
 @pytest.mark.parametrize('action', [purge_selected_payload, remove_warmed_package_payload])
 @pytest.mark.parametrize('canonical_status', [200, 503])
 def test_purge_duplicate_checks_shared_canonical_copy(tmp_path, monkeypatch, action, canonical_status):
     import httpx
-    from repowatch.nginx import compute_cache_key, resolve_dedup_pairs
+    from repowatch.routing import compute_cache_key
+    from repowatch.nginx.render import resolve_dedup_pairs
     config_path = _write_config(tmp_path, '''  - id: a
     type: dnf
     upstream: https://a.test/repo
@@ -1552,12 +1555,12 @@ nginx:
   enable_dedup: true
 ''', admin_password='secret123')
     config = load_config(config_path)
-    store = StateStore(config.state_db)
+    store = ServiceState(config.state_db)
     for repo_id in ('a', 'b'):
-        store.record_snapshot(RepoSnapshot(repo_id, {'foo-1': 'foo.rpm'},
+        store.repositories.record_snapshot(RepoSnapshot(repo_id, {'foo-1': 'foo.rpm'},
                                           content_hashes={'foo-1': 'a' * 64}))
-    store.record_warmed_package('b', 'foo-1', 'foo.rpm', True, 200)
-    assert resolve_dedup_pairs(config, store.find_duplicate_files()) == [('/rpm/b/foo.rpm', '/rpm/a/foo.rpm')]
+    store.cache.record_warmed_package('b', 'foo-1', 'foo.rpm', True, 200)
+    assert resolve_dedup_pairs(config, store.cache.find_duplicate_files()) == [('/rpm/b/foo.rpm', '/rpm/a/foo.rpm')]
     canonical_key = compute_cache_key(config, config.repo_by_id('a'), 'foo.rpm')
     seen = []
     def handler(request):
@@ -1565,7 +1568,7 @@ nginx:
         seen.append(key)
         return httpx.Response(canonical_status if key == canonical_key else 404)
     real_client = httpx.AsyncClient
-    monkeypatch.setattr('repowatch.cache_probe.httpx.AsyncClient',
+    monkeypatch.setattr('repowatch.cache.probe.httpx.AsyncClient',
                         lambda **kw: real_client(transport=httpx.MockTransport(handler)))
     status, payload = action(config_path, store, 'b', _session(config_path, 'secret123'),
                              {'package_keys': ['foo-1']})
@@ -1573,7 +1576,7 @@ nginx:
     assert status == 200
     assert seen.count(canonical_key) == 1
     assert payload[field]['foo-1'] == ('purged' if canonical_status == 200 else 'error (HTTP 503)')
-    assert bool(store.get_warmed_packages('b')) == (canonical_status != 200)
+    assert bool(store.cache.get_warmed_packages('b')) == (canonical_status != 200)
 
 
 def test_bandwidth_schedule_round_trip_and_invalid_update_is_atomic(tmp_path):
@@ -1613,9 +1616,9 @@ def test_manual_warm_reports_success_failure_and_policy_skip(tmp_path):
     from unittest.mock import AsyncMock
     config_path, store = _setup(tmp_path, admin_password='secret123')
     files = {'ok-1': 'ok.apk', 'bad-1': 'bad.apk', 'skip-1': 'skip.apk'}
-    store.record_snapshot(RepoSnapshot('alpine-test', files, {k: k[:-2] for k in files}))
-    store.ban_package('alpine-test', 'skip')
-    with patch('repowatch.prefetch._warm_one', new=AsyncMock(side_effect=[(True, 200), (False, 503)])):
+    store.repositories.record_snapshot(RepoSnapshot('alpine-test', files, {k: k[:-2] for k in files}))
+    store.cache.ban_package('alpine-test', 'skip')
+    with patch('repowatch.operations.warm.download_package', new=AsyncMock(side_effect=[(True, 200), (False, 503)])):
         status, data = warm_packages_payload(config_path, store, 'alpine-test',
             _session(config_path, 'secret123'), {'package_keys': list(files) + ['unknown-1']})
     assert status == 200
@@ -1624,10 +1627,88 @@ def test_manual_warm_reports_success_failure_and_policy_skip(tmp_path):
 
 def test_manual_warm_with_only_excluded_packages_reports_no_success(tmp_path):
     config_path, store = _setup(tmp_path, admin_password='secret123')
-    store.record_snapshot(RepoSnapshot('alpine-test', {'skip-1': 'skip.apk'}, {'skip-1': 'skip'}))
-    store.ban_package('alpine-test', 'skip')
-    with patch('repowatch.prefetch._warm_one') as fetch:
+    store.repositories.record_snapshot(RepoSnapshot('alpine-test', {'skip-1': 'skip.apk'}, {'skip-1': 'skip'}))
+    store.cache.ban_package('alpine-test', 'skip')
+    with patch('repowatch.operations.warm.download_package') as fetch:
         status, data = warm_packages_payload(config_path, store, 'alpine-test',
             _session(config_path, 'secret123'), {'package_keys': ['skip-1', 'skip-1']})
     assert status == 200 and data['warmed'] == [] and data['skipped'] == ['skip-1']
     fetch.assert_not_called()
+
+
+def test_repo_edit_rechecks_password_after_waiting_for_config_lock(tmp_path):
+    import threading
+    import yaml
+    from repowatch.config.edit import config_lock
+
+    path, _ = _setup(tmp_path, admin_password='old-password')
+    session = _session(path, 'old-password')
+    entered = threading.Event()
+    finished = threading.Event()
+    outcomes = []
+
+    def edit():
+        entered.set()
+        try:
+            outcomes.append(add_repo_payload(path, session, NEW_REPO_BODY))
+        finally:
+            finished.set()
+
+    with config_lock(path):
+        worker = threading.Thread(target=edit)
+        worker.start()
+        assert entered.wait(1)
+        assert not finished.wait(0.05)
+        raw = yaml.safe_load(path.read_text())
+        raw['admin_password_hash'] = hash_password('new-password')
+        path.write_text(yaml.safe_dump(raw))
+    worker.join(timeout=3)
+    assert not worker.is_alive()
+    assert outcomes == [(401, {'error': 'administrator session required'})]
+    assert load_config(path).repo_by_id(NEW_REPO_BODY['id']) is None
+
+
+def test_write_setup_reports_invalid_config_before_auth_or_body_errors(tmp_path):
+    path, store = _setup(tmp_path, admin_password='password')
+    path.write_text('repos: [')
+    expected = (500, {'error': 'config.yaml is currently invalid'})
+    assert add_repo_payload(path, None, None) == expected
+    assert purge_selected_payload(path, store, 'missing', None, None) == expected
+    assert path.read_text() == 'repos: ['
+
+
+@pytest.mark.parametrize('body', [
+    {'check_concurrency': 0}, {'prefetch_concurrency': 0},
+    {'warmed_retention_days': -1}, {'event_max_rows_per_repo': 0},
+    {'check_interval': True}, {'check_interval': 1.5},
+    {'request_max_rows': False}, {'request_max_rows': 2.5},
+])
+def test_unsafe_settings_leave_yaml_unchanged(tmp_path, body):
+    config_path, _ = _setup(tmp_path, admin_password='secret123')
+    session = _session(config_path, 'secret123')
+    original = config_path.read_bytes()
+    status, data = update_safe_config_payload(config_path, session, body)
+    assert status == 400
+    assert 'error' in data
+    assert config_path.read_bytes() == original
+
+
+def test_integer_form_input_preserves_numeric_strings(tmp_path):
+    config_path, _ = _setup(tmp_path, admin_password='secret123')
+    status, data = update_safe_config_payload(
+        config_path, _session(config_path, 'secret123'), {'check_interval': '60'})
+    assert status == 200
+    assert load_config(config_path).check_interval == 60
+
+
+def test_read_payload_keeps_the_authorized_config_snapshot(tmp_path):
+    from repowatch.config.load import load_config
+    from repowatch.reporting.status import status_payload, repos_list_payload
+    from repowatch.reporting.metrics import metrics_payload
+    config_path, store = _setup_purge(tmp_path)
+    current = load_config(config_path)
+    config_path.write_text('repos: [invalid')
+    assert status_payload(config_path, store, current=current)[0] == 200
+    assert repos_list_payload(config_path, store, current=current)[0] == 200
+    assert metrics_payload(config_path, store, current=current)[0] == 200
+    assert status_payload(config_path, store)[0] == 503

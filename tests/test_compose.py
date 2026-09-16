@@ -9,7 +9,7 @@ from unittest.mock import Mock
 import pytest
 import yaml
 
-from repowatch.config import ConfigError
+from repowatch.errors import ConfigError
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -28,6 +28,10 @@ SEED = ROOT / 'docker/compose/config.example.yaml'
 
 def test_trial_network_and_storage_boundaries():
     services = yaml.safe_load((ROOT / 'docker-compose.dev.yml').read_text())['services']
+    seed = yaml.safe_load(SEED.read_text())
+    assert seed['repos'] == []
+    assert seed['status_server']['guest_read_only'] is False
+    assert seed['status_server']['allow_insecure_http'] is True
     assert services['init']['network_mode'] == 'none'
     assert services['repowatch']['network_mode'] == 'service:nginx'
     assert services['repowatch']['depends_on']['nginx']['condition'] == 'service_healthy'
@@ -49,7 +53,7 @@ def test_initialize_preserves_existing_configuration_and_database(tmp_path):
     previous = os.umask(0o022)
     try:
         bootstrap.initialize(config, state, nix, SEED, owner=None)
-        data = (config / 'config.yaml').read_text().replace('Compose trial', 'Existing trial')
+        data = (config / 'config.yaml').read_text().replace('# Development stack:', '# Existing operator settings:')
         (config / 'config.yaml').write_text(data)
         import sqlite3
         with sqlite3.connect(state / 'state.sqlite3') as db:

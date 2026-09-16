@@ -1,3 +1,4 @@
+import repowatch.cache.probe as cache_probe
 import asyncio
 from pathlib import Path
 from unittest.mock import patch
@@ -5,8 +6,11 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from repowatch import cache_probe
-from repowatch.config import Config, NginxConfig, RepoConfig, StatusServerConfig
+import repowatch.cache.probe as cache_probe
+from repowatch.config.models import Config
+from repowatch.config.models import NginxConfig
+from repowatch.config.models import RepoConfig
+from repowatch.config.models import StatusServerConfig
 from repowatch.parsers.base import USER_AGENT
 
 
@@ -121,7 +125,7 @@ def test_full_inventory_queries_every_leaf_directory_and_flattens_results():
 
     real_async_client = httpx.AsyncClient
     async def run():
-        with patch('repowatch.cache_probe.httpx.AsyncClient',
+        with patch('repowatch.cache.probe.httpx.AsyncClient',
                    lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
             return await cache_probe.full_inventory('http://127.0.0.1:8080', concurrency=16)
 
@@ -153,7 +157,7 @@ def test_full_inventory_respects_the_concurrency_limit(monkeypatch):
 
     real_async_client = httpx.AsyncClient
     async def run():
-        with patch('repowatch.cache_probe.httpx.AsyncClient',
+        with patch('repowatch.cache.probe.httpx.AsyncClient',
                    lambda **kw: real_async_client(transport=httpx.MockTransport(async_handler))):
             await cache_probe.full_inventory('http://127.0.0.1:8080', concurrency=4)
 
@@ -169,7 +173,7 @@ def test_full_inventory_one_leaf_failure_does_not_abort_the_rest():
 
     real_async_client = httpx.AsyncClient
     async def run():
-        with patch('repowatch.cache_probe.httpx.AsyncClient',
+        with patch('repowatch.cache.probe.httpx.AsyncClient',
                    lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
             return await cache_probe.full_inventory('http://127.0.0.1:8080', concurrency=32)
 
@@ -194,7 +198,7 @@ def test_cache_dir_size_sums_bytes_and_flags_unreadable_keys(monkeypatch):
 
     real_async_client = httpx.AsyncClient
     async def run():
-        with patch('repowatch.cache_probe.httpx.AsyncClient',
+        with patch('repowatch.cache.probe.httpx.AsyncClient',
                    lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
             return await cache_probe.cache_dir_size('http://127.0.0.1:8080', concurrency=4)
 
@@ -221,7 +225,7 @@ def test_cache_dir_size_flags_incomplete_leaves_instead_of_silently_undercountin
 
     real_async_client = httpx.AsyncClient
     async def run():
-        with patch('repowatch.cache_probe.httpx.AsyncClient',
+        with patch('repowatch.cache.probe.httpx.AsyncClient',
                    lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
             return await cache_probe.cache_dir_size('http://127.0.0.1:8080', concurrency=4)
 
@@ -240,7 +244,7 @@ def test_cache_dir_size_propagates_a_connection_failure_instead_of_reporting_zer
 
     real_async_client = httpx.AsyncClient
     async def run():
-        with patch('repowatch.cache_probe.httpx.AsyncClient',
+        with patch('repowatch.cache.probe.httpx.AsyncClient',
                    lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
             return await cache_probe.cache_dir_size('http://127.0.0.1:8080')
 
@@ -339,7 +343,7 @@ def test_purge_selected_raw_computes_the_key_via_compute_cache_key_and_purges_ea
 
     real_async_client = httpx.AsyncClient
     async def run():
-        with patch('repowatch.cache_probe.httpx.AsyncClient',
+        with patch('repowatch.cache.probe.httpx.AsyncClient',
                    lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
             return await cache_probe.purge_selected_raw(config, repo, {
                 'bash-1-1': 'bash-1-1-x86_64.pkg.tar.zst',
@@ -380,7 +384,7 @@ def test_purge_selected_raw_falls_back_to_the_alternate_dedup_basis_on_a_miss():
 
     real_async_client = httpx.AsyncClient
     async def run():
-        with patch('repowatch.cache_probe.httpx.AsyncClient',
+        with patch('repowatch.cache.probe.httpx.AsyncClient',
                    lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
             return await cache_probe.purge_selected_raw(config, repo, {'bash-1-1': 'bash-1-1-x86_64.pkg.tar.zst'})
 
@@ -407,7 +411,7 @@ def test_purge_selected_raw_does_not_retry_when_current_and_alt_keys_are_identic
 
     real_async_client = httpx.AsyncClient
     async def run():
-        with patch('repowatch.cache_probe.httpx.AsyncClient',
+        with patch('repowatch.cache.probe.httpx.AsyncClient',
                    lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
             return await cache_probe.purge_selected_raw(config, repo, {'a-1': 'pool/main/a/a.deb'})
 
@@ -425,7 +429,7 @@ def test_purge_selected_raw_empty_items_is_a_noop():
 
     real_async_client = httpx.AsyncClient
     async def run():
-        with patch('repowatch.cache_probe.httpx.AsyncClient',
+        with patch('repowatch.cache.probe.httpx.AsyncClient',
                    lambda **kw: real_async_client(transport=httpx.MockTransport(boom))):
             return await cache_probe.purge_selected_raw(config, repo, {})
 
@@ -450,7 +454,7 @@ def test_purge_both_copies_and_preserve_any_failure(first, second, expected):
         seen.append(str(request.url))
         return httpx.Response(next(codes))
     real_client = httpx.AsyncClient
-    with patch('repowatch.cache_probe.httpx.AsyncClient',
+    with patch('repowatch.cache.probe.httpx.AsyncClient',
                lambda **kw: real_client(transport=httpx.MockTransport(handler))):
         result = asyncio.run(cache_probe.purge_selected_raw(config, repo, {'foo': 'foo.pkg.tar.zst'}))
     assert result == {'foo': expected}
@@ -465,7 +469,7 @@ def test_scan_reports_missing_sizes_separately_from_missing_keys(monkeypatch):
             {'file': 'stat-error', 'error': 'EACCES'},
         ])
     real_client = httpx.AsyncClient
-    with patch('repowatch.cache_probe.httpx.AsyncClient',
+    with patch('repowatch.cache.probe.httpx.AsyncClient',
                lambda **kw: real_client(transport=httpx.MockTransport(handler))):
         result = asyncio.run(cache_probe.cache_dir_size('http://localhost:8080'))
     assert result == {'size_bytes': 100, 'file_count': 2, 'unreadable_keys': 2, 'unreadable_sizes': 1}

@@ -11,14 +11,12 @@ import pytest
 
 from datetime import datetime, timedelta, timezone
 
-from repowatch.gpgverify import (
-    SignatureError,
-    _extract_clearsigned_body,
-    find_sha256_in_release,
-    soonest_key_expiry,
-    verify_clearsigned,
-    verify_detached,
-)
+from repowatch.errors import SignatureError
+from repowatch.verification.gpg import _extract_clearsigned_body
+from repowatch.verification.gpg import find_sha256_in_release
+from repowatch.verification.gpg import soonest_key_expiry
+from repowatch.verification.gpg import verify_clearsigned
+from repowatch.verification.gpg import verify_detached
 
 pytestmark = pytest.mark.skipif(
     not (shutil.which("gpg") and shutil.which("gpgv")),
@@ -248,5 +246,5 @@ def test_soonest_key_expiry_returns_none_for_empty_keyring(tmp_path):
 
 def test_soonest_key_expiry_returns_none_without_gpg_binary(monkeypatch, gpg_env):
     _env, keyring_path = gpg_env
-    monkeypatch.setattr("repowatch.gpgverify.shutil.which", lambda name: None)
+    monkeypatch.setattr("repowatch.verification.gpg.shutil.which", lambda name: None)
     assert soonest_key_expiry(keyring_path) is None

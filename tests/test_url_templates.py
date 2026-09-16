@@ -3,10 +3,15 @@ from pathlib import Path
 
 import pytest
 
-from repowatch.config import Config, ConfigError, RepoConfig, StatusServerConfig
-from repowatch.nginx import render
-from repowatch.prefetch import _apt_top_segment, _build_warm_url, _repo_url_prefix
-from repowatch.syslog_listener import match_repo_id
+from repowatch.config.models import Config
+from repowatch.errors import ConfigError
+from repowatch.config.models import RepoConfig
+from repowatch.config.models import StatusServerConfig
+from repowatch.nginx.render import render
+from repowatch.routing import apt_prefix
+from repowatch.routing import warm_url
+from repowatch.routing import repo_prefix
+from repowatch.runtime.syslog import match_repo_id
 from repowatch.url_templates import expand
 
 
@@ -23,7 +28,7 @@ def test_custom_template_shared_by_nginx_warm_and_syslog():
     r = repo(url_template='/{distro}/{arch}/{repo_name}/', url_variables={'distro':'archlinux'})
     c = config(r)
     assert expand(r) == '/archlinux/x86_64/core'
-    assert _build_warm_url(c, r, 'package.pkg.tar.zst') == 'http://cache:8080/archlinux/x86_64/core/package.pkg.tar.zst'
+    assert warm_url(c, r, 'package.pkg.tar.zst') == 'http://cache:8080/archlinux/x86_64/core/package.pkg.tar.zst'
     assert match_repo_id('/archlinux/x86_64/core/package.pkg.tar.zst', c.repos) == 'core'
     assert match_repo_id('/arch/core/os/x86_64/package.pkg.tar.zst', c.repos) is None
     text = render(c)
@@ -36,15 +41,15 @@ def test_apt_shared_root_keeps_component_pool_mapping():
     a = repo(type='apt', distribution='noble', component='main', upstream='https://example.test/ubuntu', url_template='/custom/{distribution}/')
     b = replace(a, id='universe', component='universe')
     c = config(a,b)
-    assert _apt_top_segment(a) == '/custom/noble'
-    assert _build_warm_url(c,a,'pool/main/a/a.deb') == 'http://cache:8080/custom/noble/pool/main/a/a.deb'
+    assert apt_prefix(a) == '/custom/noble'
+    assert warm_url(c,a,'pool/main/a/a.deb') == 'http://cache:8080/custom/noble/pool/main/a/a.deb'
     assert match_repo_id('/custom/noble/pool/universe/p/package.deb', c.repos) == 'universe'
     assert render(c).count('location /custom/noble/') == 1
 
 
 def test_apk_template_does_not_append_arch_twice():
     r = repo(type='apk', upstream='https://example.test/alpine/v3/main', url_template='/custom/{arch}/')
-    assert _repo_url_prefix(r) == '/custom/x86_64'
+    assert repo_prefix(r) == '/custom/x86_64'
     assert 'rewrite ^/custom/x86_64/(.*)$ /alpine/v3/main/x86_64/$1 break;' in render(config(r))
 
 
@@ -72,6 +77,6 @@ def test_custom_variables_are_safe_segments(variables):
 def test_defaults_unchanged_and_unused_variables_rejected():
     r=repo()
     assert expand(r) is None
-    assert _repo_url_prefix(r) == '/arch/core/os/x86_64'
+    assert repo_prefix(r) == '/arch/core/os/x86_64'
     with pytest.raises(ConfigError):
         repo(url_variables={'branch':'p11'})

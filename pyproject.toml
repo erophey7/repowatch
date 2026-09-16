@@ -14,10 +14,10 @@ dependencies = [
 ]
 
 [project.scripts]
-repowatch = "repowatch.cli:main"
+repowatch = "repowatch.cli.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-repowatch = ["static/*.html"]
+repowatch = ["static/*.html", "static/css/*.css", "static/js/*.js", "nginx/*.js"]

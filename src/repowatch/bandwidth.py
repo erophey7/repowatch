@@ -1,22 +1,21 @@
 """Process-wide warm bandwidth, shared across threads and asyncio loops.
 
-The application owns one budget through its StateStore. This is application
-read pacing, not a traffic shaper for nginx or unrelated client requests.
-"""
+The application owns one budget through its ServiceState. This is application
+read pacing, not a traffic shaper for nginx or unrelated client requests."""
+
 from __future__ import annotations
 
 import asyncio
+import logging
+import math
+import threading
+import time
+import yaml
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import logging
-import math
 from pathlib import Path
-import threading
-import time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
-import yaml
 
 DAYS = ('mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun')
 TICK = 0.05
@@ -150,7 +149,8 @@ class BandwidthBudget:
         return WarmBandwidthLimiter(self, repo.id)
 
     def _refresh(self) -> None:
-        from repowatch.config import ConfigError, load_config
+        from repowatch.errors import ConfigError
+        from repowatch.config.load import load_config
         with self._lock:
             now = time.monotonic()
             if self._path is None or now < self._next_reload:

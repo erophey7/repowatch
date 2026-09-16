@@ -20,6 +20,15 @@ see [access.md](access.md).
 
 ## Prerequisites
 
+For distribution-specific package commands and first login, start with
+[Quick start](quick-start.md). The shipped configuration has `repos: []`; it
+starts an administrative service and an empty nginx site. Add sources through
+[YAML or the dashboard](repositories.md) after installation.
+
+The shipped profile enables purge and cache inventory: install and load both
+`ngx_cache_purge` and the njs HTTP module from packages compatible with nginx.
+`make check` does not prove their availability; activation's `nginx -t` does.
+
 - Python 3.11+ with `venv` and `pip` available (some distros split `pip` out
   of the base Python package — `make check` will tell you if it's missing).
 - `nginx`, unless you're running the caching layer yourself and setting
@@ -46,7 +55,9 @@ disk or the network beyond reading local files.
 ```bash
 make check                                    # diagnostics only, safe to run any time
 sudo make install PREFIX=/usr/local           # builds wheels, lays down files — no services touched
+sudoedit /etc/repowatch/config.yaml            # review settings before activation
 sudo make activate                            # creates the system user, enables and starts services
+sudo -u repowatch /usr/local/bin/repowatch set-password
 ```
 
 `sudo` is required for `make install` itself with the defaults shown above
@@ -98,9 +109,14 @@ transaction) rather than reinstalling underneath a running process.
    recursive over an existing package cache (which may be large, and may
    sit on NFS).
 3. If `WITH_NGINX=1`: renders the cache `server` block from your
-   `config.yaml` (see `nginx.py` / [configuration.md](configuration.md)),
+   `config.yaml` (see `nginx/render.py` / [configuration.md](configuration.md)),
    validates it with `nginx -t`, and symlinks it into your nginx's enabled-
    sites directory — rolling back the symlink/file if validation fails.
+   Initial bootstrap publishes `active.conf`, `purge.conf`, `dedup.map`,
+   `probe.conf` and `probe.js` before validation. It reads existing dedup data
+   without creating SQLite as root; a fresh installation uses an empty map.
+   Failed writes/validation remove newly created bootstrap files and the link,
+   preserving pre-existing files.
    Also writes a small root-owned `policy.json` (cache dir, access log
    path, nginx binary, site-link path) that later reconciliation runs
    against — see the next section.
@@ -185,8 +201,8 @@ because a plain `cp`/`rsync` over a file the daemon is actively writing to
 (WAL mode) risks capturing it mid-transaction; the backup API produces a
 consistent snapshot without blocking the running service. Backups are
 gzip-compressed and rotated by age (`RETENTION_DAYS`, default 14 —
-noticeably longer than `event_retention_days`, since this is a full-state
-snapshot for disaster recovery, not a per-repository event log).
+independent of `event_retention_days`, which retains individual history rows
+in the live database).
 
 `config.yaml` itself is not backed up by this timer — back it up the way you
 back up any other config file under version control or your usual config-
@@ -320,6 +336,22 @@ a backup loop and an nginx-reconciliation loop in the same process — see
 `repowatch supervise --help` for the full flag list (intervals, retention).
 Nothing is auto-detected: leave out `--backup-dir`/`--nginx` to skip those
 parts entirely, same as not enabling the corresponding systemd timer.
+
+Both `run` and `supervise` bind HTTP/TLS and the enabled UDP socket before
+starting the watcher. Syslog must finish its initial index load within 30 seconds.
+A bind/TLS/startup failure aborts startup and releases prepared sockets. During
+operation, an unexpected watcher or mandatory listener exit terminates the
+service with an error; configure the process manager to restart it. Listener
+exits are checked every 100 ms when the event loop can run. Signals and external
+cancellation cancel and drain child coroutines, stop listener loops and remove
+the PID file. Blocking work already dispatched to a thread remains subject to
+its own timeout; this is not a hard real-time shutdown guarantee.
+
+Unexpected non-SQLite errors in an individual repository operation are logged
+and isolated from other repositories. Shared SQLite failures are fatal and
+cancel the current batch, so the service cannot continue retention with a known
+failed database or listener. `check-once` returns nonzero for these isolated
+operation failures; existing fetch-error logging behavior remains unchanged.
 
 **The `--nginx` root requirement, and what you give up without systemd.**
 Under systemd, nginx reconciliation deliberately runs as a *separate*

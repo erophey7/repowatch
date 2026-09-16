@@ -164,7 +164,7 @@ def restore_database(db, backup, metadata):
 
 
 def probe(python, config):
-    # Read config only, never instantiate StateStore against the live database.
+    # Read config only, never instantiate ServiceState against the live database.
     code = ('import json,sys; from repowatch.config import load_config; '
             'c=load_config(sys.argv[1]); print(json.dumps({"db":str(c.state_db),'
             '"bind":c.status_server.bind,"port":c.status_server.port,'

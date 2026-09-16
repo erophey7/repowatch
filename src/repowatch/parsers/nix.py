@@ -1,21 +1,20 @@
 """Nix package discovery using the optional system Nix CLI.
 
 The CLI evaluates a source expression; it never builds or installs packages.
-Binary metadata and NARs are handled separately by nix_cache.py.
-"""
+Binary metadata and NARs are handled separately by cache/nix.py."""
+
 from __future__ import annotations
 
 import asyncio
+import httpx
 import json
 import os
 import re
 import tempfile
 from functools import lru_cache
-
-import httpx
-
+from repowatch.models import PackageRef
+from repowatch.parsers.base import IndexHeadResult, IndexParser
 from repowatch.processes import run
-from repowatch.parsers.base import IndexHeadResult, IndexParser, PackageRef
 
 STORE_PATH = re.compile(r'/nix/store/([0123456789abcdfghijklmnpqrsvwxyz]{32})-([^/\s]+)\Z')
 MAX_OUTPUT = 128 * 1024 * 1024

@@ -9,8 +9,10 @@
     {
       "path": "src/repowatch",
       "suffixes": [
-        ".py",
-        ".html"
+        ".css",
+        ".html",
+        ".js",
+        ".py"
       ]
     }
   ]

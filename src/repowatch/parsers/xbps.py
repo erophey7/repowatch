@@ -32,25 +32,21 @@ everything else here.
 No index-level signature verification: RepoConfig.__post_init__ rejects
 verify_signature=true for type=xbps outright (see the comment there) — the
 repodata itself isn't signed upstream at all, unlike everywhere else in
-this project.
-"""
+this project."""
 
 from __future__ import annotations
 
 import asyncio
+import httpx
 import io
 import plistlib
 import re
 import shutil
 import subprocess
-
-from repowatch.processes import run
 import tarfile
-
-import httpx
-
-from repowatch.parsers.base import IndexParser, PackageRef
-
+from repowatch.models import PackageRef
+from repowatch.parsers.base import IndexParser
+from repowatch.processes import run
 
 def _decompress(raw: bytes) -> bytes:
     binary = shutil.which("zstd")

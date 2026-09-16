@@ -1,12 +1,13 @@
 import asyncio
 from unittest.mock import AsyncMock, patch
 
-from repowatch.config import Config, StatusServerConfig
+from repowatch.config.models import Config
+from repowatch.config.models import StatusServerConfig
 from repowatch.notifications import (
     record_failure_and_maybe_notify,
     record_success_and_maybe_notify,
 )
-from repowatch.state import StateStore
+from repowatch.runtime.context import ServiceState
 
 
 def _config(webhook_url: str | None = "https://hooks.example.org/x", after_failures: int = 3) -> Config:
@@ -20,8 +21,8 @@ def _config(webhook_url: str | None = "https://hooks.example.org/x", after_failu
     )
 
 
-def _store(tmp_path) -> StateStore:
-    return StateStore(tmp_path / "state.sqlite3")
+def _store(tmp_path) -> ServiceState:
+    return ServiceState(tmp_path / "state.sqlite3")
 
 
 def test_no_notification_below_threshold(tmp_path):
@@ -64,7 +65,7 @@ def test_no_notification_without_webhook_configured(tmp_path):
 
     mock_send.assert_not_called()
     # bookkeeping must still happen even without a webhook
-    assert store.bump_failure("r", "prefetch", "boom") == (2, False)
+    assert store.notifications.bump_failure("r", "prefetch", "boom") == (2, False)
 
 
 def test_failed_send_does_not_mark_as_notified_so_it_retries_next_time(tmp_path):

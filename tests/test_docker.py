@@ -64,12 +64,12 @@ def test_explicit_context_excludes_secrets_and_unrelated_files(project):
                  'config.yaml', 'secrets.py'):
         (project / name).write_text('SECRET')
     files = docker.context_files(project)
-    assert 'src/repowatch/cli.py' in files
+    assert 'src/repowatch/cli/main.py' in files
     assert 'src/repowatch/static/dashboard.html' in files
     assert not any('SECRET' in (project / name).read_text() for name in files)
     ignore = docker.dockerignore(files)
     assert '\n**\n' in ignore
-    assert '!src/repowatch/cli.py\n' in ignore
+    assert '!src/repowatch/cli/main.py\n' in ignore
     assert '!src/repowatch/local.sqlite3' not in ignore
     assert '!config.yaml' not in ignore
 

@@ -2,7 +2,7 @@ import asyncio
 import io
 import tarfile
 
-from repowatch.config import RepoConfig
+from repowatch.config.models import RepoConfig
 from repowatch.parsers.apk import ApkParser
 
 APKINDEX_SAMPLE = (

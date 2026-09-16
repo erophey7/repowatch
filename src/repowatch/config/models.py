@@ -1,0 +1,459 @@
+"""Configuration values and their local validation rules."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import ipaddress
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from repowatch.errors import ConfigError
+
+WEBHOOK_EVENTS = frozenset({'repository.failing', 'repository.recovered',
+                            'repository.changed', 'warm.started', 'warm.completed'})
+
+
+def _validate_integer(name: str, value: object, *, minimum: int = 1,
+                      maximum: int = 2**31 - 1) -> None:
+    """Reject coercions and values outside the supported operational range."""
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ConfigError(f'{name}: must be an integer in {minimum}..{maximum}')
+
+
+@dataclass(frozen=True)
+class RepoConfig:
+    id: str
+    type: str  # "pacman" | "apt" | "apk" | "dnf" | "apt-rpm" | "xbps" | "nix" | "gentoo" | "slackware"
+    upstream: str
+    arch: str
+    prefetch: bool = True
+    # fields specific to particular repo types
+    repo_name: str | None = None       # pacman: core/extra/community
+    distribution: str | None = None    # apt: bookworm/jammy/...
+    component: str | None = None       # apt: main/contrib/non-free
+    # GPG verification of the index before parsing (see verification/gpg.py) —
+    # implemented for apt (InRelease, clearsigned), pacman
+    # (<repo>.db.tar.gz.sig, detached), and dnf (repomd.xml.asc, detached).
+    # apk uses a different, non-GPG signature scheme via verification/apk.py.
+    verify_signature: bool = False
+    apk_signature_backend: str = 'openssl'
+    apk_keys_dir: str | None = None
+    keyring_path: str | None = None    # exported keyring (not .asc!), see README
+    # The interval overrides the global default. Bandwidth is an additional
+    # per-repository ceiling inside the shared global budget; None adds no cap.
+    check_interval: int | None = None
+    prefetch_bandwidth_limit: float | None = None  # bytes/sec, not requests/sec
+    # Free-text label for manual grouping in the dashboard (see
+    # static/dashboard.html) — not automatic by type/distribution, the
+    # operator decides (e.g. "arch"/"ubuntu-noble"/"staging"). Affects
+    # nothing but display — no validation of the set of values, duplicates
+    # and any string are allowed.
+    group: str | None = None
+    url_template: str | None = None
+    url_variables: dict[str, str] = field(default_factory=dict)
+
+    # Optional system Nix CLI backend, agreed by the user for Nix evaluation.
+    # Other repository types do not require Nix or additional Python packages.
+    nix_source: str | None = None
+    nix_attributes: list[str] = field(default_factory=list)
+    nix_public_keys: list[str] = field(default_factory=list)
+    nix_timeout: int = 600
+    nix_max_paths: int = 500000
+
+    prefetch_whitelist: list[str] = field(default_factory=list)
+    prefetch_blacklist: list[str] = field(default_factory=list)
+
+    def catalog_identity(self) -> str:
+        """Bind HTTP validators to the source and parser selection, not just the repo id."""
+        fields = ('type', 'upstream', 'arch', 'repo_name', 'distribution', 'component',
+                  'url_template', 'url_variables', 'nix_source', 'nix_attributes')
+        data = {name: getattr(self, name) for name in fields}
+        return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
+
+    def __post_init__(self) -> None:
+        for name in ('prefetch', 'verify_signature'):
+            if type(getattr(self, name)) is not bool:
+                raise ConfigError(f'{self.id}: {name} must be a bool')
+        if self.check_interval is not None:
+            _validate_integer(f'{self.id}: check_interval', self.check_interval)
+        from repowatch.warming_policy import validate_patterns
+        for name in ('prefetch_whitelist', 'prefetch_blacklist'):
+            try:
+                validate_patterns(name, getattr(self, name))
+            except ValueError as exc:
+                raise ConfigError(f'{self.id}: {exc}') from exc
+        from repowatch.bandwidth import validate_limit
+        try:
+            validate_limit(self.prefetch_bandwidth_limit)
+        except ValueError as exc:
+            raise ConfigError(f'{self.id}: {exc}') from exc
+        from repowatch.url_templates import expand
+        expand(self)
+        if self.type not in {"pacman", "apt", "apk", "dnf", "apt-rpm", "xbps", "nix", "gentoo", "slackware"}:
+            raise ConfigError(f"{self.id}: unknown type={self.type!r}")
+        if self.type == 'nix':
+            from urllib.parse import urlsplit
+            if not isinstance(self.nix_source, str):
+                raise ConfigError(f'{self.id}: nix_source must be a URL string')
+            try:
+                source = urlsplit(self.nix_source)
+            except ValueError as exc:
+                raise ConfigError(f'{self.id}: invalid nix_source URL') from exc
+            if (source.scheme not in ('http', 'https') or not source.hostname
+                    or source.username or source.password or source.fragment):
+                raise ConfigError(f'{self.id}: nix_source must be an HTTP(S) nixpkgs source tarball URL')
+            if not isinstance(self.arch, str) or not re.fullmatch(r'[A-Za-z0-9_]+-(linux|darwin)', self.arch):
+                raise ConfigError(f'{self.id}: Nix arch must be a system such as x86_64-linux')
+            if (not isinstance(self.nix_attributes, list) or any(not isinstance(a, str) or
+                    not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_+-]*(?:\.[A-Za-z_][A-Za-z0-9_+-]*)*", a) for a in self.nix_attributes)):
+                raise ConfigError(f'{self.id}: nix_attributes must be a list of attribute paths')
+            if (not isinstance(self.nix_public_keys, list) or any(not isinstance(k, str) or
+                    not re.fullmatch(r'[A-Za-z0-9_.-]+:[A-Za-z0-9+/]{43}=', k) for k in self.nix_public_keys)):
+                raise ConfigError(f'{self.id}: nix_public_keys must contain Nix Ed25519 public keys')
+            for name in ('nix_timeout', 'nix_max_paths'):
+                if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                    raise ConfigError(f'{self.id}: {name} must be a positive integer')
+        if self.type == "pacman" and not self.repo_name:
+            raise ConfigError(f"{self.id}: repo_name is required for pacman")
+        if self.type == "apt" and not (self.distribution and self.component):
+            raise ConfigError(f"{self.id}: distribution and component are required for apt")
+        if self.type == "apt-rpm":
+            if not isinstance(self.component, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", self.component):
+                raise ConfigError(f"{self.id}: apt-rpm requires a safe component (e.g. classic)")
+            if not isinstance(self.arch, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", self.arch):
+                raise ConfigError(f"{self.id}: apt-rpm requires arch")
+        if self.type == 'slackware' and self.component not in (None, 'patches', 'extra', 'pasture', 'testing'):
+            raise ConfigError(f'{self.id}: slackware component must be patches, extra, pasture, testing or omitted')
+        if self.type == 'gentoo' and self.verify_signature:
+            raise ConfigError(f'{self.id}: verify_signature is unsupported for gentoo; GPKG signatures must be checked by Portage')
+        if self.apk_signature_backend not in ('openssl', 'apk-tools'):
+            raise ConfigError(f'{self.id}: apk_signature_backend must be openssl or apk-tools')
+        if self.apk_keys_dir is not None and (not isinstance(self.apk_keys_dir, str) or not self.apk_keys_dir.strip()):
+            raise ConfigError(f'{self.id}: apk_keys_dir must be a nonempty directory path')
+        if self.verify_signature:
+            if self.type == 'nix':
+                if not self.nix_public_keys:
+                    raise ConfigError(f'{self.id}: verify_signature=true requires nix_public_keys')
+            elif self.type == 'apk':
+                if not self.apk_keys_dir:
+                    raise ConfigError(f'{self.id}: verify_signature=true requires apk_keys_dir')
+            elif self.type == 'xbps':
+                # Unlike apt/pacman/dnf/apt-rpm, XBPS repos don't publish a
+                # signed index at all (no <arch>-repodata.sig(2) — verified
+                # by hand against repo-default.voidlinux.org). Trust instead
+                # comes from a per-PACKAGE RSA signature sidecar
+                # (<file>.xbps.sig2), checked by the real xbps client at
+                # install time — a different shape of verification (at
+                # warm-time, per package) than anything else here, not
+                # implemented yet (see docs_dev/ROADMAP.md item 21). Refusing
+                # outright avoids a false sense of security, same reasoning
+                # as apk's original GPG rejection before verification/apk.py existed.
+                raise ConfigError(
+                    f'{self.id}: verify_signature is not yet supported for xbps '
+                    f'(no signed index is published upstream; see docs_dev/ROADMAP.md item 21)'
+                )
+            elif not self.keyring_path:
+                raise ConfigError(f'{self.id}: verify_signature=true requires keyring_path')
+
+
+@dataclass(frozen=True)
+class StatusServerConfig:
+    bind: str = "0.0.0.0"
+    port: int = 8085
+    tls_cert_path: str | None = None
+    tls_key_path: str | None = None
+    guest_read_only: bool = False
+    token_repo_restrictions: bool = False
+    allow_insecure_http: bool = False
+    trusted_proxies: list[str] = field(default_factory=list)
+    metrics_allowed_networks: list[str] = field(default_factory=lambda: ["127.0.0.1/32", "::1/128"])
+
+    def __post_init__(self) -> None:
+        if type(self.token_repo_restrictions) is not bool:
+            raise ConfigError("status_server.token_repo_restrictions: must be a bool")
+        if type(self.guest_read_only) is not bool:
+            raise ConfigError("status_server.guest_read_only: must be a bool")
+        if type(self.allow_insecure_http) is not bool:
+            raise ConfigError("status_server.allow_insecure_http: must be a bool")
+        for name in ("trusted_proxies", "metrics_allowed_networks"):
+            networks = getattr(self, name)
+            if not isinstance(networks, list) or any(not isinstance(n, str) for n in networks):
+                raise ConfigError(f"status_server.{name}: must be a list of IP/CIDR")
+            try:
+                for network in networks:
+                    ipaddress.ip_network(network, strict=False)
+            except ValueError as exc:
+                raise ConfigError(f"status_server.{name}: invalid IP/CIDR") from exc
+        paths = (self.tls_cert_path, self.tls_key_path)
+        if all(path is None for path in paths):
+            return
+        if not all(isinstance(path, str) and path.strip() for path in paths):
+            raise ConfigError("status_server: tls_cert_path and tls_key_path are required together (nonempty strings)")
+
+
+@dataclass(frozen=True)
+class SyslogListenerConfig:
+    """Listener for nginx's syslog access_log — the source of "what was
+    requested" for the dashboard.
+
+    On by default since 2026-09-14 (was opt-in) — the socket itself is
+    loopback-only (`bind` defaults to 127.0.0.1) and nginx.render.render() emits
+    the matching `access_log syslog:server=...` directive off the SAME
+    flag, so enabling this can never leave the two sides mismatched. The
+    real reason to default it on: without real request visibility, the
+    hourly warmed_packages expiry (ServiceState.cache.prune_warmed_packages, see
+    operations.cleanup.prune_all) has no way to tell "nobody's asking for this
+    anymore" from "we just don't know" — see operations/check.py's own gating of
+    that cleanup on this exact flag. A fresh install with this off would
+    silently get a warmed_at timer that, for any repo without its own
+    prefetch re-touching it, only ever advances once (at first warm) and
+    then age out client-still-wants-it packages 180 days later for no
+    real reason — the opposite of what the retention was meant to do.
+    """
+
+    enabled: bool = True
+    bind: str = "127.0.0.1"
+    port: int = 1514
+
+    def __post_init__(self) -> None:
+        if type(self.enabled) is not bool:
+            raise ConfigError('syslog_listener.enabled: must be a bool')
+
+
+@dataclass(frozen=True)
+class NginxConfig:
+    enabled: bool = False
+    listen: str = "8080"
+    server_name: str = "repo-cache.local"
+    resolvers: list[str] = field(default_factory=lambda: ["127.0.0.53"])
+    cache_max_size: str = "100g"
+    cache_key_version: str = ""
+    index_ttl: int = 300
+    package_ttl: int = 15552000
+    # Purely informational/read-only from the operator's point of view — the
+    # actual cache directory nginx uses comes from the root-owned
+    # policy.json written by `make activate` (see install.py), not from
+    # here. NOT in web.settings.SAFE_CONFIG_FIELDS/dashboard-editable, same reasoning
+    # as admin_password_hash: writable service YAML choosing where
+    # root-owned nginx writes cache files would be a privilege boundary
+    # problem. When set, nginx.apply.apply.apply() cross-checks it against policy.json's
+    # cache_dir and refuses to apply on a mismatch (see nginx/render.py) — so this
+    # field can't silently drift from what's actually enforced; it exists so
+    # the path isn't hidden entirely inside a file the service user can't
+    # read. To actually change the cache directory, use
+    # `CACHE_DIR=... make install && sudo make activate`/`nginx-apply`.
+    cache_dir: str | None = None
+    # Active cache eviction on package removal (see docs_dev/ROADMAP.md item
+    # 24) via the third-party ngx_cache_purge nginx module — NOT bundled
+    # with stock nginx, and NOT the nginx-plus proxy_cache_purge API. Off by
+    # default: without it, behavior is exactly as before (inactive=/
+    # max_size= are the only eviction, see nginx/render.py) — enabling this doesn't
+    # change existing configs' rendered output at all besides adding the
+    # purge locations. The operator must separately add
+    # `load_module ".../ngx_http_cache_purge_module.so";` to their own main
+    # nginx.conf (a main-context directive — the generated file here lives
+    # inside http{}/sites-enabled, which can't emit it); nginx -t during
+    # nginx-apply catches a missing module with a clear error and rolls
+    # back, same as any other bad generated config.
+    enable_purge: bool = False
+    # docs_dev/ROADMAP.md item 29 — reroute a package request to another
+    # repository's already-cached copy when the index reports the SAME
+    # filename+SHA256 in more than one repo (real dedup, saves both origin
+    # bandwidth and cache disk — see nginx.render.render_dedup()). Off by default,
+    # no effect on existing configs' rendered output when disabled. Only
+    # apt/pacman/dnf packages currently carry a comparable SHA256 (see
+    # PackageRef.content_hash) — apk/apt-rpm files never participate.
+    enable_dedup: bool = False
+    # docs_dev/ROADMAP.md item 8 (unifies items 23/33) — read-only cache
+    # introspection (nginx.render.render_probe_js()/render_probe_conf()) via the
+    # third-party ngx_http_js_module (njs), NOT bundled with stock nginx.
+    # Off by default, no effect on existing configs' rendered output when
+    # disabled — same opt-in/degrades-gracefully shape as enable_purge/
+    # enable_dedup. The njs script runs INSIDE the nginx worker (already
+    # running as nginx's own `user`), so it can read proxy_cache_path's
+    # subdirectories (0700, owned by that user) that repowatch's own
+    # unprivileged process cannot — see CLAUDE.md's cache_dir_stats()
+    # permission finding. The operator must separately add
+    # `load_module ".../ngx_http_js_module.so";` to their own main
+    # nginx.conf (a main-context directive, same limitation as
+    # enable_purge's load_module); nginx -t during nginx-apply catches a
+    # missing module and rolls back like any other bad generated config.
+    # When both this and enable_purge are on, render_probe_conf() also
+    # emits a route-independent /purge-raw location (accepts an arbitrary
+    # already-known cache key, not tied to any current repo's route) — the
+    # only way to evict a genuinely orphaned entry whose repo/config no
+    # longer exists to compute a normal per-route purge key for.
+    enable_cache_probe: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.enabled) is not bool:
+            raise ConfigError("nginx.enabled: must be a bool")
+        if type(self.enable_purge) is not bool:
+            raise ConfigError("nginx.enable_purge: must be a bool")
+        if type(self.enable_dedup) is not bool:
+            raise ConfigError("nginx.enable_dedup: must be a bool")
+        if type(self.enable_cache_probe) is not bool:
+            raise ConfigError("nginx.enable_cache_probe: must be a bool")
+        if not isinstance(self.listen, str) or not re.fullmatch(r"(?:[0-9.]+:)?[0-9]{1,5}", self.listen):
+            raise ConfigError("nginx.listen: a port or IPv4:port string")
+        host, _, port = self.listen.rpartition(":")
+        try:
+            if host:
+                ipaddress.IPv4Address(host)
+            if not 1 <= int(port) <= 65535:
+                raise ValueError()
+            if not isinstance(self.resolvers, list) or not self.resolvers:
+                raise ValueError()
+            for address in self.resolvers:
+                if not isinstance(address, str):
+                    raise ValueError()
+                ipaddress.IPv4Address(address)
+        except (ValueError, TypeError) as exc:
+            raise ConfigError("nginx: invalid port/resolvers IPv4") from exc
+        if not isinstance(self.server_name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", self.server_name):
+            raise ConfigError("nginx.server_name: a single name without nginx syntax")
+        if not isinstance(self.cache_max_size, str) or not re.fullmatch(r"[1-9][0-9]{0,6}[mg]", self.cache_max_size):
+            raise ConfigError("nginx.cache_max_size: a size like 100g")
+        if not isinstance(self.cache_key_version, str) or not re.fullmatch(r"[A-Za-z0-9_-]{0,64}", self.cache_key_version):
+            raise ConfigError("nginx.cache_key_version: up to 64 letters/digits/hyphens")
+        for ttl in (self.index_ttl, self.package_ttl):
+            if type(ttl) is not int or not 1 <= ttl <= 31536000:
+                raise ConfigError("nginx: TTL in seconds, 1-31536000")
+        if self.cache_dir is not None:
+            if (not isinstance(self.cache_dir, str)
+                    or not re.fullmatch(r"/[A-Za-z0-9_./+-]+", self.cache_dir)
+                    or ".." in self.cache_dir.split("/")):
+                raise ConfigError("nginx.cache_dir: an absolute filesystem path with no traversal")
+
+
+@dataclass(frozen=True)
+class Config:
+    state_db: Path
+    check_interval: int
+    cache_base_url: str
+    status_server: StatusServerConfig
+    repos: list[RepoConfig] = field(default_factory=list)
+    # how many days to keep the change log (repo_events) before cleanup
+    event_retention_days: int = 90
+    # how many days to keep the log of real client requests (request_events)
+    request_retention_days: int = 7
+    # how many days to keep warmed_packages rows that haven't been updated —
+    # much longer than event_retention_days: this isn't an event log but the
+    # "last known warm state", and a package can legitimately go unwarmed
+    # (and not update warmed_at) for months if its version doesn't change
+    warmed_retention_days: int = 180
+    # Size-based auto-cleanup on top of the time-based one above, for cases
+    # where volume/traffic is high enough that day-based retention alone
+    # doesn't prevent unbounded growth. None means no limit (time-based
+    # only). event_max_rows_per_repo is per-repo (repo_events);
+    # request_max_rows is global (request_events contains rows with
+    # repo_id IS NULL, so "per repo" doesn't cleanly apply there).
+    # warmed_packages deliberately has no size limit — its ceiling is
+    # already naturally bounded by the number of packages ever seen, not an
+    # open-ended event log.
+    event_max_rows_per_repo: int | None = None
+    request_max_rows: int | None = None
+    # password hash (see auth.py, generated by `repowatch hash-password`)
+    # for administrator login. Until set, the dashboard and administrative
+    # API are closed; initial setup is via repowatch set-password. The
+    # plaintext password is never stored anywhere, only a PBKDF2 hash — if
+    # config.yaml leaks, the password itself is not exposed.
+    admin_password_hash: str | None = None
+    syslog_listener: SyslogListenerConfig = field(default_factory=SyslogListenerConfig)
+    nginx: NginxConfig = field(default_factory=NginxConfig)
+    # how many files to warm in parallel per warm_cache() run — on the
+    # first full warm of a large repo (thousands of new packages),
+    # warming one at a time sequentially would take hours
+    prefetch_concurrency: int = 8
+    # how many repositories to check concurrently per scheduler tick
+    # (runtime.scheduler.check_all, asyncio.Semaphore) — repositories used to be
+    # checked strictly one at a time, so a slow/hung upstream for one repo
+    # delayed checking all the others in that tick
+    check_concurrency: int = 8
+    # address of the nginx cache that a human actually browses to (for
+    # "view files" links in the dashboard). Separate from cache_base_url,
+    # because that one is usually 127.0.0.1 — the address repowatch itself
+    # uses for warming, useless as a clickable link in the operator's
+    # browser. If unset, cache_base_url is used as-is (fine for simple
+    # single-host setups without the loopback quirk).
+    public_cache_url: str | None = None
+    # Webhook for notifications about repeated warm/GPG-verification
+    # failures (see notifications.py) — not email/SMTP: we don't want to
+    # drag SMTP server config/credentials into this otherwise simple tool;
+    # a generic JSON webhook covers Slack/Discord/Mattermost incoming
+    # webhooks and a custom HTTP receiver equally well. None (default)
+    # means notifications are off. NOT included in web.settings.SAFE_CONFIG_FIELDS
+    # and NOT returned by safe_config_payload — this is effectively a
+    # secret (the incoming webhook URL is itself a bearer token), not
+    # returned even to the administrator, same reasoning as
+    # admin_password_hash.
+    notify_webhook_url: str | None = None
+    # after how many CONSECUTIVE failures to send a notification (see
+    # state.notifications.bump_failure/notifications.record_failure_and_maybe_notify) —
+    # exactly once when the threshold is reached, not on every subsequent
+    # failure.
+    notify_after_failures: int = 3
+    notify_events: list[str] = field(default_factory=lambda: [
+        "repository.failing", "repository.recovered"])
+    # global limit on total warm-up bandwidth (bytes/sec through
+    # warm_cache, not requests/sec — the size of warmed files varies by
+    # orders of magnitude, from a few hundred bytes for a pacman .desc to
+    # hundreds of megabytes for a debian .deb, so a requests/sec limit
+    # wouldn't protect the actual bandwidth to upstream/the local nginx).
+    # None means no global limit. Per-repo limits are additional ceilings;
+    # they cannot override or bypass this shared process-wide budget.
+    prefetch_bandwidth_limit: float | None = None
+    prefetch_bandwidth_timezone: str = 'UTC'
+    prefetch_bandwidth_schedule: list[dict] = field(default_factory=list)
+    # Below how many days left until the soonest-expiring key in a repo's
+    # keyring counts as "expiring soon" — surfaced in /api/repos and
+    # /metrics, and drives a webhook notification the same way repeated
+    # warm/GPG failures do (see operations.check.check_repo, notifications.py, kind
+    # "key_expiry"). Only meaningful for repositories with
+    # verify_signature=true and a GPG-based type (apt/pacman/dnf/apt-rpm) —
+    # apk's embedded RSA keys have no expiry concept at all.
+    key_expiry_warning_days: int = 30
+
+    def __post_init__(self) -> None:
+        for name in ('check_interval', 'prefetch_concurrency', 'check_concurrency',
+                     'notify_after_failures'):
+            _validate_integer(name, getattr(self, name))
+        for name in ('event_max_rows_per_repo', 'request_max_rows'):
+            if getattr(self, name) is not None:
+                _validate_integer(name, getattr(self, name))
+        # Bound calendar arithmetic as well as rejecting premature expiry.
+        # A thousand years is well beyond any supported retention use case.
+        for name in ('event_retention_days', 'request_retention_days', 'warmed_retention_days'):
+            _validate_integer(name, getattr(self, name), maximum=365000)
+        _validate_integer('key_expiry_warning_days', self.key_expiry_warning_days,
+                          minimum=0, maximum=365000)
+        if (not isinstance(self.notify_events, list)
+                or any(not isinstance(e, str) or e not in WEBHOOK_EVENTS for e in self.notify_events)
+                or len(set(self.notify_events)) != len(self.notify_events)):
+            raise ConfigError("notify_events must be a list of unique supported webhook events")
+        from repowatch.bandwidth import validate_limit, validate_schedule
+        try:
+            validate_limit(self.prefetch_bandwidth_limit)
+            validate_schedule(self.prefetch_bandwidth_schedule, self.prefetch_bandwidth_timezone)
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
+
+    def repo_by_id(self, repo_id: str) -> RepoConfig | None:
+        return next((r for r in self.repos if r.id == repo_id), None)
+
+    @property
+    def browse_base_url(self) -> str:
+        """What to show a human as a clickable link — see public_cache_url."""
+        return self.public_cache_url or self.cache_base_url
+
+    def effective_check_interval(self, repo: RepoConfig) -> int:
+        """Per-repository check timers — RepoConfig.check_interval overrides
+        the global value when set."""
+        return repo.check_interval if repo.check_interval is not None else self.check_interval
+
+    def effective_prefetch_bandwidth_limit(self, repo: RepoConfig) -> float | None:
+        """Current per-repo ceiling; the global budget is also shared with others."""
+        from repowatch.bandwidth import scheduled_limit
+        limits = [limit for limit in (scheduled_limit(self), repo.prefetch_bandwidth_limit) if limit is not None]
+        return min(limits) if limits else None

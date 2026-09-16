@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 import httpx
 
-from repowatch.config import RepoConfig
-from repowatch.gpgverify import SignatureError
+from repowatch.config.models import RepoConfig
+from repowatch.errors import SignatureError
 from repowatch.parsers.apt import AptParser
 
 FIXTURE = Path(__file__).parent / "fixtures" / "apt" / "Packages"

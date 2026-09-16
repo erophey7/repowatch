@@ -1,0 +1,184 @@
+  :root {
+    color-scheme: light dark;
+    --bg: #f7f7f8;
+    --surface: #ffffff;
+    --border: #e2e2e6;
+    --text: #1b1b1f;
+    --text-dim: #6b6b74;
+    --accent: #3457d5;
+    --ok: #1f8a4c;
+    --warn: #b3541e;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16161a;
+      --surface: #1f1f24;
+      --border: #303038;
+      --text: #eceef0;
+      --text-dim: #9a9aa2;
+      --accent: #7c93ff;
+      --ok: #4fce84;
+      --warn: #e0904a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: 24px;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .subtitle { color: var(--text-dim); margin: 0 0 20px; font-size: 13px; }
+  .table-wrap { overflow-x: auto; border-radius: 8px; }
+  table { width: 100%; border-collapse: collapse; background: var(--surface);
+          border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border);
+           font-size: 13px; white-space: nowrap; }
+  th { color: var(--text-dim); font-weight: 500; }
+
+  /* Hide less-important columns as the window narrows — the repository
+     table used to just squash into mush on narrow screens (10 columns).
+     Drop order goes from least important for a quick glance to most
+     important; hidden columns are still available in the row's expanded
+     detail on click. */
+  @media (max-width: 1200px) { .col-upstream { display: none; } }
+  @media (max-width: 1000px) { .col-changed { display: none; } }
+  @media (max-width: 850px)  { .col-interval { display: none; } }
+  @media (max-width: 700px)  { .col-type, .col-prefetch { display: none; } }
+  @media (max-width: 550px)  { .col-warmed { display: none; } }
+  tr.repo-row { cursor: pointer; }
+  tr.repo-row:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+  tr:last-child td { border-bottom: none; }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; }
+  .badge-changed { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
+  .badge-stale { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+  .badge-warn { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+  .mono { font-family: var(--mono); font-size: 12px; }
+  /* white-space:nowrap is inherited down from the "th, td" rule above (it's
+     what keeps ordinary repo-row cells like timestamps on one line) — reset
+     it here so text inside the detail row's panel (package keys, the purge
+     hint paragraph, etc.) can wrap at all instead of rendering as one
+     unbroken line that overflows into neighboring grid columns. */
+  .detail-row td { background: var(--bg); padding: 0; white-space: normal; }
+  .detail-panel { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; padding: 14px 16px; }
+  /* min-width:0 lets the column shrink below its content's intrinsic width
+     (the default grid-item min-width is auto, sized to fit content);
+     overflow-wrap covers long unbreakable tokens (package keys, filenames)
+     that can still exceed the column width even once wrapping works. */
+  .detail-col { min-width: 0; overflow-wrap: anywhere; }
+  .detail-col h3 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase;
+                   letter-spacing: .04em; color: var(--text-dim); }
+  .scroll-list { max-height: 220px; overflow-y: auto; overflow-wrap: anywhere;
+                 border: 1px solid var(--border); border-radius: 6px; background: var(--surface); }
+  .scroll-list div { padding: 4px 8px; font-family: var(--mono); font-size: 12px;
+                      border-bottom: 1px solid var(--border); }
+  .scroll-list div:last-child { border-bottom: none; }
+  .empty { color: var(--text-dim); font-style: italic; padding: 8px; }
+  [hidden] { display: none !important; }
+  #status { color: var(--text-dim); font-size: 12px; margin-top: 16px; }
+
+  .toolbar { margin: 16px 0; }
+  button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border);
+           background: var(--surface); color: var(--text); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:hover { filter: brightness(0.97); }
+  #add-form { margin-top: 12px; padding: 16px; background: var(--surface);
+              border: 1px solid var(--border); border-radius: 8px; max-width: 480px; }
+  #add-form h3 { margin: 0 0 12px; font-size: 13px; }
+  .field { margin-bottom: 10px; display: flex; flex-direction: column; gap: 4px; }
+  .field label { font-size: 12px; color: var(--text-dim); }
+  .field input[type=text], .field input[type=password], .field select, .field textarea {
+    font: inherit; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text);
+  }
+  .field.checkbox { flex-direction: row; align-items: center; }
+  .form-actions { display: flex; gap: 8px; margin-top: 14px; }
+  .form-msg { font-size: 12px; margin-top: 10px; }
+  .form-msg.error { color: var(--warn); }
+  .form-msg.ok { color: var(--ok); }
+  .section-title { font-size: 15px; margin: 28px 0 4px; }
+  .dim { color: var(--text-dim); }
+  .pkg-search { width: 100%; font: inherit; padding: 5px 8px; margin-bottom: 6px;
+                border-radius: 6px; border: 1px solid var(--border);
+                background: var(--bg); color: var(--text); }
+  .checklist { max-height: 160px; }
+  .pick-row { display: block; padding: 3px 8px; font-family: var(--mono); font-size: 12px;
+              cursor: pointer; }
+  .pick-row:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+  .pick-row input { margin-right: 6px; }
+  .pick-row-inline { display: flex; align-items: center; gap: 6px; cursor: pointer; flex: 1; min-width: 0; }
+  .bulk-actions { display: flex; gap: 6px; margin: 8px 0; flex-wrap: wrap; }
+  .warm-actions { display: flex; gap: 6px; margin-top: 8px; }
+  .warm-actions input { flex: 1; font: inherit; padding: 5px 8px; border-radius: 6px;
+                         border: 1px solid var(--border); background: var(--bg); color: var(--text); }
+  .browse-link { font-size: 12px; }
+  .ban-form { display: flex; gap: 6px; margin-top: 10px; }
+  .ban-form input { flex: 1; font: inherit; padding: 5px 8px; border-radius: 6px;
+                     border: 1px solid var(--border); background: var(--bg); color: var(--text); }
+  .subsection-title { font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+                       color: var(--text-dim); margin: 14px 0 6px; }
+  .row-actions { display: flex; gap: 4px; }
+  .row-actions button { font-size: 11px; padding: 2px 8px; }
+  .row-actions .danger { color: var(--warn); }
+  .field input:disabled { opacity: .6; }
+  .field-hint { font-size: 11px; color: var(--text-dim); }
+  .purge-section { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); }
+  @media (max-width: 900px) {
+    .detail-panel { grid-template-columns: 1fr; }
+  }
+  .requests-toolbar { display: flex; gap: 8px; margin: 10px 0; }
+  .requests-toolbar select { font: inherit; padding: 5px 8px; border-radius: 6px;
+                              border: 1px solid var(--border); background: var(--surface);
+                              color: var(--text); }
+  .charts-row { display: flex; gap: 12px; flex-wrap: wrap; margin: 12px 0 20px; }
+  .chart-panel { flex: 1 1 260px; min-width: 220px; background: var(--surface);
+                 border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+  .chart-panel h3 { margin: 0 0 8px; font-size: 11px; text-transform: uppercase;
+                     letter-spacing: .04em; color: var(--text-dim); }
+  .chart-svg-wrap svg { display: block; }
+  .chart-label { fill: var(--text-dim); font-size: 11px; font-family: var(--mono); }
+  .chart-bar { fill: var(--accent); }
+  .chart-bar-total { fill: var(--text-dim); opacity: .35; }
+  .chart-count { fill: var(--text); font-size: 11px; }
+  .chart-axis-label { fill: var(--text-dim); font-size: 9px; font-family: var(--mono); }
+  code { font-family: var(--mono); background: var(--surface); padding: 1px 5px;
+         border-radius: 4px; border: 1px solid var(--border); }
+
+  /* Collapsible manual repository groups — native <details>/<summary>, no
+     JS libraries, the same approach already used for the request charts. */
+  .repo-group { margin-bottom: 12px; border-radius: 8px; background: var(--surface);
+                border: 1px solid var(--border); overflow: hidden; }
+  .repo-group > summary { cursor: pointer; padding: 8px 12px; font-size: 13px;
+                           font-weight: 500; list-style: none; display: flex;
+                           align-items: center; gap: 8px; user-select: none; }
+  .repo-group > summary::-webkit-details-marker { display: none; }
+  .repo-group > summary::before { content: '▸'; color: var(--text-dim); font-size: 11px;
+                                   display: inline-block; transition: transform .1s; }
+  .repo-group[open] > summary::before { transform: rotate(90deg); }
+  .repo-group .group-count { color: var(--text-dim); font-weight: 400; }
+  .repo-group .table-wrap { border-radius: 0; border-top: 1px solid var(--border); }
+  .repo-group table { border: none; border-radius: 0; }
+
+  .login-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 18px;
+               padding: 10px 14px; background: var(--surface); border: 1px solid var(--border);
+               border-radius: 8px; }
+  .login-bar input[type=password] { font: inherit; padding: 5px 8px; border-radius: 6px;
+                                     border: 1px solid var(--border); background: var(--bg);
+                                     color: var(--text); width: 220px; }
+  .login-bar .login-msg { font-size: 12px; }
+  .login-bar .login-msg.error { color: var(--warn); }
+  .login-bar .login-msg.ok { color: var(--ok); }
+  .login-bar .logged-in { display: flex; align-items: center; gap: 8px; }
+  .login-bar .logout-link { font-size: 12px; cursor: pointer; color: var(--accent);
+                             text-decoration: underline; background: none; border: none; padding: 0; }
+  body:not([data-role="admin"]) .row-actions,
+  body:not([data-role="admin"]) .warm-actions,
+  body:not([data-role="admin"]) .bulk-actions,
+  body:not([data-role="admin"]) .purge-section,
+  body:not([data-role="admin"]) .ban-form,
+  body:not([data-role="admin"]) .pick-row input,
+  body:not([data-role="admin"]) .pick-row-inline input,
+  body:not([data-role="admin"]) #logout-btn { display: none; }

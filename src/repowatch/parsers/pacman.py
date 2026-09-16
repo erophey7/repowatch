@@ -13,21 +13,19 @@ TODO (see CLAUDE.md):
 
 GPG verification (repo.verify_signature): official Arch mirrors ship a
 detached signature <repo>.db.tar.gz.sig alongside the index — we download
-both files and verify with gpgv BEFORE unpacking/parsing.
-"""
+both files and verify with gpgv BEFORE unpacking/parsing."""
 
 from __future__ import annotations
 
 import asyncio
+import httpx
 import io
 import logging
 import re
 import tarfile
-
-import httpx
-
-from repowatch.gpgverify import verify_detached
-from repowatch.parsers.base import IndexParser, PackageRef
+from repowatch.models import PackageRef
+from repowatch.parsers.base import IndexParser
+from repowatch.verification.gpg import verify_detached
 
 logger = logging.getLogger(__name__)
 

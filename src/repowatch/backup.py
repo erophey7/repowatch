@@ -1,12 +1,12 @@
 """Pure-Python online backup of state.sqlite3 — for repowatch supervise/backup
-(see supervisor.py, cli.py), which must not assume the `scripts/` tree (and
+(see runtime/service.py, cli/main.py), which must not assume the `scripts/` tree (and
 its `sqlite3`/`gzip` CLI binaries) is present on disk, unlike the systemd
 timer path (scripts/backup-state.sh, left untouched, still used there).
 
 Same operation as backup-state.sh: SQLite's own online backup API (not a
 plain file copy, which risks capturing the file mid-transaction/WAL), then
-gzip, then age-based rotation of old backups.
-"""
+gzip, then age-based rotation of old backups."""
+
 from __future__ import annotations
 
 import gzip

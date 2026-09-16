@@ -1,4 +1,5 @@
 """Shared scheduling across repositories, threads, loops and policy changes."""
+import repowatch.operations.warm as operations_warm
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -11,9 +12,13 @@ import pytest
 import yaml
 
 from repowatch.bandwidth import BandwidthBudget, _Request, scheduled_limit
-from repowatch.config import Config, ConfigError, RepoConfig, StatusServerConfig, load_config
-from repowatch.state import StateStore
-from repowatch.prefetch import warm_cache
+from repowatch.config.models import Config
+from repowatch.errors import ConfigError
+from repowatch.config.models import RepoConfig
+from repowatch.config.models import StatusServerConfig
+from repowatch.config.load import load_config
+from repowatch.runtime.context import ServiceState
+from repowatch.operations.warm import warm_cache
 
 
 def config(tmp_path, **kwargs):
@@ -140,13 +145,13 @@ def test_live_reload_and_invalid_file_retains_last_valid_policy(tmp_path):
 
 
 def test_manual_and_automatic_warm_share_budget(tmp_path,monkeypatch):
-    from repowatch import prefetch
+    import repowatch.operations.warm as prefetch
     r1,r2=repo('one'),repo('two');c=config(tmp_path,repos=[r1,r2],prefetch_bandwidth_limit=100)
-    store=StateStore(c.state_db)
+    store=ServiceState(c.state_db)
     async def fake(client,url,limiter):
         await limiter.consume(30)
         return True,200
-    monkeypatch.setattr(prefetch,'_warm_one',fake)
+    monkeypatch.setattr(operations_warm,'download_package',fake)
     async def scenario():
         await asyncio.gather(warm_cache(c,r1,store,{'one':'one.apk'}),
                              warm_cache(c,r2,store,{'two':'two.apk'},force=True))
@@ -202,13 +207,13 @@ def test_default_utc_does_not_require_system_timezone_database(tmp_path,monkeypa
 
 def test_oversized_warm_response_still_spends_consumed_bytes():
     import httpx
-    from repowatch.prefetch import _warm_one
+    from repowatch.cache.transport import download_package
     consumed = []
     class Limiter:
         async def consume(self, size): consumed.append(size)
     async def scenario():
         async with httpx.AsyncClient(transport=httpx.MockTransport(
                 lambda request: httpx.Response(200,content=b'oversized'))) as client:
-            assert await _warm_one(client,'http://cache.test/file',Limiter(),expected_size=1) == (False,200)
+            assert await download_package(client,'http://cache.test/file',Limiter(),expected_size=1) == (False,200)
     asyncio.run(scenario())
     assert consumed == [9]

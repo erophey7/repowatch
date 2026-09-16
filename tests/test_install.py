@@ -1,5 +1,6 @@
 """Installation preflight must be read-only and must not guess nginx layout."""
 from __future__ import annotations
+import repowatch.cli.main as cli_main
 
 import importlib.util
 import logging
@@ -157,14 +158,14 @@ def test_write_preserves_config_and_refuses_symlinks(tmp_path):
 
 
 def test_cli_uses_install_default_and_explicit_override(tmp_path, monkeypatch, capsys):
-    from repowatch import cli
+    import repowatch.cli.main as cli
     config = tmp_path / 'config.yaml'
     config.write_text('state_db: /unused/state\ncache_base_url: http://localhost\nrepos:\n'
                       '  - {id: test, type: apk, upstream: https://example.org/alpine, arch: x86_64}\n')
-    monkeypatch.setattr(cli, 'DEFAULT_CONFIG_PATH', str(config))
-    assert cli.main(['check-config']) == 0
+    monkeypatch.setattr('repowatch.cli.parser.DEFAULT_CONFIG_PATH', str(config))
+    assert cli_main.main(['check-config']) == 0
     assert str(config) in capsys.readouterr().out
-    assert cli.main(['-c', str(tmp_path / 'missing'), 'check-config']) == 1
+    assert cli_main.main(['-c', str(tmp_path / 'missing'), 'check-config']) == 1
 
 
 def test_make_defaults_are_read_only_help():
@@ -196,7 +197,7 @@ def test_activation_nginx_failure_removes_new_link_and_never_starts_services(tmp
         commands.append(args)
         if args[0] == 'nginx':
             raise subprocess.CalledProcessError(1, args)
-        return subprocess.CompletedProcess(args, 0, stdout="server { listen 8080; }\n")
+        return subprocess.CompletedProcess(args, 0, stdout=json.dumps({name: "# generated\n" for name in ("active.conf", "purge.conf", "dedup.map", "probe.conf", "probe.js")} ))
 
     monkeypatch.setattr(installer, 'run', fake_run)
     with pytest.raises(subprocess.CalledProcessError):
@@ -222,3 +223,80 @@ def test_generated_file_symlink_blocks_before_install(tmp_path, caplog):
     (layout.share / 'config.example.yaml').symlink_to(tmp_path / 'foreign')
     assert installer.check(layout).failures > 0
     assert 'file conflict' in caplog.text
+
+
+def test_activation_executes_packaged_cli_before_host_mutations(tmp_path, monkeypatch):
+    import json
+    layout = layout_at(tmp_path)
+    layout.share.mkdir(parents=True)
+    (layout.share / 'install.json').write_text(json.dumps(installer.asdict(layout)))
+    layout.config.parent.mkdir(parents=True)
+    layout.config.write_text(
+        f'state_db: {tmp_path / "unused.db"}\ncache_base_url: http://127.0.0.1:8080\n'
+        'repos:\n  - id: r\n    type: apk\n    upstream: https://example.org\n    arch: x86_64\n')
+    monkeypatch.setattr(installer.os, 'geteuid', lambda: 0)
+    monkeypatch.setattr(installer, 'check', lambda *a, **kw: installer.Report())
+    class CheckedCommand(Exception):
+        pass
+    def execute(args, **kwargs):
+        result = subprocess.run([sys.executable, *args[1:]], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert not (tmp_path / 'unused.db').exists()
+        raise CheckedCommand()
+    monkeypatch.setattr(installer, 'run', execute)
+    with pytest.raises(CheckedCommand):
+        installer.activate(layout)
+
+
+@pytest.mark.parametrize('failure', [None, 'write', 'nginx'])
+def test_first_activation_bootstraps_all_features_without_creating_database(tmp_path, monkeypatch, failure):
+    import json
+    import os
+    from types import SimpleNamespace
+    layout = layout_at(tmp_path)
+    layout.with_nginx = True
+    layout.nginx_conf = str(tmp_path / 'nginx/nginx.conf')
+    layout.nginx_enabled_dir = str(tmp_path / 'nginx/conf.d')
+    layout.share.mkdir(parents=True)
+    (layout.share / 'install.json').write_text(json.dumps(installer.asdict(layout)))
+    layout.config.parent.mkdir(parents=True)
+    state_db = layout.state / 'state.sqlite3'
+    source = Path(__file__).parents[1] / 'config/config.example.yaml'
+    layout.config.write_text(source.read_text().replace('/var/lib/repowatch', str(layout.state)))
+    monkeypatch.setattr(installer.os, 'geteuid', lambda: 0)
+    monkeypatch.setattr(installer.os, 'chown', lambda *a: None)
+    monkeypatch.setattr(installer.grp, 'getgrnam', lambda *a: SimpleNamespace(gr_gid=os.getgid()))
+    monkeypatch.setattr(installer.pwd, 'getpwnam', lambda *a: SimpleNamespace(pw_uid=os.getuid()))
+    monkeypatch.setattr(installer, 'check', lambda *a, **kw: installer.Report())
+    names = ('active.conf', 'purge.conf', 'dedup.map', 'probe.conf', 'probe.js')
+    checked = []
+    def run(args, **kwargs):
+        if args[0] != 'nginx':
+            return subprocess.run([sys.executable, *args[1:]], check=True, capture_output=True, text=True)
+        directory = layout.nginx_policy.parent
+        assert all((directory / name).is_file() for name in names)
+        active = (directory / 'active.conf').read_text()
+        assert str(directory / 'probe.js') in active
+        assert str(directory / 'probe.conf') in active
+        assert layout.cache_dir in (directory / 'probe.js').read_text()
+        assert not state_db.exists()
+        checked.append(args)
+        if failure == 'nginx':
+            raise subprocess.CalledProcessError(1, args)
+        return subprocess.CompletedProcess(args, 0)
+    monkeypatch.setattr(installer, 'run', run)
+    write = installer.write
+    def fail_write(path, content, *args, **kwargs):
+        if failure == 'write' and path.name == 'probe.js':
+            raise OSError('simulated disk failure')
+        return write(path, content, *args, **kwargs)
+    monkeypatch.setattr(installer, 'write', fail_write)
+    if failure:
+        with pytest.raises((OSError, subprocess.CalledProcessError)):
+            installer.activate(layout)
+        assert all(not (layout.nginx_policy.parent / name).exists() for name in names)
+        assert not (Path(layout.nginx_enabled_dir) / 'repowatch.conf').exists()
+    else:
+        installer.activate(layout)
+        assert checked
+    assert not state_db.exists()

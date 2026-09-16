@@ -3,30 +3,30 @@
 HEAD is applied to repomd.xml, not to primary, whose name changes.
 Optional GPG verification of repomd.xml.asc precedes parsing the metadata;
 the primary checksum is always checked. This verifies the index's
-signature, not the RPM payload.
-"""
+signature, not the RPM payload."""
+
 from __future__ import annotations
 
 import asyncio
 import bz2
-from dataclasses import dataclass
 import gzip
 import hashlib
+import httpx
 import io
 import lzma
-from pathlib import PurePosixPath
 import re
 import shutil
 import subprocess
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from pathlib import PurePosixPath
+from repowatch.errors import SignatureError
+from repowatch.models import PackageRef
+from repowatch.parsers.base import IndexParser
+from repowatch.processes import ProcessStream
+from repowatch.verification.gpg import verify_detached
 from typing import BinaryIO
 from urllib.parse import urlsplit
-import xml.etree.ElementTree as ET
-
-import httpx
-
-from repowatch.processes import ProcessStream
-from repowatch.gpgverify import SignatureError, verify_detached
-from repowatch.parsers.base import IndexParser, PackageRef
 
 _REPO = '{http://linux.duke.edu/metadata/repo}'
 _COMMON = '{http://linux.duke.edu/metadata/common}'

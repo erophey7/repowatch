@@ -2,20 +2,19 @@
 
 Call from asyncio.to_thread in asynchronous paths. One deadline covers pipe
 reads and process exit. Both output pipes are drained together; failures kill
-and reap the process group. Callers interpret return codes and tool output.
-"""
+and reap the process group. Callers interpret return codes and tool output."""
+
 from __future__ import annotations
 
-import os
 import io
+import os
 import selectors
 import signal
 import subprocess
 import tempfile
 import time
-from contextlib import ExitStack
 from collections.abc import Mapping, Sequence
-
+from contextlib import ExitStack
 
 class OutputLimitError(subprocess.SubprocessError):
     """A subprocess exceeded its configured output budget."""

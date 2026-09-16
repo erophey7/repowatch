@@ -9,19 +9,17 @@ fields:
      <P>-<V>.apk)
 
 TODO (see CLAUDE.md):
-- honor the architecture from the A: field, for mixed-arch repositories.
-"""
+- honor the architecture from the A: field, for mixed-arch repositories."""
 
 from __future__ import annotations
 
 import asyncio
+import httpx
 import io
 import logging
 import tarfile
-
-import httpx
-
-from repowatch.parsers.base import IndexParser, PackageRef
+from repowatch.models import PackageRef
+from repowatch.parsers.base import IndexParser
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +78,6 @@ class ApkParser(IndexParser):
         logger.debug("apk: fetching %s", url)
         raw = await self._http_get(client, url)
         if self.repo.verify_signature:
-            from repowatch.apkverify import verify_index
+            from repowatch.verification.apk import verify_index
             raw = await asyncio.to_thread(verify_index, raw, self.repo.apk_keys_dir, self.repo.apk_signature_backend)
         return await asyncio.to_thread(_parse_apkindex_tar_gz, raw, url)

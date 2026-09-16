@@ -3,8 +3,7 @@
 PBKDF2-HMAC-SHA256 via stdlib hashlib — no bcrypt/argon2/passlib in the
 dependencies. The hash format is self-describing (algorithm$iterations$salt$hash)
 so the iteration count can be raised in the future without breaking already
-stored hashes of old passwords.
-"""
+stored hashes of old passwords."""
 
 from __future__ import annotations
 
@@ -26,7 +25,7 @@ _DEFAULT_ITERATIONS = 600_000
 
 
 def hash_password(password: str, iterations: int = _DEFAULT_ITERATIONS) -> str:
-    """Called from `repowatch hash-password` (see cli.py) — the operator
+    """Called from `repowatch hash-password` (see cli/main.py) — the operator
     pastes the result into config.yaml as admin_password_hash."""
     salt = os.urandom(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)

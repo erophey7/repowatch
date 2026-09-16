@@ -70,6 +70,23 @@ rest of repowatch runs normally):
 Run `make check` for a read-only diagnostic of what's actually present on a
 given host (`OK`/`WARN`/`FAIL` per item).
 
+## Quick start
+
+A fresh installation starts with **no repositories** (`repos: []`). Add only
+what your clients use, through the dashboard or YAML. The shipped system profile
+enables purge, deduplication, cache inventory and request tracking; install the
+matching nginx modules before activation. Repository keys, TLS certificates,
+webhook destinations and optional Nix need site-specific setup.
+
+1. [Install the server](docs/quick-start.md): Debian/Ubuntu, Arch, Fedora/Rocky
+   and Alpine prerequisites, activation and first login.
+2. [Add repositories](docs/repositories.md): dashboard/YAML workflows, format
+   examples and bounded warming.
+3. [Connect clients](docs/clients.md): package-manager configuration and checks.
+
+Existing installations keep their YAML on upgrade. The empty seed and new
+feature settings are first-install choices, not automatic changes to your setup.
+
 ## Install
 
 ### Development
@@ -110,7 +127,9 @@ different file, pass `-c`/`--config` before the subcommand, as above.
 ```bash
 make check                                    # environment diagnostics only
 sudo make install PREFIX=/usr/local
+sudoedit /etc/repowatch/config.yaml            # review the empty, full-feature seed
 sudo make activate                            # enables and starts services
+sudo -u repowatch /usr/local/bin/repowatch set-password
 ```
 
 `PREFIX`, `SYSCONFDIR` (default `/etc`), `LOCALSTATEDIR` (default `/var`),
@@ -139,6 +158,12 @@ instead — see
 in detail.
 
 ## Documentation
+
+- [Quick start](docs/quick-start.md), [repositories](docs/repositories.md) and
+  [clients](docs/clients.md) — from an empty installation to a working cache.
+- [Warming policies](docs/warming-policy.md), [Nix](docs/nix.md),
+  [Gentoo/Slackware](docs/gentoo-slackware.md), [webhooks](docs/webhooks.md)
+  and [Docker](docs/docker.md) — feature-specific examples.
 
 - [docs/configuration.md](docs/configuration.md) — full `config.yaml`
   reference.

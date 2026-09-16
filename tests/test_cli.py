@@ -1,6 +1,6 @@
 import gzip
 
-from repowatch.cli import main
+from repowatch.cli.main import main
 
 
 def _write_config(tmp_path, repos_yaml: str = ""):
@@ -103,7 +103,7 @@ def test_stats_cache_dir_flag_prefers_cache_probe_when_enabled(tmp_path, capsys)
         return httpx.Response(200, json=[])
 
     real_async_client = httpx.AsyncClient
-    with patch("repowatch.cache_probe.httpx.AsyncClient",
+    with patch("repowatch.cache.probe.httpx.AsyncClient",
                lambda **kw: real_async_client(transport=httpx.MockTransport(handler))):
         rc = main(["-c", str(config_path), "stats", "--cache-dir"])
 
@@ -181,7 +181,7 @@ def test_self_update_does_not_require_a_config_file(monkeypatch, tmp_path, capsy
     # No -c given, and no config.yaml exists at the default path either —
     # self-update must not touch load_config at all.
     monkeypatch.setattr("repowatch._paths.DEFAULT_CONFIG_PATH", str(tmp_path / "does-not-exist.yaml"))
-    monkeypatch.setattr("repowatch.cli.DEFAULT_CONFIG_PATH", str(tmp_path / "does-not-exist.yaml"))
+    monkeypatch.setattr("repowatch.cli.parser.DEFAULT_CONFIG_PATH", str(tmp_path / "does-not-exist.yaml"))
 
     async def fake_run_self_update(repo, *, check_only=False, force=False):
         assert repo == "owner/name"

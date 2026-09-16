@@ -7,21 +7,20 @@ GPG verification (repo.verify_signature): InRelease is clearsigned, the
 signature is checked with gpgv, then the expected SHA256 for the specific
 Packages.gz is extracted from the verified body and compared after
 download — i.e. we don't trust Packages.gz itself (nobody signs it
-separately), but the chain InRelease signature -> SHA256 -> Packages.gz.
-"""
+separately), but the chain InRelease signature -> SHA256 -> Packages.gz."""
 
 from __future__ import annotations
 
 import asyncio
 import gzip
 import hashlib
+import httpx
 import logging
 import re
-
-import httpx
-
-from repowatch.gpgverify import SignatureError, find_sha256_in_release, verify_clearsigned, _extract_clearsigned_body
-from repowatch.parsers.base import IndexParser, PackageRef
+from repowatch.errors import SignatureError
+from repowatch.models import PackageRef
+from repowatch.parsers.base import IndexParser
+from repowatch.verification.gpg import find_sha256_in_release, verify_clearsigned, _extract_clearsigned_body
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +113,7 @@ def _parse_packages_gz(raw: bytes) -> list[PackageRef]:
             filename = line.split(":", 1)[1].strip()
         elif line.startswith("SHA256:"):
             # Standard per-stanza field, distinct from the by-hash SHA256 of
-            # the whole Packages.gz index checked elsewhere (gpgverify.py) —
+            # the whole Packages.gz index checked elsewhere (verification/gpg.py) —
             # this one is per package file, used for cross-repo dedup
             # (docs_dev/ROADMAP.md item 29).
             value = line.split(":", 1)[1].strip()

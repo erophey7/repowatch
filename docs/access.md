@@ -1,5 +1,12 @@
 # Access control
 
+The shipped system profile binds status to `127.0.0.1:8085`, disables guest access
+and enables `token_repo_restrictions`. Start with the [first-login instructions](quick-start.md#3-open-the-dashboard-and-add-a-source),
+then [add repositories](repositories.md). Schema defaults for omitted fields can
+differ; upgrades preserve your existing configuration. Package-cache access is
+separate from dashboard/status authentication.
+
+
 repowatch's HTTP server (`repowatch run` / `serve-status`) exposes three
 different kinds of access, each with its own credential:
 

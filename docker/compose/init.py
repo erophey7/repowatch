@@ -3,8 +3,8 @@ from pathlib import Path
 import os
 import shutil
 
-from repowatch.config import load_config
-from repowatch.state import StateStore
+from repowatch.config.load import load_config
+from repowatch.runtime.context import ServiceState
 
 
 def initialize(config_dir: Path, state_dir: Path, nix_dir: Path, seed: Path,
@@ -49,7 +49,7 @@ def initialize(config_dir: Path, state_dir: Path, nix_dir: Path, seed: Path,
     # Create/migrate SQLite as the application user. Setgid directories and
     # group-writable SQLite files allow the nginx helper's dedup reads too.
     os.umask(0o007)
-    store = StateStore(state_path)
+    store = ServiceState(state_path)
     state_path.chmod(0o660)
     del store
 

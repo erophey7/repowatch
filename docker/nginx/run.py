@@ -7,8 +7,9 @@ import subprocess
 import tempfile
 import threading
 
-from repowatch.config import ConfigError, load_config
-from repowatch.nginx import apply
+from repowatch.errors import ConfigError
+from repowatch.config.load import load_config
+from repowatch.nginx.apply import apply
 
 CONFIG = Path('/etc/repowatch/config.yaml')
 DIRECTORY = Path('/etc/nginx/repowatch')

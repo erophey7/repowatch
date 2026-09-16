@@ -1,4 +1,5 @@
 """Gentoo/Slackware format and integration regressions; no network fixtures."""
+import repowatch.operations.check as operations_check
 import asyncio
 from dataclasses import replace
 import hashlib
@@ -8,13 +9,18 @@ import re
 import httpx
 import pytest
 
-from repowatch.config import Config, ConfigError, NginxConfig, RepoConfig, StatusServerConfig
-from repowatch.gpgverify import SignatureError
-from repowatch.nginx import render, render_purge
+from repowatch.config.models import Config
+from repowatch.errors import ConfigError
+from repowatch.config.models import NginxConfig
+from repowatch.config.models import RepoConfig
+from repowatch.config.models import StatusServerConfig
+from repowatch.errors import SignatureError
+from repowatch.nginx.render import render
+from repowatch.nginx.render import render_purge
 from repowatch.parsers import PARSERS
 from repowatch.parsers.gentoo import _parse_packages as gentoo
 from repowatch.parsers.slackware import _parse_packages as slackware, _check_index
-from repowatch.prefetch import _build_warm_url
+from repowatch.routing import warm_url
 
 FIXTURES = Path(__file__).parent / 'fixtures'
 GENTOO = (FIXTURES / 'gentoo/Packages').read_bytes()
@@ -94,7 +100,7 @@ def test_fetch_snapshot_head_warm_and_nginx_paths(kind):
     c = Config(Path('/tmp/unused'), 300, 'http://cache', StatusServerConfig(),
                repos=[r], nginx=NginxConfig(enabled=True, enable_purge=True))
     filename = next(iter(snapshot.packages.values()))
-    assert _build_warm_url(c, r, filename) == f'http://cache/{kind}/{kind}/{filename}'
+    assert warm_url(c, r, filename) == f'http://cache/{kind}/{kind}/{filename}'
     rendered = render(c)
     assert f'location /{kind}/{kind}/' in rendered
     patterns = re.findall(r'location ~ (\S+) \{', rendered)
@@ -102,7 +108,7 @@ def test_fetch_snapshot_head_warm_and_nginx_paths(kind):
     assert not any(re.search(p, f'/{kind}/{kind}/{filename}') for p in patterns)
     assert f'/{kind}/{kind}/' in render_purge(c)
     custom = replace(r, url_template='/custom/{id}')
-    assert _build_warm_url(c, custom, filename) == f'http://cache/custom/{kind}/{filename}'
+    assert warm_url(c, custom, filename) == f'http://cache/custom/{kind}/{filename}'
 
 
 @pytest.mark.parametrize('mode', ['ok', 'bad-hash', 'missing', 'duplicate', 'bad-signature'])
@@ -150,11 +156,11 @@ def test_valid_empty_gentoo_and_duplicate_slackware():
 
 @pytest.mark.parametrize('kind', ['gentoo', 'slackware'])
 def test_watcher_records_catalog_and_warms_via_cache(tmp_path, monkeypatch, kind):
-    from repowatch import watcher
-    from repowatch.state import StateStore
+    import repowatch.operations.check as watcher
+    from repowatch.runtime.context import ServiceState
     r = repo(kind)
     c = Config(tmp_path / 'state.db', 300, 'http://cache', StatusServerConfig(), repos=[r])
-    store = StateStore(c.state_db)
+    store = ServiceState(c.state_db)
     paths = []
     raw = GENTOO if kind == 'gentoo' else SLACKWARE
     def handler(request):
@@ -165,12 +171,12 @@ def test_watcher_records_catalog_and_warms_via_cache(tmp_path, monkeypatch, kind
         return httpx.Response(200, content=raw, headers={'ETag': 'v1'})
     client_class = httpx.AsyncClient
     monkeypatch.setattr(httpx, 'AsyncClient', lambda **kw: client_class(transport=httpx.MockTransport(handler), **kw))
-    asyncio.run(watcher.check_repo(c, r, store))
-    packages = store.get_packages(r.id)
+    asyncio.run(operations_check.check_repo(c, r, store))
+    packages = store.repositories.get_packages(r.id)
     assert len(packages) == 3
     assert sorted(paths) == sorted(f'/{kind}/{kind}/{p}' for p in packages.values())
-    assert all(p['status'] == 'ok' for p in store.get_warmed_packages(r.id))
-    asyncio.run(watcher.check_repo(c, r, store))
+    assert all(p['status'] == 'ok' for p in store.cache.get_warmed_packages(r.id))
+    asyncio.run(operations_check.check_repo(c, r, store))
     assert len(paths) == 3
 
 
@@ -181,4 +187,4 @@ def test_slackware_components_can_share_client_prefix():
                repos=[r, patches], nginx=NginxConfig(enabled=True))
     text = render(c)
     assert text.count('location /slackware/15.0/') == 1
-    assert _build_warm_url(c, r, 'patches/packages/x.txz') == _build_warm_url(c, patches, 'patches/packages/x.txz')
+    assert warm_url(c, r, 'patches/packages/x.txz') == warm_url(c, patches, 'patches/packages/x.txz')

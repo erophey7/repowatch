@@ -1,4 +1,4 @@
-# Trial stack: small initial scope, no automatic package downloads.
+# Development stack: full cache features, no preconfigured repositories.
 state_db: /var/lib/repowatch/state.sqlite3
 cache_base_url: http://127.0.0.1:8080
 public_cache_url: http://127.0.0.1:18080
@@ -7,7 +7,11 @@ prefetch_bandwidth_limit: 2097152
 status_server:
   bind: 0.0.0.0
   port: 8085
-  guest_read_only: true
+  # Docker forwards the host-loopback port from a bridge address.
+  # This developer stack publishes status only on host 127.0.0.1.
+  allow_insecure_http: true
+  guest_read_only: false
+  token_repo_restrictions: true
 # Set a password with the Compose exec command for your stack (see docs/docker.md).
 admin_password_hash: null
 nginx:
@@ -22,12 +26,6 @@ syslog_listener:
   enabled: true
   bind: 127.0.0.1
   port: 5514
-repos:
-  - id: debian-bookworm-main
-    type: apt
-    upstream: https://deb.debian.org/debian
-    arch: amd64
-    distribution: bookworm
-    component: main
-    prefetch: false
-    group: Compose trial
+# Start empty; add repositories through the dashboard or YAML.
+# Examples and management workflows: docs/repositories.md.
+repos: []
