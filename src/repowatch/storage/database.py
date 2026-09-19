@@ -6,7 +6,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from repowatch.storage.schema import SCHEMA, _migrate, _search_index
+from repowatch.storage.schema import SCHEMA, _migrate, _request_rollups, _search_index
 from typing import Iterator
 
 def _utcnow() -> str:
@@ -34,6 +34,7 @@ class Database:
             conn.executescript(SCHEMA)
             conn.execute("BEGIN IMMEDIATE")
             _migrate(conn)
+            _request_rollups(conn)
             self.search_index = _search_index(conn)
 
 

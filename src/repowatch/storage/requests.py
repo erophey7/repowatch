@@ -5,6 +5,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from repowatch.storage.database import Database, _utcnow
 
+# Rows removed per transaction by the request pruners (see _delete_requests).
+_PRUNE_CHUNK = 5000
+
+
 class RequestsStore:
     """SQL operations for requests; the caller supplies the shared database."""
 
@@ -73,32 +77,29 @@ class RequestsStore:
         ]
 
 
+    def _top(self, kind: str, repo_id: str | None, limit: int) -> list[dict]:
+        """Highest counts of one rollup kind, globally or for one repository."""
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT key, total FROM request_counters
+                WHERE kind = ? AND repo_key = ? AND total > 0
+                ORDER BY total DESC, key LIMIT ?
+                """,
+                (kind, f"r:{repo_id}" if repo_id else "*", limit),
+            ).fetchall()
+        return [{"key": key, "count": count} for key, count in rows]
+
+
     def get_top_client_ips(self, repo_id: str | None = None, limit: int = 10) -> list[dict]:
         """Top client_ip values by request count — for the dashboard chart
         (see reporting.statistics.requests_summary_payload). client_ip can be NULL (old
         log_format without $remote_addr, see request_events.client_ip) —
         such rows are excluded from the top, there's nothing meaningful to
-        group them by."""
-        with self.db.connect() as conn:
-            if repo_id:
-                rows = conn.execute(
-                    """
-                    SELECT client_ip, COUNT(*) AS cnt FROM request_events
-                    WHERE repo_id = ? AND client_ip IS NOT NULL
-                    GROUP BY client_ip ORDER BY cnt DESC LIMIT ?
-                    """,
-                    (repo_id, limit),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """
-                    SELECT client_ip, COUNT(*) AS cnt FROM request_events
-                    WHERE client_ip IS NOT NULL
-                    GROUP BY client_ip ORDER BY cnt DESC LIMIT ?
-                    """,
-                    (limit,),
-                ).fetchall()
-        return [{"key": key, "count": count} for key, count in rows]
+        group them by. Read from request_counters (see storage.schema):
+        the cost depends on the number of distinct addresses, not on how many
+        requests are retained."""
+        return self._top("ip", repo_id, limit)
 
 
     def get_top_request_paths(self, repo_id: str | None = None, limit: int = 10) -> list[dict]:
@@ -106,40 +107,9 @@ class RequestsStore:
         package": grouped by the raw path, not by the resolved package_key
         (see request_events.package_key/get_prefetch_efficiency for the
         latter, used for a different question — "was this prefetched?" —
-        not "what's most popular")."""
-        with self.db.connect() as conn:
-            if repo_id:
-                rows = conn.execute(
-                    """
-                    SELECT path, COUNT(*) AS cnt FROM request_events
-                    WHERE repo_id = ? GROUP BY path ORDER BY cnt DESC LIMIT ?
-                    """,
-                    (repo_id, limit),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """
-                    SELECT path, COUNT(*) AS cnt FROM request_events
-                    GROUP BY path ORDER BY cnt DESC LIMIT ?
-                    """,
-                    (limit,),
-                ).fetchall()
-        return [{"key": key, "count": count} for key, count in rows]
-
-
-    def get_requests_by_repo(self, limit: int = 20) -> list[dict]:
-        """Requests per repository — including repo_id IS NULL (path didn't
-        match any repository, see runtime.syslog.match_repo_id), shown as
-        "(unmatched)" on the dashboard side."""
-        with self.db.connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT repo_id, COUNT(*) AS cnt FROM request_events
-                GROUP BY repo_id ORDER BY cnt DESC LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-        return [{"key": key, "count": count} for key, count in rows]
+        not "what's most popular"). Counts equal those grouped over
+        request_events, read from request_counters."""
+        return self._top("path", repo_id, limit)
 
 
     def get_request_hit_stats(self) -> dict[str | None, dict[str, int]]:
@@ -152,42 +122,36 @@ class RequestsStore:
         — the caller decides whether/how to surface that bucket."""
         with self.db.connect() as conn:
             rows = conn.execute(
-                """
-                SELECT repo_id, COUNT(*) AS total,
-                       SUM(CASE WHEN cache_status = 'HIT' THEN 1 ELSE 0 END) AS hits
-                FROM request_events
-                GROUP BY repo_id
-                """
+                "SELECT repo_key, total, hits FROM request_counters WHERE kind = 'repo' AND total > 0"
             ).fetchall()
-        return {repo_id: {"total": total, "hits": hits or 0} for repo_id, total, hits in rows}
+        return {(repo_key[2:] if repo_key else None): {"total": total, "hits": hits}
+                for repo_key, total, hits in rows}
 
 
     def get_requests_timeline(self, repo_id: str | None = None, hours: int = 24) -> list[dict]:
         """Hourly request-count buckets for the last `hours` hours, oldest
-        first — docs_dev/ROADMAP.md item 19's "timeline" chart. Bucketing is
-        a plain substr() on the ISO-8601 `ts` (always "YYYY-MM-DDTHH:...",
-        fixed width, UTC — see _utcnow), not a datetime() call: cheap and
-        exact for this format, no timezone conversion needed. A snapshot
-        like the rest of this module — retention pruning can make an older
-        hour's bucket shrink or disappear between two calls."""
-        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat(timespec="seconds")
-        params: tuple = (cutoff,)
-        where = "ts >= ?"
+        first — docs_dev/ROADMAP.md item 19's "timeline" chart. Read from
+        request_hourly, whose bucket is the 'YYYY-MM-DDTHH' prefix of the ISO-8601
+        `ts` (fixed width, UTC — see _utcnow). Buckets are whole hours: the
+        oldest one includes the requests from before the exact cut-off within
+        that hour. A snapshot like the rest of this module — retention pruning
+        can make an older hour's bucket shrink or disappear between two calls."""
+        first_hour = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat(timespec="seconds")[:13]
+        where, params = "hour >= ? AND total > 0", (first_hour,)
         if repo_id is not None:
-            where += " AND repo_id = ?"
-            params += (repo_id,)
+            if not repo_id:
+                return []
+            where += " AND repo_key = ?"
+            params += (f"r:{repo_id}",)
         with self.db.connect() as conn:
             rows = conn.execute(
                 f"""
-                SELECT substr(ts, 1, 13) AS hour, COUNT(*) AS total,
-                       SUM(CASE WHEN cache_status = 'HIT' THEN 1 ELSE 0 END) AS hits
-                FROM request_events
-                WHERE {where}
-                GROUP BY hour ORDER BY hour
+                SELECT hour, SUM(total), SUM(hits) FROM request_hourly
+                WHERE {where} GROUP BY hour ORDER BY hour
                 """,
                 params,
             ).fetchall()
-        return [{"hour": hour, "total": total, "hits": hits or 0} for hour, total, hits in rows]
+        return [{"hour": hour, "total": total, "hits": hits} for hour, total, hits in rows]
 
 
     def get_prefetch_efficiency(self) -> list[dict]:
@@ -230,16 +194,47 @@ class RequestsStore:
         ]
 
 
+    def _delete_requests(self, where: str, params: tuple) -> int:
+        """Delete matching request_events rows in bounded transactions.
+
+        The triggers in storage.schema move each row out of the rollups, which
+        makes a delete roughly ten times dearer than a bare one; one statement
+        over a large backlog would hold the write lock (blocking every
+        incoming request record) for its whole duration. Each chunk commits
+        separately."""
+        deleted = 0
+        while True:
+            with self.db.connect() as conn:
+                count = conn.execute(
+                    f"DELETE FROM request_events WHERE id IN "
+                    f"(SELECT id FROM request_events WHERE {where} LIMIT ?)",
+                    (*params, _PRUNE_CHUNK),
+                ).rowcount
+            deleted += count
+            if count < _PRUNE_CHUNK:
+                return deleted
+
+
+    def _sweep_rollups(self) -> None:
+        """Drop rollup rows whose count fell to zero (readers already ignore
+        them; this only stops them accumulating)."""
+        with self.db.connect() as conn:
+            conn.execute("DELETE FROM request_counters WHERE total <= 0")
+            conn.execute("DELETE FROM request_hourly WHERE total <= 0")
+
+
     def prune_requests(self, retention_days: int) -> int:
         """Same as prune_events but for request_events — grows much faster
         (on every client request, not just on changes), so retention is
-        usually shorter."""
+        usually shorter. Blocking and proportional to the rows removed: an
+        asynchronous caller should run it in a thread."""
         cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat(
             timespec="seconds"
         )
-        with self.db.connect() as conn:
-            cur = conn.execute("DELETE FROM request_events WHERE ts < ?", (cutoff,))
-            return cur.rowcount
+        deleted = self._delete_requests("ts < ?", (cutoff,))
+        if deleted:
+            self._sweep_rollups()
+        return deleted
 
 
     def prune_requests_by_size(self, max_rows: int) -> int:
@@ -247,15 +242,24 @@ class RequestsStore:
         per-repo: a noticeable share of request_events has repo_id IS NULL
         (path didn't match any repository, see
         runtime.syslog.match_repo_id), so "per repository" doesn't cleanly
-        apply here — we just keep the N most recent requests overall."""
+        apply here — we just keep the N most recent requests overall.
+
+        "Most recent" is (ts DESC, id ASC), which the ts index provides without a
+        sort; rows sharing a timestamp are therefore kept lowest id first. The
+        row at position N is the boundary: it and everything after it goes.
+        A row recorded in the same second as the boundary while this runs can
+        be removed with them, which only matters for limits below one second of
+        traffic. Blocking, like prune_requests."""
         with self.db.connect() as conn:
-            cur = conn.execute(
-                """
-                DELETE FROM request_events
-                WHERE id NOT IN (
-                    SELECT id FROM request_events ORDER BY ts DESC LIMIT ?
-                )
-                """,
+            boundary = conn.execute(
+                "SELECT ts, id FROM request_events ORDER BY ts DESC, id ASC LIMIT 1 OFFSET ?",
                 (max_rows,),
-            )
-            return cur.rowcount
+            ).fetchone()
+        if boundary is None:
+            return 0
+        boundary_ts, boundary_id = boundary
+        deleted = self._delete_requests("ts < ?", (boundary_ts,))
+        deleted += self._delete_requests("ts = ? AND id >= ?", (boundary_ts, boundary_id))
+        if deleted:
+            self._sweep_rollups()
+        return deleted

@@ -172,6 +172,9 @@ in detail.
 - [docs/deployment.md](docs/deployment.md) — production install, systemd,
   nginx, backups, upgrades.
 
+- [Profiling and bounded load tests](docs/profiling.md) — reproducible measurements
+  and explicit operational checks.
+
 ## Contributing
 
 Issues and pull requests are welcome. There's no CI pipeline yet — run

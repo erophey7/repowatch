@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
-from itertools import groupby
 from repowatch.storage.database import Database, _utcnow
 
 class CacheStore:
@@ -155,22 +154,24 @@ class CacheStore:
         actual local cache URIs — this module stays URL-agnostic.
         """
         with self.db.connect() as conn:
-            rows = conn.execute(
+            # Do not materialize unique files in Python. Grouping removes package
+            # aliases but keeps distinct hash groups even if their output tuples match.
+            return conn.execute(
                 """
-                SELECT filename, content_hash, repo_id FROM repo_packages
-                WHERE content_hash IS NOT NULL
-                GROUP BY filename, content_hash, repo_id
-                ORDER BY filename, content_hash, repo_id
+                WITH duplicates AS (
+                    SELECT filename, content_hash, MIN(repo_id) AS canonical
+                    FROM repo_packages WHERE content_hash IS NOT NULL
+                    GROUP BY filename, content_hash
+                    HAVING COUNT(DISTINCT repo_id) > 1
+                )
+                SELECT p.repo_id, d.canonical, p.filename
+                FROM repo_packages p JOIN duplicates d
+                  ON p.filename = d.filename AND p.content_hash = d.content_hash
+                WHERE p.repo_id <> d.canonical
+                GROUP BY p.filename, p.content_hash, p.repo_id, d.canonical
+                ORDER BY p.filename, p.content_hash, p.repo_id
                 """
             ).fetchall()
-        duplicates: list[tuple[str, str, str]] = []
-        for _, group in groupby(rows, key=lambda row: (row[0], row[1])):
-            members = list(group)
-            if len(members) < 2:
-                continue
-            filename, _, canonical_repo_id = members[0]
-            duplicates.extend((repo_id, canonical_repo_id, filename) for _, _, repo_id in members[1:])
-        return duplicates
 
 
     def ban_package(self, repo_id: str, package_name: str) -> None:

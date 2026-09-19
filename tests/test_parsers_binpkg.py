@@ -188,3 +188,38 @@ def test_slackware_components_can_share_client_prefix():
     text = render(c)
     assert text.count('location /slackware/15.0/') == 1
     assert warm_url(c, r, 'patches/packages/x.txz') == warm_url(c, patches, 'patches/packages/x.txz')
+
+
+# --- slice-wise decoding must equal one decode + splitlines over the whole index ---
+
+import random
+
+from repowatch.parsers import gentoo as gentoo_module
+
+
+def _whole_document_lines(raw: bytes):
+    return raw.decode('utf-8').splitlines() + ['']
+
+
+@pytest.mark.parametrize('slice_size', [1, 2, 3, 7, 16, 100])
+def test_gentoo_lines_match_whole_document_splitlines(monkeypatch, slice_size):
+    monkeypatch.setattr(gentoo_module, '_SCAN_SLICE', slice_size)
+    rng = random.Random(slice_size)
+    pieces = ['A: 1', 'CPV: a/b-1', '\n', '\n', '\n\n', '\r\n', '\r', '\x0b', '\x0c', '\x1c', '\x85',
+              ' ', ' ', ' ', 'é', '日本', '\U0001f600', '', ': ']
+    for _ in range(200):
+        raw = ''.join(rng.choice(pieces) for _ in range(rng.randrange(0, 40))).encode()
+        assert list(gentoo_module._lines(raw)) == _whole_document_lines(raw)
+    for raw in (b'', b'\n', b'x', b'x\n', b'\n\n\n', GENTOO):
+        assert list(gentoo_module._lines(raw)) == _whole_document_lines(raw)
+
+
+@pytest.mark.parametrize('slice_size', [1, 4, 33])
+def test_gentoo_slicing_keeps_results_and_rejections(monkeypatch, slice_size):
+    expected = gentoo(GENTOO, ROOT)
+    monkeypatch.setattr(gentoo_module, '_SCAN_SLICE', slice_size)
+    assert gentoo(GENTOO, ROOT) == expected
+    for broken in (GENTOO.replace(b'ARCH: amd64', b'ARCH: am\xffd64'),  # invalid UTF-8 is rejected as before
+                   GENTOO.replace(b'VERSION: 0', b'VERSION: 1'), b''):
+        with pytest.raises(ValueError):
+            gentoo(broken, ROOT)

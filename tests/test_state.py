@@ -368,17 +368,6 @@ def test_get_top_request_paths_orders_by_count_desc(tmp_path):
     assert top[1] == {"key": "/rare.apk", "count": 1}
 
 
-def test_get_requests_by_repo_includes_unmatched_null_repo(tmp_path):
-    store = _store(tmp_path)
-    store.requests.record_request("repo-a", "1.1.1.1", "GET", "/x", "200", "HIT")
-    store.requests.record_request(None, "1.1.1.1", "GET", "/unmatched", "200", "HIT")
-    store.requests.record_request(None, "1.1.1.1", "GET", "/unmatched2", "200", "HIT")
-
-    by_repo = store.requests.get_requests_by_repo()
-
-    assert {"key": "repo-a", "count": 1} in by_repo
-    assert {"key": None, "count": 2} in by_repo
-
 
 def test_bump_failure_increments_and_starts_unnotified(tmp_path):
     store = _store(tmp_path)
@@ -709,3 +698,55 @@ def test_read_only_database_never_initializes_or_writes(tmp_path):
         assert conn.execute('SELECT COUNT(*) FROM repo_state').fetchone() == (0,)
         with pytest.raises(sqlite3.OperationalError, match='readonly'):
             conn.execute("INSERT INTO repo_state (repo_id,last_check) VALUES ('r','')")
+
+
+def test_dedup_query_matches_reference_with_aliases_and_mixed_hashes(tmp_path):
+    from itertools import groupby
+    store = _store(tmp_path)
+    for repo_id in ('a', 'b', 'c'):
+        packages = {f'pkg-{i}': f'file-{i // 2}.deb' for i in range(80)}
+        hashes = {key: str(int(key.split('-')[1]) // 4 % 3) * 64
+                  for key in packages if int(key.split('-')[1]) % 7}
+        if repo_id == 'c':
+            hashes = {key: 'e' * 64 for key in hashes}
+        store.repositories.record_snapshot(RepoSnapshot(repo_id, packages, content_hashes=hashes))
+    with store.database.connect() as conn:
+        rows = conn.execute('SELECT filename,content_hash,repo_id FROM repo_packages '
+            'WHERE content_hash IS NOT NULL GROUP BY filename,content_hash,repo_id '
+            'ORDER BY filename,content_hash,repo_id').fetchall()
+    expected = []
+    for _, group in groupby(rows, key=lambda row: row[:2]):
+        members = list(group)
+        expected.extend((repo_id, members[0][2], filename) for filename, _, repo_id in members[1:])
+    assert store.cache.find_duplicate_files() == expected
+    assert len(expected) > 0
+
+
+def test_dedup_preserves_distinct_hash_groups_with_identical_output_tuples(tmp_path):
+    store = _store(tmp_path)
+    for repo_id in ('a', 'b'):
+        store.repositories.record_snapshot(RepoSnapshot(repo_id,
+            {'v1':'same.deb','v2':'same.deb','alias':'same.deb'},
+            content_hashes={'v1':'a'*64,'v2':'b'*64,'alias':'a'*64}))
+    assert store.cache.find_duplicate_files() == [('b','a','same.deb'),('b','a','same.deb')]
+
+
+def test_request_rollups_upgrade_pre_client_ip_history(tmp_path):
+    path = tmp_path / 'old.sqlite3'
+    with sqlite3.connect(path) as conn:
+        conn.executescript('''
+            CREATE TABLE request_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, repo_id TEXT,
+                method TEXT NOT NULL, path TEXT NOT NULL, status TEXT, cache_status TEXT);
+            INSERT INTO request_events(ts,repo_id,method,path,status,cache_status)
+            VALUES ('2026-01-01T00:00:00+00:00',NULL,'GET','/old','200','HIT');
+        ''')
+    store = ServiceState(path)
+    assert store.requests.get_request_hit_stats() == {None: {'total': 1, 'hits': 1}}
+    assert store.requests.get_top_client_ips() == []
+    assert store.requests.get_top_request_paths() == [{'key': '/old', 'count': 1}]
+    store = ServiceState(path)
+    store.requests.record_request('r', '192.0.2.1', 'GET', '/new', '200', 'MISS')
+    assert store.requests.get_top_client_ips() == [{'key': '192.0.2.1', 'count': 1}]
+    assert store.requests.prune_requests_by_size(0) == 2
+    assert store.requests.get_request_hit_stats() == {}

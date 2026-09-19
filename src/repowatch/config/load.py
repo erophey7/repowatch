@@ -8,10 +8,13 @@ from repowatch.config.models import RepoConfig, StatusServerConfig, SyslogListen
 from repowatch.errors import ConfigError
 from typing import Any
 
+# Optional acceleration already supplied by PyYAML; retain its safe Python fallback.
+_SAFE_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
 def load_config(path: str | Path) -> Config:
     path = Path(path)
     try:
-        raw: dict[str, Any] = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        raw: dict[str, Any] = yaml.load(path.read_text(encoding="utf-8"), Loader=_SAFE_LOADER) or {}
     except (OSError, UnicodeError) as exc:
         raise ConfigError(f"cannot read configuration: {path}") from exc
     except yaml.YAMLError as exc:

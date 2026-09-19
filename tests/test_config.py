@@ -444,3 +444,23 @@ def test_empty_installation_checks_and_reports_without_fetching(tmp_path, monkey
     assert asyncio.run(scheduler.check_all(config, store)) == []
     assert status_payload(path, store) == (200, {})
     assert healthz_payload(path, store) == (200, {"ok": True})
+
+
+@pytest.mark.parametrize('backend', ['SafeLoader', 'CSafeLoader'])
+def test_safe_yaml_backends_preserve_aliases_and_reject_objects(tmp_path, monkeypatch, backend):
+    import importlib
+    import yaml
+    module = importlib.import_module('repowatch.config.load')
+    loader = getattr(yaml, backend, None)
+    if loader is None:
+        pytest.skip('PyYAML C backend unavailable')
+    monkeypatch.setattr(module, '_SAFE_LOADER', loader)
+    path = tmp_path / 'config.yaml'
+    path.write_text('state_db: /tmp/unused.sqlite3\ncache_base_url: &url http://127.0.0.1:8080\n'
+                    'public_cache_url: *url\nrepos: []\n')
+    config = load_config(path)
+    assert config.cache_base_url == config.public_cache_url
+    for invalid in ('state_db: [broken', '!!python/object:builtins.object {}'):
+        path.write_text(invalid)
+        with pytest.raises(ConfigError):
+            load_config(path)

@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from repowatch.config.load import load_config
 from repowatch.config.models import Config, RepoConfig
 from repowatch.errors import ConfigError
-from repowatch.routing import repo_prefix, package_path
+from repowatch.routing import repo_prefix, package_prefix
 from urllib.parse import urlsplit, unquote
 from repowatch.runtime.context import ServiceState
 
@@ -77,29 +77,43 @@ def parse_syslog_line(raw: bytes, tag: str = "repowatch") -> ParsedRequest | Non
     )
 
 
-def match_repo_id(path: str, repos: list[RepoConfig]) -> str | None:
-    """Best-effort match of a request path to a repo_id, using the same
-    prefixes as routing.repo_prefix uses for warming. If several
-    repositories share the same prefix (e.g. two apk repos with the same
-    arch), we deliberately return None instead of guessing."""
-    candidates = []
-    for repo in repos:
-        try:
-            prefix = repo_prefix(repo)
-        except ValueError:
-            continue
-        if path == prefix or path.startswith(prefix + "/"):
-            candidates.append(repo.id)
+class RepoMatcher:
+    """Prepare warming-route prefixes for one listener configuration snapshot."""
 
-    return candidates[0] if len(candidates) == 1 else None
+    def __init__(self, repos: list[RepoConfig]) -> None:
+        """Expand each supported route once, without retaining mutable config objects."""
+        self.prefixes: list[tuple[str, str, str]] = []
+        for repo in repos:
+            try:
+                prefix = repo_prefix(repo)
+            except ValueError:
+                continue
+            self.prefixes.append((repo.id, prefix, prefix + '/'))
+
+    def match(self, path: str) -> str | None:
+        """Return the only matching owner; shared and overlapping routes stay ambiguous."""
+        candidates = [repo_id for repo_id, prefix, child_prefix in self.prefixes
+                      if path == prefix or path.startswith(child_prefix)]
+        return candidates[0] if len(candidates) == 1 else None
+
+
+def match_repo_id(path: str, repos: list[RepoConfig]) -> str | None:
+    """One-shot matching; the listener reuses a RepoMatcher until config reload."""
+    return RepoMatcher(repos).match(path)
 
 
 def package_path_index(repo: RepoConfig, packages: dict[str, str]) -> dict[str, list[str]]:
     """Index complete local routes, preserving every owner of the same file."""
     index: dict[str, list[str]] = {}
+    prefix = package_prefix(repo) + "/"
     for key, filename in packages.items():
         if filename:
-            path = unquote(urlsplit(package_path(repo, filename)).path)
+            path = prefix + filename
+            # Ordinary absolute paths need neither URL parsing nor decoding.
+            # Preserve urlsplit/unquote semantics for authorities, URL suffixes,
+            # percent escapes and characters stripped by the URL parser.
+            if path.startswith('//') or any(char in path for char in '%?#\t\r\n'):
+                path = unquote(urlsplit(path).path)
             index.setdefault(path, []).append(key)
     return index
 
@@ -175,6 +189,7 @@ def run_listener(config_path: str, initial_config: Config, store: ServiceState,
     )
 
     repos = initial_config.repos
+    matcher = RepoMatcher(repos)
     packages_by_repo: dict[str, dict[str, str]] = {}
     by_path: dict[str, dict[str, list[str]]] = {}
     last_revision: dict[str, tuple[int | None, str]] = {}
@@ -198,6 +213,7 @@ def run_listener(config_path: str, initial_config: Config, store: ServiceState,
                     "failed to reload %s in the syslog listener, keeping the previous repository list",
                     config_path,
                 )
+            matcher = RepoMatcher(repos)
             refresh_package_indexes(repos, store, packages_by_repo, by_path, last_revision)
             last_reload = time.monotonic()
 
@@ -216,7 +232,7 @@ def run_listener(config_path: str, initial_config: Config, store: ServiceState,
             # information.
             continue
 
-        repo_id = match_repo_id(parsed.path, repos)
+        repo_id = matcher.match(parsed.path)
         # Computed once, used for both request_events (below) and the
         # warmed_packages loop further down — same matching, two consumers.
         matches = match_all_package_keys(parsed.path, by_path)

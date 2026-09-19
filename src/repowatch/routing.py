@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 import urllib.parse
 from repowatch.config.models import Config, RepoConfig
 from repowatch.errors import ConfigError
@@ -92,19 +93,44 @@ def repo_prefix(repo: RepoConfig) -> str:
     raise ValueError(f"unknown repository type: {repo.type}")
 
 
-def package_path(repo: RepoConfig, filename: str) -> str:
-    """Local path (no scheme/host) this file is reachable at through
-    cache_base_url — factored out so the warm URL and the purge URL (see
-    warm_url/purge_url) share exactly one source of truth for the
-    apt/apt-rpm special-casing, instead of two copies that could drift."""
+def package_prefix(repo: RepoConfig) -> str:
+    """Prefix before a catalog filename, including APT's already-prefixed pool paths."""
     if repo.type == "apt-rpm":
-        return f"{apt_rpm_prefix(repo)}/{filename}"
+        return apt_rpm_prefix(repo)
     if repo.type == "apt":
-        # The apt index's Filename already includes a path like
-        # pool/main/x/xz-utils/... (by itself, without the top segment —
-        # that's added here via apt_prefix)
-        return f"{apt_prefix(repo)}/{filename}"
-    return f"{repo_prefix(repo)}/{filename}"
+        return apt_prefix(repo)
+    return repo_prefix(repo)
+
+
+def package_path(repo: RepoConfig, filename: str) -> str:
+    """Local package path shared by warming, purging and access tracking."""
+    return f"{package_prefix(repo)}/{filename}"
+
+
+class CacheKeyBuilder:
+    """Prepare validated routes once per operation, never across configuration reloads."""
+
+    def __init__(self, config: Config):
+        """Snapshot route validation and the default dedup basis for one operation."""
+        self.key_prefix, self.routes, _ = compute_routes(config)
+        self.dedup = config.nginx.enable_dedup
+
+    def for_repo(self, repo: RepoConfig) -> Callable[..., str]:
+        """Bind invariant local/remote prefixes; preserve filenames and query strings."""
+        local = package_prefix(repo) + '/'
+        for route, (_scheme, host, remote, _ttl) in self.routes.items():
+            if local.startswith(route):
+                remote = remote + local[len(route):]
+                key_base = self.key_prefix + 'http' + host
+                default_dedup = self.dedup
+
+                def key(filename: str, *, dedup: bool | None = None) -> str:
+                    """Build a key under the selected current or historical dedup basis."""
+                    use_remote = default_dedup if dedup is None else dedup
+                    return key_base + (remote if use_remote else local) + filename
+
+                return key
+        raise ValueError(f'{repo.id}: {local!r} does not match any current nginx route')
 
 
 def warm_url(config: Config, repo: RepoConfig, filename: str) -> str:
@@ -149,14 +175,7 @@ def compute_cache_key(config: Config, repo: RepoConfig, filename: str) -> str:
     current routing (e.g. a stale RepoConfig from before a reload) —
     callers always pass a repo drawn from the same `config` they pass here.
     """
-    key_prefix, routes, _kinds = compute_routes(config)
-    local_path = package_path(repo, filename)
-    for local_prefix, (_scheme, host, remote_prefix, _ttl) in routes.items():
-        if local_path.startswith(local_prefix):
-            remote_path = remote_prefix + local_path[len(local_prefix):]
-            basis = remote_path if config.nginx.enable_dedup else local_path
-            return f'{key_prefix}http{host}{basis}'
-    raise ValueError(f'{repo.id}: {filename!r} does not match any current nginx route')
+    return CacheKeyBuilder(config).for_repo(repo)(filename)
 
 
 def _uri(value: str) -> str:

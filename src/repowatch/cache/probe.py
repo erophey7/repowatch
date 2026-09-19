@@ -20,10 +20,10 @@ from __future__ import annotations
 import asyncio
 import httpx
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from repowatch.config.models import Config, RepoConfig
 from repowatch.parsers.base import USER_AGENT
-from repowatch.routing import compute_cache_key
+from repowatch.routing import CacheKeyBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -282,11 +282,11 @@ async def purge_selected_raw(
         return {}
     semaphore = asyncio.Semaphore(config.prefetch_concurrency)
     results: dict[str, str] = {}
-    alt_config = replace(config, nginx=replace(config.nginx, enable_dedup=not config.nginx.enable_dedup))
+    cache_key_for = CacheKeyBuilder(config).for_repo(repo)
 
     async def _run(client: httpx.AsyncClient, key: str, filename: str) -> None:
-        keys = dict.fromkeys((compute_cache_key(config, repo, filename),
-                              compute_cache_key(alt_config, repo, filename)))
+        keys = dict.fromkeys((cache_key_for(filename),
+                              cache_key_for(filename, dedup=not config.nginx.enable_dedup)))
         if canonical_keys and filename in canonical_keys:
             keys[canonical_keys[filename]] = None
         outcomes = []

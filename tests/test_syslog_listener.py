@@ -496,3 +496,87 @@ def test_refresh_detects_same_second_snapshot_and_discards_deleted_repo(tmp_path
     assert packages['r'] == {'b': 'b.pkg'}
     refresh_package_indexes([], store, packages, paths, revisions)
     assert packages == paths == revisions == {}
+
+
+def test_path_index_preserves_decoding_queries_and_alias_owners(monkeypatch):
+    import repowatch.runtime.syslog as listener
+    repo = RepoConfig(id='r', type='apt', upstream='https://example.org/ubuntu',
+                      arch='amd64', distribution='noble', component='main')
+    original = listener.package_prefix
+    calls = []
+    def prefix(repo):
+        calls.append(repo.id)
+        return original(repo)
+    monkeypatch.setattr(listener, 'package_prefix', prefix)
+    assert listener.package_path_index(repo, {
+        'a': 'pool/main/a%20b.deb?hash=one',
+        'alias': 'pool/main/a%20b.deb?hash=two',
+        'empty': '',
+    }) == {'/ubuntu/pool/main/a b.deb': ['a', 'alias']}
+    assert calls == ['r']
+
+
+def test_prepared_repo_matcher_keeps_ambiguity_and_config_snapshot():
+    from repowatch.runtime.syslog import RepoMatcher
+    repos = [_pacman_repo('a', 'core')]
+    first = RepoMatcher(repos)
+    repos.append(_pacman_repo('b', 'core'))
+    assert first.match('/arch/core/os/x86_64/file.pkg') == 'a'
+    assert RepoMatcher(repos).match('/arch/core/os/x86_64/file.pkg') is None
+    assert first.match('/arch/core/os/x86_64-other/file.pkg') is None
+    assert first.match('/arch/core/os/x86_64') == 'a'
+
+
+def test_path_index_shortcut_matches_url_oracle():
+    from urllib.parse import unquote, urlsplit
+    from repowatch.routing import package_prefix
+    filenames = ['plain.pkg', 'dir/file.pkg', 'a%2Fb', 'a%252Fb', 'a%FF',
+                 'a?query#fragment', 'a#fragment', 'a\tb', 'a\rb', 'a\nb',
+                 'a\x00b', 'a\x1fb', 'café/包.pkg', '../a', '//host/path',
+                 '\u2028path', ' space ', 'a\\b', 'a%zz']
+    repos = [_pacman_repo('p', 'core'), RepoConfig(id='a', type='apt',
+        upstream='https://example.org', arch='amd64', distribution='stable', component='main')]
+    packages = {str(i): name for i, name in enumerate(filenames)}
+    packages['alias'] = filenames[0]
+    for repo in repos:
+        expected = {}
+        for key, filename in packages.items():
+            path = unquote(urlsplit(package_prefix(repo) + '/' + filename).path)
+            expected.setdefault(path, []).append(key)
+        assert package_path_index(repo, packages) == expected
+
+
+def test_listener_rebuilds_repo_matcher_on_config_reload(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from repowatch.config.models import Config, StatusServerConfig
+    import repowatch.runtime.syslog as listener
+    store = ServiceState(tmp_path / 'state.sqlite3')
+    config = Config(state_db=store.database.db_path, check_interval=300,
+                    cache_base_url='http://127.0.0.1:8080', status_server=StatusServerConfig(),
+                    repos=[_pacman_repo('old', 'core')])
+    updated = replace(config, repos=[_pacman_repo('new', 'extra')])
+    monkeypatch.setattr(listener, 'load_config', lambda _: updated)
+    ticks = iter([0, 1, 61, 61, 62])
+    monkeypatch.setattr(listener.time, 'monotonic', lambda: next(ticks))
+    stop = threading.Event()
+    paths = iter(['/arch/core/os/x86_64/a', '/arch/extra/os/x86_64/b', '/arch/core/os/x86_64/c'])
+
+    class Packets:
+        def recvfrom(self, size):
+            path = next(paths)
+            if path.endswith('/c'):
+                stop.set()
+            return f'repowatch: 192.0.2.1 GET {path} 200 HIT'.encode(), ('127.0.0.1', 1)
+
+    run_listener('unused.yaml', config, store, sock=Packets(), stop=stop)
+    with store.database.connect() as conn:
+        rows = conn.execute('SELECT repo_id FROM request_events ORDER BY id').fetchall()
+    assert rows == [('old',), ('new',), (None,)]
+
+
+def test_path_index_retains_url_parser_errors_for_authorities():
+    import pytest
+    repo = RepoConfig(id='r', type='apt', upstream='https://example.org',
+                      arch='amd64', distribution='stable', component='main')
+    with pytest.raises(ValueError):
+        package_path_index(repo, {'broken': '/[invalid-authority'})

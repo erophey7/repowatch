@@ -1068,3 +1068,28 @@ def test_apply_file_failure_restores_entire_generation(tmp_path, monkeypatch, fa
     for name in names:
         assert (tmp_path / name).read_text() == '# old ' + name
     assert json.loads((tmp_path / 'status.json').read_text())['rollback_failed'] is False
+
+
+@pytest.mark.parametrize('dedup', [False, True])
+def test_prepared_cache_keys_keep_route_snapshot_and_alternate_basis(dedup, monkeypatch):
+    repo = RepoConfig('core', 'pacman', 'https://mirror.test/core/os/x86_64',
+                      'x86_64', repo_name='core', url_template='/custom/core')
+    c = config([repo])
+    c = replace(c, nginx=replace(c.nginx, enable_dedup=dedup, cache_key_version='v2'))
+    original = routing.compute_routes
+    calls = []
+    def counted(config):
+        calls.append(config)
+        return original(config)
+    monkeypatch.setattr(routing, 'compute_routes', counted)
+    key = routing.CacheKeyBuilder(c).for_repo(repo)
+    for i in range(30):
+        filename = f'package-{i}.pkg.tar.zst?hash=a%2Fb'
+        assert key(filename) == 'v2:httpmirror.test' + (
+            '/core/os/x86_64/' if dedup else '/custom/core/') + filename
+        assert key(filename, dedup=not dedup) == 'v2:httpmirror.test' + (
+            '/custom/core/' if dedup else '/core/os/x86_64/') + filename
+    assert len(calls) == 1
+    new_config = replace(c, nginx=replace(c.nginx, cache_key_version='v3'))
+    assert routing.CacheKeyBuilder(new_config).for_repo(repo)('x').startswith('v3:')
+    assert key('x').startswith('v2:')

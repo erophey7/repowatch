@@ -271,3 +271,94 @@ def _search_index(conn: sqlite3.Connection) -> bool:
         INSERT INTO package_search(rowid, package_key, package_name)
         VALUES (new.rowid, new.package_key, new.package_name); END""")
     return True
+
+
+# Derived request statistics. request_events stays the log (recent-requests
+# list, prefetch efficiency); the dashboard and /metrics aggregates are read
+# from these tables instead of grouping the whole retained history on every
+# poll. Triggers maintain them for every writer, like package_search above, so
+# pruning, direct SQL and older code that only knows request_events cannot
+# desynchronize them.
+#
+# request_counters.repo_key scopes a counter: 'r:<repo_id>' for one repository,
+# '' for requests that matched no repository, '*' for all requests (only the
+# 'ip' and 'path' kinds keep '*' rows, so a global top-N is a single index range).
+# Rows are only ever updated in place by the triggers; a count that reaches
+# zero stays until RequestsStore's prune sweep removes it, and readers ignore it.
+_ROLLUP_TABLES = (
+    """CREATE TABLE IF NOT EXISTS request_counters (
+    kind     TEXT NOT NULL,             -- 'repo' | 'ip' | 'path'
+    repo_key TEXT NOT NULL,
+    key      TEXT NOT NULL,             -- client IP / request path / '' for 'repo'
+    total    INTEGER NOT NULL,
+    hits     INTEGER NOT NULL DEFAULT 0, -- cache HITs; only maintained for 'repo'
+    PRIMARY KEY (kind, repo_key, key)
+) WITHOUT ROWID""",
+    """CREATE TABLE IF NOT EXISTS request_hourly (
+    hour     TEXT NOT NULL,             -- 'YYYY-MM-DDTHH' prefix of request_events.ts (UTC)
+    repo_key TEXT NOT NULL,             -- as above, never '*'
+    total    INTEGER NOT NULL,
+    hits     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (hour, repo_key)
+) WITHOUT ROWID""",
+)
+
+
+def _rollup_triggers() -> list[str]:
+    """Trigger DDL: one pair (always / only with a client_ip) per row event."""
+    triggers = []
+    for name, event, row, add in (("insert", "INSERT", "new", True), ("delete", "DELETE", "old", False)):
+        repo_key = f"CASE WHEN {row}.repo_id IS NULL THEN '' ELSE 'r:' || {row}.repo_id END"
+        hit = f"CASE WHEN {row}.cache_status = 'HIT' THEN 1 ELSE 0 END"
+
+        def counter(kind: str, scope: str, key: str, hits: str = "0") -> str:
+            """One counter statement: an upsert for an insert trigger, an in-place decrement for a delete trigger."""
+            if add:
+                return (f"INSERT INTO request_counters (kind, repo_key, key, total, hits) "
+                        f"VALUES ('{kind}', {scope}, {key}, 1, {hits}) "
+                        f"ON CONFLICT (kind, repo_key, key) DO UPDATE SET total = total + 1, hits = hits + {hits};")
+            return (f"UPDATE request_counters SET total = total - 1, hits = hits - {hits} "
+                    f"WHERE kind = '{kind}' AND repo_key = {scope} AND key = {key};")
+
+        if add:
+            hourly = (f"INSERT INTO request_hourly (hour, repo_key, total, hits) "
+                      f"VALUES (substr({row}.ts, 1, 13), {repo_key}, 1, {hit}) "
+                      f"ON CONFLICT (hour, repo_key) DO UPDATE SET total = total + 1, hits = hits + {hit};")
+        else:
+            hourly = (f"UPDATE request_hourly SET total = total - 1, hits = hits - {hit} "
+                      f"WHERE hour = substr({row}.ts, 1, 13) AND repo_key = {repo_key};")
+        always = [counter("repo", repo_key, "''", hit),
+                  counter("path", repo_key, f"{row}.path"), counter("path", "'*'", f"{row}.path"), hourly]
+        with_ip = [counter("ip", repo_key, f"{row}.client_ip"), counter("ip", "'*'", f"{row}.client_ip")]
+        triggers.append(f"CREATE TRIGGER request_rollup_{name} AFTER {event} ON request_events BEGIN "
+                        + " ".join(always) + " END")
+        triggers.append(f"CREATE TRIGGER request_rollup_ip_{name} AFTER {event} ON request_events "
+                        f"WHEN {row}.client_ip IS NOT NULL BEGIN " + " ".join(with_ip) + " END")
+    return triggers
+
+
+def _request_rollups(conn: sqlite3.Connection) -> None:
+    """Create the rollup tables/triggers once and fill them from existing history.
+
+    Runs inside the initialization transaction, so a crash leaves either no
+    rollups or complete ones. request_events rows are append/delete-only; nothing
+    updates ts/repo_id/client_ip/path/cache_status in place."""
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'request_rollup_insert'").fetchone():
+        return
+    for statement in _ROLLUP_TABLES:
+        conn.execute(statement)
+    conn.execute("DELETE FROM request_counters")
+    conn.execute("DELETE FROM request_hourly")
+    scope = "CASE WHEN repo_id IS NULL THEN '' ELSE 'r:' || repo_id END"
+    hit = "SUM(CASE WHEN cache_status = 'HIT' THEN 1 ELSE 0 END)"
+    conn.execute(f"INSERT INTO request_counters (kind, repo_key, key, total, hits) "
+                 f"SELECT 'repo', {scope}, '', COUNT(*), {hit} FROM request_events GROUP BY 2")
+    for kind, column, where in (("ip", "client_ip", "WHERE client_ip IS NOT NULL"), ("path", "path", "")):
+        conn.execute(f"INSERT INTO request_counters (kind, repo_key, key, total, hits) "
+                     f"SELECT '{kind}', {scope}, {column}, COUNT(*), 0 FROM request_events {where} GROUP BY 2, 3")
+        conn.execute(f"INSERT INTO request_counters (kind, repo_key, key, total, hits) "
+                     f"SELECT '{kind}', '*', {column}, COUNT(*), 0 FROM request_events {where} GROUP BY 3")
+    conn.execute(f"INSERT INTO request_hourly (hour, repo_key, total, hits) "
+                 f"SELECT substr(ts, 1, 13), {scope}, COUNT(*), {hit} FROM request_events GROUP BY 1, 2")
+    for trigger in _rollup_triggers():
+        conn.execute(trigger)

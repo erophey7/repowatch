@@ -58,7 +58,8 @@ def seed(root: Path, repos: int, packages: int, events: int) -> tuple[ServiceSta
             "INSERT INTO request_events (ts,repo_id,client_ip,method,path,status,cache_status) VALUES (?,?,?,?,?,?,?)",
             ((now, f"r{i % repos}", f"192.0.2.{i % 200 + 1}", "GET", f"/debian/pool/main/p/pkg-{i % packages:07}_1_amd64.deb", "200", "HIT") for i in range(events)),
         )
-        conn.execute("INSERT INTO warmed_packages SELECT repo_id,package_key,filename,?,'ok',200 FROM repo_packages WHERE rowid % 2 = 0", (now,))
+        conn.execute("INSERT INTO warmed_packages (repo_id,package_key,filename,warmed_at,status,http_status) "
+                     "SELECT repo_id,package_key,filename,?,'ok',200 FROM repo_packages WHERE rowid % 2 = 0", (now,))
     return store, config, snapshot
 
 

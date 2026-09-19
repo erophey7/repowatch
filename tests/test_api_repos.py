@@ -1712,3 +1712,37 @@ def test_read_payload_keeps_the_authorized_config_snapshot(tmp_path):
     assert repos_list_payload(config_path, store, current=current)[0] == 200
     assert metrics_payload(config_path, store, current=current)[0] == 200
     assert status_payload(config_path, store)[0] == 503
+
+
+def test_request_summary_global_top_limit_and_fresh_retention(tmp_path):
+    _, store = _setup(tmp_path)
+    for i in range(23):
+        for _ in range(i + 1):
+            store.requests.record_request(f'r{i:02}', '192.0.2.1', 'GET', '/x', '200', 'HIT')
+    store.requests.record_request(None, None, 'GET', '/unknown', '404', None)
+    status, summary = requests_summary_payload(store, repo_id='r00')
+    assert status == 200
+    assert summary['by_repo'] == [{'key': f'r{i:02}', 'count': i + 1} for i in range(22, 2, -1)]
+    assert len(summary['by_repo']) == 20
+    assert summary['by_client_ip'] == [{'key': '192.0.2.1', 'count': 1}]
+    assert {'repo_id': None, 'total': 1, 'hits': 0} in summary['cache_hit_stats']
+    # Retention must immediately affect both global and filtered aggregates.
+    store.requests.prune_requests_by_size(0)
+    _, empty = requests_summary_payload(store, repo_id=None)
+    assert all(value == [] for value in empty.values())
+    store.requests.record_request('new', None, 'GET', '/new', '200', 'MISS')
+    _, fresh = requests_summary_payload(store, repo_id=None)
+    assert fresh['by_repo'] == [{'key': 'new', 'count': 1}]
+    assert fresh['cache_hit_stats'] == [{'repo_id': 'new', 'total': 1, 'hits': 0}]
+
+
+def test_request_summary_includes_unmatched_null_repo(tmp_path):
+    _, store = _setup(tmp_path)
+    store.requests.record_request("repo-a", "1.1.1.1", "GET", "/x", "200", "HIT")
+    store.requests.record_request(None, "1.1.1.1", "GET", "/unmatched", "200", "HIT")
+    store.requests.record_request(None, "1.1.1.1", "GET", "/unmatched2", "200", "HIT")
+
+    by_repo = requests_summary_payload(store, repo_id=None)[1]["by_repo"]
+
+    assert {"key": "repo-a", "count": 1} in by_repo
+    assert {"key": None, "count": 2} in by_repo

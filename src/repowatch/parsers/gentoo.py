@@ -8,13 +8,31 @@ import re
 from repowatch.models import PackageRef
 from repowatch.parsers.base import IndexParser, safe_package_path
 
+# Decoding and splitting the whole 20 MiB index in single C calls holds the GIL for
+# a quarter of a second at a time; work through it in slices of this many bytes.
+_SCAN_SLICE = 1024 * 1024
 _CPV = re.compile(r'([A-Za-z0-9_+.-]+/[A-Za-z0-9_+.-]+)-([0-9]+(?:\.[0-9]+)*[a-z]?(?:_(?:alpha|beta|pre|rc|p)[0-9]*)*(?:-r[0-9]+)?)')
+
+
+def _lines(raw: bytes):
+    """The lines of raw.decode('utf-8').splitlines(), then one empty line, one slice at a time.
+
+    A slice ends right after an LF, so no line (or "\\r\\n" pair, or multi-byte
+    character: UTF-8 continuation bytes are never 0x0A) is split between slices
+    and every separator str.splitlines() knows behaves as in a single call."""
+    position, end = 0, len(raw)
+    while position < end:
+        stop = raw.find(b'\n', position + _SCAN_SLICE)
+        stop = end if stop < 0 else stop + 1
+        yield from raw[position:stop].decode('utf-8').splitlines()
+        position = stop
+    yield ''
 
 
 def _parse_packages(raw: bytes, upstream: str) -> list[PackageRef]:
     records = []
     current: dict[str, str] = {}
-    for line in raw.decode('utf-8').splitlines() + ['']:
+    for line in _lines(raw):
         if not line.strip():
             if current:
                 records.append(current)

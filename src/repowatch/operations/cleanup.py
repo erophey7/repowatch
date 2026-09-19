@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import repowatch.cache.probe as cache_probe
 from repowatch.cache.purge import purge_selected
@@ -49,7 +50,10 @@ async def prune_all(config: Config, store: ServiceState) -> None:
     if pruned:
         logger.debug("cleaned up %d stale repo_events rows", pruned)
 
-    pruned_requests = store.requests.prune_requests(config.request_retention_days)
+    # Each removed request row also updates the statistics rollups, so a backlog
+    # takes long enough to stall the event loop; run it in a worker thread
+    # (every store call opens its own connection).
+    pruned_requests = await asyncio.to_thread(store.requests.prune_requests, config.request_retention_days)
     if pruned_requests:
         logger.debug("cleaned up %d stale request_events rows", pruned_requests)
 
@@ -82,7 +86,8 @@ async def prune_all(config: Config, store: ServiceState) -> None:
             )
 
     if config.request_max_rows is not None:
-        pruned_requests_by_size = store.requests.prune_requests_by_size(config.request_max_rows)
+        pruned_requests_by_size = await asyncio.to_thread(
+            store.requests.prune_requests_by_size, config.request_max_rows)
         if pruned_requests_by_size:
             logger.debug(
                 "cleaned up %d request_events rows over the global %d-row limit",
@@ -109,14 +114,18 @@ async def purge_items(config: Config, repo: RepoConfig, items: dict[str, str], s
     if config.nginx.enable_cache_probe:
         canonical_keys = {}
         if config.nginx.enable_dedup:
-            from repowatch.routing import compute_cache_key
+            from repowatch.routing import CacheKeyBuilder
+            builder = CacheKeyBuilder(config)
+            canonical_builders = {}
             selected = set(items.values())
             for duplicate_id, canonical_id, filename in store.cache.find_duplicate_files():
                 if duplicate_id != repo.id or filename not in selected:
                     continue
                 canonical = config.repo_by_id(canonical_id)
                 if canonical is not None:
-                    canonical_keys[filename] = compute_cache_key(config, canonical, filename)
+                    if canonical_id not in canonical_builders:
+                        canonical_builders[canonical_id] = builder.for_repo(canonical)
+                    canonical_keys[filename] = canonical_builders[canonical_id](filename)
         if canonical_keys:
             return await cache_probe.purge_selected_raw(
                 config, repo, items, canonical_keys=canonical_keys)

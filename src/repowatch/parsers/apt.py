@@ -87,10 +87,143 @@ class AptParser(IndexParser):
         return await asyncio.to_thread(_parse_packages_gz, raw)
 
 
+# Fast path: only the four consumed fields are located, with a literal "\n" prefix
+# so the regex engine can skip to candidate lines instead of testing every offset.
+_FIRST_FIELD = re.compile(rb"(Package|Version|Filename|SHA256):([^\r\n]*)")
+_LATER_FIELDS = re.compile(rb"\n(Package|Version|Filename|SHA256):([^\r\n]*)")
+_SHA256_HEX = re.compile(r"[0-9a-fA-F]{64}")
+
+# str.splitlines() also breaks on these. The fast path only splits on LF, so an
+# index containing any of them is parsed by the reference implementation.
+_ASCII_LINE_BREAKS = (b"\r", b"\x0b", b"\x0c", b"\x1c", b"\x1d", b"\x1e")
+_NEL = (b"\xc2\x85",)                          # U+0085
+_LINE_SEPARATORS = (b"\xe2\x80\xa8", b"\xe2\x80\xa9")  # U+2028, U+2029
+# Lead-byte occurrences inspected one by one before switching to a direct
+# substring search, which is slower but linear whatever the input looks like.
+_LEAD_BYTE_SCAN_LIMIT = 4096
+# A single C call over the whole 70 MiB document (regex scan, substring search)
+# holds the GIL for up to a quarter of a second, stalling the event loop and HTTP
+# threads of the same process. Scan in slices of this many bytes instead; the
+# interpreter can hand the GIL over between calls.
+_SCAN_SLICE = 1024 * 1024
+
+
 def _parse_packages_gz(raw: bytes) -> list[PackageRef]:
-    """The CPU-heavy part (gzip + line-by-line parsing) — called via
-    asyncio.to_thread, see fetch_packages above."""
-    text = gzip.decompress(raw).decode("utf-8", errors="replace")
+    """The CPU-heavy part (gzip + parsing) — called via asyncio.to_thread,
+    see fetch_packages above."""
+    return _parse_packages(gzip.decompress(raw))
+
+
+def _parse_packages(data: bytes) -> list[PackageRef]:
+    """Extract Package/Version/Filename/SHA256 from a deb822 Packages document.
+
+    Results are identical to _parse_packages_reference (the oracle in tests),
+    including replacement decoding of invalid UTF-8: only the used fields are
+    decoded, not the whole document. Documents with line breaks other than LF
+    take the reference path, so unusual separators cannot change the result."""
+    if _has_unusual_line_break(data):
+        return _parse_packages_reference(data)
+
+    first = _FIRST_FIELD.match(data)
+    fields = _field_lines(data)
+    if first is not None:
+        fields.insert(0, first.groups())
+
+    packages: list[PackageRef] = []
+    name: str | None = None
+    version: str | None = None
+    filename: str | None = None
+    content_hash: str | None = None
+
+    for field, raw_value in fields:
+        value = raw_value.decode("utf-8", errors="replace").strip()
+        if field == b"Package":
+            # start of a new stanza — save the previous one if it was complete
+            if name and version:
+                packages.append(PackageRef(name=name, version=version, filename=filename, content_hash=content_hash))
+            name = value
+            version = None
+            filename = None
+            content_hash = None
+        elif field == b"Version":
+            version = value
+        elif field == b"Filename":
+            filename = value
+        else:
+            # Standard per-stanza field, distinct from the by-hash SHA256 of
+            # the whole Packages.gz index checked elsewhere (verification/gpg.py) —
+            # this one is per package file, used for cross-repo dedup
+            # (docs_dev/ROADMAP.md item 29).
+            content_hash = value if _SHA256_HEX.fullmatch(value) else None
+
+    if name and version:
+        packages.append(PackageRef(name=name, version=version, filename=filename, content_hash=content_hash))
+
+    return packages
+
+
+def _field_lines(data: bytes) -> list[tuple[bytes, bytes]]:
+    """(field, raw value) for every used field on a line after the first, in order.
+
+    Slices end at an LF, and the next slice starts on that LF, which is where
+    every match begins: no match is split or lost, and a value can only end at
+    an LF or at the end of the data, so slicing does not change any result."""
+    fields: list[tuple[bytes, bytes]] = []
+    position, end = 0, len(data)
+    while position < end:
+        stop = data.find(b"\n", position + _SCAN_SLICE)
+        if stop < 0:
+            stop = end
+        fields.extend(_LATER_FIELDS.findall(data, position, stop))
+        position = stop
+    return fields
+
+
+def _find(data: bytes, needle: bytes, start: int = 0) -> int:
+    """bytes.find(needle, start) in bounded slices (see _SCAN_SLICE)."""
+    overlap = len(needle) - 1
+    end = len(data)
+    while start < end:
+        stop = start + _SCAN_SLICE
+        position = data.find(needle, start, min(stop + overlap, end))
+        if position != -1:
+            return position
+        start = stop
+    return -1
+
+
+def _has_unusual_line_break(data: bytes) -> bool:
+    """True if str.splitlines() could split the decoded text somewhere other than at LF.
+
+    Byte-level and deliberately conservative: it looks for the UTF-8 encodings
+    of the separators, and any real occurrence in the decoded text implies one
+    here (a lead byte such as 0xC2 always starts a new sequence)."""
+    if any(_find(data, separator) != -1 for separator in _ASCII_LINE_BREAKS):
+        return True
+    return (_has_encoded_break(data, b"\xc2", _NEL)
+            or _has_encoded_break(data, b"\xe2", _LINE_SEPARATORS))
+
+
+def _has_encoded_break(data: bytes, lead: bytes, sequences: tuple[bytes, ...]) -> bool:
+    """True if any of the multi-byte `sequences` (all starting with `lead`) occurs in data."""
+    inspected = 0
+    position = _find(data, lead)
+    while position != -1:
+        if data.startswith(sequences, position):
+            return True
+        inspected += 1
+        if inspected > _LEAD_BYTE_SCAN_LIMIT:
+            return any(_find(data, sequence) != -1 for sequence in sequences)
+        position = _find(data, lead, position + 1)
+    return False
+
+
+def _parse_packages_reference(data: bytes) -> list[PackageRef]:
+    """Line-by-line parser over the fully decoded document.
+
+    Defines the behavior the fast path must match; also handles every document
+    the fast path declines."""
+    text = data.decode("utf-8", errors="replace")
 
     packages: list[PackageRef] = []
     name: str | None = None
@@ -112,12 +245,8 @@ def _parse_packages_gz(raw: bytes) -> list[PackageRef]:
         elif line.startswith("Filename:"):
             filename = line.split(":", 1)[1].strip()
         elif line.startswith("SHA256:"):
-            # Standard per-stanza field, distinct from the by-hash SHA256 of
-            # the whole Packages.gz index checked elsewhere (verification/gpg.py) —
-            # this one is per package file, used for cross-repo dedup
-            # (docs_dev/ROADMAP.md item 29).
             value = line.split(":", 1)[1].strip()
-            content_hash = value if re.fullmatch(r"[0-9a-fA-F]{64}", value) else None
+            content_hash = value if _SHA256_HEX.fullmatch(value) else None
 
     if name and version:
         packages.append(PackageRef(name=name, version=version, filename=filename, content_hash=content_hash))

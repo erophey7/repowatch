@@ -28,18 +28,22 @@ def paged_payload(store: ServiceState, kind: str, repo_id: str | None, query: st
 def requests_summary_payload(store: ServiceState, repo_id: str | None, timeline_hours: int = 24) -> tuple[int, dict]:
     """Aggregates for the dashboard's request charts (top IPs/paths, requests
     per repository, an hourly timeline, and per-repo cache HIT/MISS) —
-    already-computed counters, separate from the paged request list. by_repo
+    computed from retained request history, separate from the paged list. by_repo
     and cache_hit_stats ignore the repo_id filter (already broken down by
     repository); timeline respects it (a per-repo or global chart, per the
     dashboard's current selection)."""
+    hit_stats = store.requests.get_request_hit_stats()
+    # The hit aggregate already contains the global repository counts. Reuse
+    # its snapshot instead of scanning history again for the same totals.
+    busiest = sorted(hit_stats, key=lambda repo: -hit_stats[repo]['total'])[:20]
     return 200, {
         "by_client_ip": store.requests.get_top_client_ips(repo_id=repo_id),
         "by_path": store.requests.get_top_request_paths(repo_id=repo_id),
-        "by_repo": store.requests.get_requests_by_repo(),
+        "by_repo": [{"key": repo, "count": hit_stats[repo]['total']} for repo in busiest],
         "timeline": store.requests.get_requests_timeline(repo_id=repo_id, hours=timeline_hours),
         "cache_hit_stats": [
             {"repo_id": rid, "total": v["total"], "hits": v["hits"]}
-            for rid, v in store.requests.get_request_hit_stats().items()
+            for rid, v in hit_stats.items()
         ],
     }
 
