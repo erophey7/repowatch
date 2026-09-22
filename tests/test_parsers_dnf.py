@@ -263,7 +263,7 @@ def test_primary_parser_only_requests_bounded_chunks():
 
 
 def test_parse_primary_reads_the_per_package_sha256_checksum():
-    """docs_dev/ROADMAP.md item 29 — content_hash comes from the per-package
+    """Cross-repo dedup: content_hash comes from the per-package
     <checksum type="sha256">, not the container-level checksum in repomd.xml
     (that one's already covered by _checked_primary/_parse_repomd tests)."""
     valid = 'c' * 64

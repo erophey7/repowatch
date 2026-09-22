@@ -345,6 +345,198 @@ test('dashboard manual cache purge: scan shows candidates all-checked, purge rep
   }
 });
 
+test('storage panel: scan shows orphaned repos all-checked, delete reports outcomes and cleans up', async () => {
+  const calls = [];
+  const repo = {id: 'r', type: 'apt', upstream: 'example', config: {}, package_count: 1000};
+  let orphaned = {
+    'gone-1': {repo_state: 1, repo_packages: 3, repo_events: 2},
+    'gone-2': {warmed_packages: 1},
+  };
+  const dom = new JSDOM(html, {
+    url: 'http://localhost/', runScripts: 'dangerously',
+    beforeParse(w) {
+      w.fetch = async (raw, options = {}) => {
+        const url = new URL(raw, 'http://localhost');
+        calls.push({url, options, body: options.body ? JSON.parse(options.body) : null});
+        let data = [];
+        if (url.pathname === '/api/auth/session') data = {role: 'admin', csrf_token: 'csrf'};
+        else if (url.pathname === '/api/repos') data = [repo];
+        else if (url.pathname.endsWith('/summary')) data = {by_client_ip: [], by_path: [], by_repo: [], timeline: [], cache_hit_stats: []};
+        else if (url.pathname === '/api/stats') data = {state_db_bytes: 1234, tables: {repo_packages: 5}};
+        else if (url.pathname === '/api/storage/orphans' && options.method === 'POST') {
+          const ids = JSON.parse(options.body).repo_ids;
+          data = {deleted: Object.fromEntries(ids.filter(id => id in orphaned).map(id => [id, orphaned[id]]))};
+          orphaned = Object.fromEntries(Object.entries(orphaned).filter(([id]) => !ids.includes(id)));
+        } else if (url.pathname === '/api/storage/orphans') data = {orphaned};
+        else if (url.pathname.endsWith('/packages')) data = {items: [], next_cursor: null};
+        else if (url.pathname.endsWith('/warmed')) data = {items: [], next_cursor: null};
+        else if (url.pathname === '/api/requests') data = {items: [], next_cursor: null};
+        else if (url.pathname.endsWith('/bans')) data = [];
+        return {ok: true, json: async () => data};
+      };
+    }
+  });
+  try {
+    const w = dom.window, doc = w.document;
+    w.confirm = () => true;
+    await delay(30);
+
+    const orphansList = doc.getElementById('orphans-list');
+    assert.equal(orphansList.hidden, true);
+    doc.getElementById('scan-orphans-btn').click();
+    await delay(20);
+    assert.equal(orphansList.hidden, false);
+    const checkboxes = [...orphansList.querySelectorAll('input')];
+    assert.equal(checkboxes.length, 2);
+    assert(checkboxes.every(cb => cb.checked)); // all checked by default
+    assert.equal(doc.getElementById('orphans-actions').hidden, false);
+    assert.match(doc.getElementById('orphans-msg').textContent, /2 orphaned repository/);
+
+    // Uncheck one, delete the other.
+    checkboxes.find(cb => cb.value === 'gone-2').checked = false;
+    doc.getElementById('orphans-delete-btn').click();
+    await delay(30);
+    const deleteCall = calls.find(c => c.url.pathname === '/api/storage/orphans' && c.options.method === 'POST');
+    assert.deepEqual(deleteCall.body.repo_ids, ['gone-1']);
+    assert.match(doc.getElementById('orphans-msg').textContent, /Deleted: 1/);
+    // Re-scan happened automatically — the deleted one is gone from the list.
+    assert.deepEqual([...orphansList.querySelectorAll('input')].map(cb => cb.value), ['gone-2']);
+    // The storage stats panel above was also refreshed (row counts just changed).
+    assert(calls.some(c => c.url.pathname === '/api/stats'));
+  } finally {
+    dom.window.close();
+  }
+});
+
+test('storage panel: scan shows zombie packages all-checked across repos, purge reports outcomes', async () => {
+  const calls = [];
+  const repo = {id: 'r', type: 'apt', upstream: 'example', config: {}, package_count: 1000};
+  let candidates = [
+    {repo_id: 'alpine-test', package_key: 'gone-1', filename: 'gone-1.apk'},
+    {repo_id: 'arch-extra', package_key: 'firefox-155.0.1-1', filename: 'firefox-155.0.1-1.pkg'},
+  ];
+  const dom = new JSDOM(html, {
+    url: 'http://localhost/', runScripts: 'dangerously',
+    beforeParse(w) {
+      w.fetch = async (raw, options = {}) => {
+        const url = new URL(raw, 'http://localhost');
+        calls.push({url, options, body: options.body ? JSON.parse(options.body) : null});
+        let data = [];
+        if (url.pathname === '/api/auth/session') data = {role: 'admin', csrf_token: 'csrf'};
+        else if (url.pathname === '/api/repos') data = [repo];
+        else if (url.pathname.endsWith('/summary')) data = {by_client_ip: [], by_path: [], by_repo: [], timeline: [], cache_hit_stats: []};
+        else if (url.pathname === '/api/stats') data = {state_db_bytes: 1234, tables: {repo_packages: 5}};
+        else if (url.pathname === '/api/storage/zombies' && options.method === 'POST') {
+          const items = JSON.parse(options.body).items;
+          const results = {};
+          for (const {repo_id, package_key} of items) {
+            (results[repo_id] ||= {})[package_key] = package_key === 'gone-1' ? 'purged' : 'not_cached';
+          }
+          data = {results};
+          candidates = candidates.filter(c => !items.some(i => i.repo_id === c.repo_id && i.package_key === c.package_key));
+        } else if (url.pathname === '/api/storage/zombies') data = {enable_purge: true, candidates};
+        else if (url.pathname === '/api/storage/orphans') data = {orphaned: {}};
+        else if (url.pathname.endsWith('/packages')) data = {items: [], next_cursor: null};
+        else if (url.pathname.endsWith('/warmed')) data = {items: [], next_cursor: null};
+        else if (url.pathname === '/api/requests') data = {items: [], next_cursor: null};
+        else if (url.pathname.endsWith('/bans')) data = [];
+        return {ok: true, json: async () => data};
+      };
+    }
+  });
+  try {
+    const w = dom.window, doc = w.document;
+    await delay(30);
+
+    const zombiesList = doc.getElementById('zombies-list');
+    assert.equal(zombiesList.hidden, true);
+    doc.getElementById('scan-zombies-btn').click();
+    await delay(20);
+    assert.equal(zombiesList.hidden, false);
+    const checkboxes = [...zombiesList.querySelectorAll('input')];
+    assert.equal(checkboxes.length, 2);
+    assert(checkboxes.every(cb => cb.checked)); // all checked by default
+    assert.deepEqual(checkboxes.map(cb => cb.dataset.repo), ['alpine-test', 'arch-extra']);
+    assert.equal(doc.getElementById('zombies-actions').hidden, false);
+    assert.match(doc.getElementById('zombies-msg').textContent, /2 zombie package/);
+
+    doc.getElementById('zombies-purge-btn').click();
+    await delay(30);
+    const purgeCall = calls.find(c => c.url.pathname === '/api/storage/zombies' && c.options.method === 'POST');
+    assert.deepEqual(purgeCall.body.items, [
+      {repo_id: 'alpine-test', package_key: 'gone-1'},
+      {repo_id: 'arch-extra', package_key: 'firefox-155.0.1-1'},
+    ]);
+    assert.match(doc.getElementById('zombies-msg').textContent, /Purged: 1, not cached: 1/);
+    // Re-scan happened automatically — both purged candidates are gone from the list.
+    assert.equal([...zombiesList.querySelectorAll('input')].length, 0);
+  } finally {
+    dom.window.close();
+  }
+});
+
+test('storage panel: zombie scan shows a clear message when enable_purge is off', async () => {
+  const repo = {id: 'r', type: 'apt', upstream: 'example', config: {}, package_count: 1000};
+  const dom = new JSDOM(html, {
+    url: 'http://localhost/', runScripts: 'dangerously',
+    beforeParse(w) {
+      w.fetch = async raw => {
+        const url = new URL(raw, 'http://localhost');
+        let data = [];
+        if (url.pathname === '/api/auth/session') data = {role: 'admin', csrf_token: 'csrf'};
+        else if (url.pathname === '/api/repos') data = [repo];
+        else if (url.pathname.endsWith('/summary')) data = {by_client_ip: [], by_path: [], by_repo: [], timeline: [], cache_hit_stats: []};
+        else if (url.pathname === '/api/stats') data = {state_db_bytes: 0, tables: {}};
+        else if (url.pathname === '/api/storage/zombies') data = {enable_purge: false, candidates: []};
+        else if (url.pathname === '/api/storage/orphans') data = {orphaned: {}};
+        return {ok: true, json: async () => data};
+      };
+    }
+  });
+  try {
+    const w = dom.window, doc = w.document;
+    await delay(30);
+    doc.getElementById('scan-zombies-btn').click();
+    await delay(20);
+    assert.equal(doc.getElementById('zombies-list').hidden, true);
+    assert.match(doc.getElementById('zombies-msg').textContent, /enable_purge is not enabled/);
+  } finally {
+    dom.window.close();
+  }
+});
+
+test('storage panel: nothing selected or nothing found are both handled without a network call', async () => {
+  const repo = {id: 'r', type: 'apt', upstream: 'example', config: {}, package_count: 1000};
+  const dom = new JSDOM(html, {
+    url: 'http://localhost/', runScripts: 'dangerously',
+    beforeParse(w) {
+      w.fetch = async raw => {
+        const url = new URL(raw, 'http://localhost');
+        let data = [];
+        if (url.pathname === '/api/auth/session') data = {role: 'admin', csrf_token: 'csrf'};
+        else if (url.pathname === '/api/repos') data = [repo];
+        else if (url.pathname.endsWith('/summary')) data = {by_client_ip: [], by_path: [], by_repo: [], timeline: [], cache_hit_stats: []};
+        else if (url.pathname === '/api/stats') data = {state_db_bytes: 0, tables: {}};
+        else if (url.pathname === '/api/storage/orphans') data = {orphaned: {}};
+        return {ok: true, json: async () => data};
+      };
+    }
+  });
+  try {
+    const w = dom.window, doc = w.document;
+    await delay(30);
+    doc.getElementById('scan-orphans-btn').click();
+    await delay(20);
+    assert.match(doc.getElementById('orphans-list').textContent, /no orphaned repositories found/);
+    assert.equal(doc.getElementById('orphans-actions').hidden, true);
+    doc.getElementById('orphans-delete-btn').click();
+    await delay(10);
+    assert.match(doc.getElementById('orphans-msg').textContent, /Nothing selected/);
+  } finally {
+    dom.window.close();
+  }
+});
+
 test('dashboard manual cache purge shows a clear message when enable_purge is off', async () => {
   const repo = {id: 'r', type: 'apt', upstream: 'example', config: {}, package_count: 1000};
   const dom = new JSDOM(html, {
@@ -516,6 +708,40 @@ test('repository editor preserves ALT type and custom URL scheme on save', async
 });
 
 
+test('repository editor shows and submits a human-readable bandwidth limit', async () => {
+  const calls = [];
+  const cfg = {id:'alpine-test', type:'apk', upstream:'https://example.test/alpine', arch:'x86_64',
+               prefetch_bandwidth_limit: 10 * 1024 * 1024};
+  const dom = new JSDOM(html, {url:'http://localhost/', runScripts:'dangerously', beforeParse(w) {
+    w.fetch = async (url, options={}) => {
+      calls.push({url,options});
+      let data = [];
+      if (url==='/api/auth/session') data={role:'admin',csrf_token:'csrf'};
+      else if(url==='/api/repos') data=[{...cfg,config:cfg}];
+      else if(url==='/api/repos/alpine-test') data={id:'alpine-test'};
+      else if(url.startsWith('/api/requests/summary')) data={by_client_ip:[],by_path:[],by_repo:[],timeline:[],cache_hit_stats:[]};
+      else if(url.startsWith('/api/requests')) data={items:[],next_cursor:null};
+      return {ok:true,status:200,json:async()=>data};
+    };
+  }});
+  try {
+    const w=dom.window, doc=w.document;
+    await delay(50);
+    doc.querySelector('[data-action="edit-repo"]').click();
+    // Prefilled as human-readable text, not the raw byte count.
+    assert.equal(doc.getElementById('f-prefetch-bandwidth-limit').value, '10.0 MiB/s');
+    doc.getElementById('add-form').dispatchEvent(new w.Event('submit',{bubbles:true,cancelable:true}));
+    await delay(50);
+    const saved=calls.find(c=>c.url==='/api/repos/alpine-test' && c.options.method==='POST');
+    assert(saved);
+    const body=JSON.parse(saved.options.body);
+    // Sent as the (unchanged) formatted text, not force-converted to a
+    // Number — the server parses either form (see sizes.parse_byte_rate_loose).
+    assert.equal(body.prefetch_bandwidth_limit, '10.0 MiB/s');
+  } finally { dom.window.close(); }
+});
+
+
 test('APK editor preserves signature backend and trusted keys', async () => {
   const calls=[];
   const cfg={id:'alpine',type:'apk',upstream:'https://example.org/alpine',arch:'x86_64',prefetch:false,
@@ -617,10 +843,24 @@ test('Nix repository editor preserves source, outputs and signature policy', asy
   } finally {dom.window.close();}
 });
 
-test('bandwidth schedule editor saves windows and timezone', async () => {
+test('bandwidth schedule editor shows human-readable rates and saves windows/timezone', async () => {
   let submitted;
   const settings = {prefetch_bandwidth_limit: 5000, prefetch_bandwidth_timezone: 'UTC',
     prefetch_bandwidth_schedule: [{days: ['mon','fri'], start: '23:00', end: '06:00', limit: 10000}]};
+  // Mirrors sizes.parse_byte_rate_loose() closely enough for this test: a
+  // bare numeric string or an explicit-unit string — the real server does
+  // this casting before echoing back the reloaded config, so an untouched
+  // field's formatted text ("9.8 KiB/s") round-trips to a real number, not
+  // itself.
+  const UNITS = {B:1, KB:1000, KIB:1024, MB:1000**2, MIB:1024**2, GB:1000**3, GIB:1024**3, TB:1000**4, TIB:1024**4};
+  function mockCastLimit(value) {
+    if (value === null || value === '') return null;
+    if (typeof value !== 'string') return value;
+    if (Number.isFinite(Number(value))) return Number(value);
+    const m = /^\s*([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]+)\s*(?:\/\s*s(?:ec)?)?\s*$/.exec(value);
+    if (!m) throw new Error(`invalid size: ${value}`);
+    return Number(m[1]) * UNITS[m[2].toUpperCase()];
+  }
   const dom = new JSDOM(html, {url: 'http://localhost/', runScripts: 'dangerously',
     beforeParse(w) {
       w.fetch = async (raw, options = {}) => {
@@ -628,8 +868,15 @@ test('bandwidth schedule editor saves windows and timezone', async () => {
         let data = [];
         if (url.pathname === '/api/auth/session') data = {role: 'admin', csrf_token: 'csrf'};
         else if (url.pathname === '/api/config') {
-          if (options.method === 'POST') submitted = JSON.parse(options.body);
-          data = submitted || settings;
+          if (options.method === 'POST') {
+            const body = JSON.parse(options.body);
+            submitted = body;
+            data = {...body,
+              prefetch_bandwidth_limit: mockCastLimit(body.prefetch_bandwidth_limit),
+              prefetch_bandwidth_schedule: body.prefetch_bandwidth_schedule.map(
+                w => ({...w, limit: mockCastLimit(w.limit)})),
+            };
+          } else data = settings;
         } else if (url.pathname.endsWith('/summary')) {
           data = {by_client_ip: [], by_path: [], by_repo: [], timeline: [], cache_hit_stats: []};
         }
@@ -642,16 +889,26 @@ test('bandwidth schedule editor saves windows and timezone', async () => {
     doc.getElementById('toggle-settings-form').click();
     await delay(30);
     assert.equal(doc.querySelectorAll('.bandwidth-window').length, 1);
+    // Pre-filled with human-readable text, not the raw byte count.
+    assert.equal(doc.getElementById('s-prefetch-bandwidth-limit').value, '4.9 KiB/s');
+    assert.equal(doc.querySelectorAll('.bandwidth-window')[0].querySelector('[data-field="limit"]').value, '9.8 KiB/s');
     doc.getElementById('s-bandwidth-timezone').value = 'Asia/Vladivostok';
     doc.getElementById('s-bandwidth-add').click();
     const row = doc.querySelectorAll('.bandwidth-window')[1];
     row.querySelector('[data-field="days"]').value = 'sun';
-    row.querySelector('[data-field="limit"]').value = '';
+    row.querySelector('[data-field="limit"]').value = '2 MiB/s';
     doc.getElementById('settings-form').dispatchEvent(new dom.window.Event('submit', {bubbles:true,cancelable:true}));
     await delay(30);
     assert.equal(submitted.prefetch_bandwidth_timezone, 'Asia/Vladivostok');
-    assert.deepEqual(submitted.prefetch_bandwidth_schedule, [settings.prefetch_bandwidth_schedule[0],
-      {days:['sun'],start:'00:00',end:'24:00',limit:null}]);
+    // The untouched first window's formatted text is what gets sent (not
+    // the original 10000) — a plain byte count that doesn't land on a
+    // clean one-decimal boundary settles to its nearest human value after
+    // the first save; a value typed with an explicit unit (the new second
+    // window) round-trips exactly from then on.
+    assert.deepEqual(submitted.prefetch_bandwidth_schedule, [
+      {days: ['mon','fri'], start: '23:00', end: '06:00', limit: '9.8 KiB/s'},
+      {days: ['sun'], start: '00:00', end: '24:00', limit: '2 MiB/s'},
+    ]);
     doc.querySelector('.bandwidth-window button').click();
     assert.equal(doc.querySelectorAll('.bandwidth-window').length, 1);
   } finally {dom.window.close();}

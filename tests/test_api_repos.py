@@ -10,6 +10,10 @@ import pytest
 
 from repowatch.web.handler import STATIC_DIR
 from repowatch.web.repositories import add_repo_payload
+from repowatch.reporting.statistics import orphaned_repos_payload
+from repowatch.reporting.statistics import purge_orphaned_repos_payload
+from repowatch.reporting.statistics import zombie_packages_payload
+from repowatch.reporting.statistics import purge_zombie_packages_payload
 from repowatch.web.packages import ban_package_payload
 from repowatch.web.packages import banned_packages_payload
 from repowatch.reporting.statistics import cache_dir_stats
@@ -248,6 +252,39 @@ def test_add_repo_rejects_invalid_body(tmp_path):
     assert "error" in data
 
 
+def test_add_repo_accepts_a_human_size_bandwidth_limit(tmp_path):
+    config_path, _store = _setup(tmp_path, admin_password="secret123")
+
+    status, data = add_repo_payload(
+        config_path, _session(config_path, "secret123"),
+        {**NEW_REPO_BODY, "prefetch_bandwidth_limit": "10 MiB/s"},
+    )
+
+    assert status == 201
+    reloaded = load_config(config_path)
+    assert reloaded.repo_by_id("arch-extra-test").prefetch_bandwidth_limit == 10 * 1024 ** 2
+
+    # Persisted to config.yaml as a plain number, not the unparsed string —
+    # otherwise config.load's own stricter YAML-facing parser (no
+    # bare-numeric-string leniency) would reject it on the very next load.
+    import yaml as _yaml
+    raw = _yaml.safe_load(config_path.read_text())
+    saved = next(r for r in raw["repos"] if r["id"] == "arch-extra-test")
+    assert saved["prefetch_bandwidth_limit"] == 10 * 1024 ** 2
+
+
+def test_add_repo_rejects_a_malformed_bandwidth_limit_string(tmp_path):
+    config_path, _store = _setup(tmp_path, admin_password="secret123")
+
+    status, data = add_repo_payload(
+        config_path, _session(config_path, "secret123"),
+        {**NEW_REPO_BODY, "prefetch_bandwidth_limit": "ten MiB"},
+    )
+
+    assert status == 400
+    assert "prefetch_bandwidth_limit" in data["error"]
+
+
 def test_warm_packages_payload_disabled_without_admin_password(tmp_path):
     config_path, store = _setup(tmp_path, admin_password=None)
 
@@ -453,7 +490,7 @@ def test_remove_warmed_package_also_purges_when_enable_purge_is_on(tmp_path, mon
     """Real behavior gap pointed out by the user (2026-09-13): "Remove from
     warmed" only ever edited the warmed_packages bookkeeping row, leaving
     the real cached file on disk untouched — exactly the disconnect
-    docs_dev/ROADMAP.md item 33 flagged (an unwarmed-but-still-cached file
+    found in review (an unwarmed-but-still-cached file
     becomes invisible to future stale-scans, since find_stale_warmed()
     needs the row to find it). Now, when purge is available, un-warming
     also evicts the real entry via the same prefetch.purge_selected() call
@@ -859,6 +896,31 @@ def test_update_repo_succeeds_and_persists(tmp_path):
     assert list_status == 200
     assert repos[0]["check_interval"] == 60
     assert repos[0]["prefetch"] is False
+
+
+def test_update_repo_accepts_a_human_size_bandwidth_limit(tmp_path):
+    config_path, _store = _setup(tmp_path, admin_password="secret123")
+
+    status, data = update_repo_payload(
+        config_path, _session(config_path, "secret123"), "alpine-test",
+        {**UPDATE_REPO_BODY, "prefetch_bandwidth_limit": "512 KiB"},
+    )
+
+    assert status == 200
+    reloaded = load_config(config_path)
+    assert reloaded.repo_by_id("alpine-test").prefetch_bandwidth_limit == 512 * 1024
+
+
+def test_update_repo_rejects_a_malformed_bandwidth_limit_string(tmp_path):
+    config_path, _store = _setup(tmp_path, admin_password="secret123")
+
+    status, data = update_repo_payload(
+        config_path, _session(config_path, "secret123"), "alpine-test",
+        {**UPDATE_REPO_BODY, "prefetch_bandwidth_limit": "ten MiB"},
+    )
+
+    assert status == 400
+    assert "prefetch_bandwidth_limit" in data["error"]
 
 
 def test_update_repo_can_set_and_clear_manual_group(tmp_path):
@@ -1271,8 +1333,8 @@ nginx:
 
 
 def test_stats_payload_prefers_cache_probe_when_enabled(tmp_path):
-    """docs_dev/ROADMAP.md item 8 — hooked up to "Calculate cache directory
-    size" (item 27): with nginx.enable_cache_probe on, the njs-based
+    """Hooked up to "Calculate cache directory
+    size": with nginx.enable_cache_probe on, the njs-based
     ground-truth scan is used instead of os.walk(), and it works even
     without nginx.cache_dir set locally (unlike the os.walk() path) since
     it only needs cache_base_url, which is always present."""
@@ -1596,6 +1658,56 @@ def test_bandwidth_schedule_round_trip_and_invalid_update_is_atomic(tmp_path):
     assert config_path.read_bytes() == original
 
 
+def test_update_safe_config_accepts_a_human_size_bandwidth_limit(tmp_path):
+    config_path, _store = _setup(tmp_path, admin_password="secret123")
+
+    status, data = update_safe_config_payload(
+        config_path, _session(config_path, "secret123"), {"prefetch_bandwidth_limit": "10 MiB"},
+    )
+
+    assert status == 200
+    assert data["prefetch_bandwidth_limit"] == 10 * 1024 ** 2
+    assert load_config(config_path).prefetch_bandwidth_limit == 10 * 1024 ** 2
+
+
+def test_update_safe_config_still_accepts_a_bare_numeric_string_bandwidth_limit(tmp_path):
+    """The HTML-form-shaped API boundary keeps accepting plain numeric
+    text unchanged — only config.yaml itself requires an explicit unit
+    (see test_config.py's equivalent)."""
+    config_path, _store = _setup(tmp_path, admin_password="secret123")
+
+    status, data = update_safe_config_payload(
+        config_path, _session(config_path, "secret123"), {"prefetch_bandwidth_limit": "5000000"},
+    )
+
+    assert status == 200
+    assert data["prefetch_bandwidth_limit"] == 5000000.0
+
+
+def test_update_safe_config_rejects_a_malformed_bandwidth_limit_string(tmp_path):
+    config_path, _store = _setup(tmp_path, admin_password="secret123")
+
+    status, data = update_safe_config_payload(
+        config_path, _session(config_path, "secret123"), {"prefetch_bandwidth_limit": "ten MiB"},
+    )
+
+    assert status == 400
+    assert "prefetch_bandwidth_limit" in data["error"]
+
+
+def test_update_safe_config_accepts_a_human_size_schedule_window_limit(tmp_path):
+    config_path, _store = _setup(tmp_path, admin_password="secret123")
+    schedule = [{"start": "00:00", "end": "06:00", "limit": "1 GiB"}]
+
+    status, data = update_safe_config_payload(
+        config_path, _session(config_path, "secret123"), {"prefetch_bandwidth_schedule": schedule},
+    )
+
+    assert status == 200
+    assert data["prefetch_bandwidth_schedule"][0]["limit"] == 1024 ** 3
+    assert load_config(config_path).prefetch_bandwidth_schedule[0]["limit"] == 1024 ** 3
+
+
 def test_repo_warming_lists_roundtrip_and_invalid_update_is_atomic(tmp_path):
     config_path, store = _setup(tmp_path, admin_password='secret123')
     session = _session(config_path, 'secret123')
@@ -1746,3 +1858,211 @@ def test_request_summary_includes_unmatched_null_repo(tmp_path):
 
     assert {"key": "repo-a", "count": 1} in by_repo
     assert {"key": None, "count": 2} in by_repo
+
+
+def test_orphaned_repos_payload_lists_repo_ids_absent_from_config(tmp_path):
+    config_path, store = _setup(tmp_path)
+    store.repositories.record_snapshot(RepoSnapshot("removed-long-ago", {"a-1": "a.apk"}))
+
+    status, payload = orphaned_repos_payload(config_path, store)
+
+    assert status == 200
+    assert payload["orphaned"] == {
+        "removed-long-ago": {"repo_state": 1, "repo_packages": 1, "repo_events": 1}
+    }
+
+
+def test_orphaned_repos_payload_empty_when_nothing_orphaned(tmp_path):
+    config_path, store = _setup(tmp_path)
+    status, payload = orphaned_repos_payload(config_path, store)
+    assert status == 200
+    assert payload["orphaned"] == {}
+
+
+def test_purge_orphaned_repos_payload_disabled_without_admin_password(tmp_path):
+    config_path, store = _setup(tmp_path, admin_password=None)
+    store.repositories.record_snapshot(RepoSnapshot("gone", {"a-1": "a.apk"}))
+    status, payload = purge_orphaned_repos_payload(
+        config_path, store, _session(config_path, "whatever"), {"repo_ids": ["gone"]}
+    )
+    assert status == 501
+
+
+def test_purge_orphaned_repos_payload_rejects_wrong_password(tmp_path):
+    config_path, store = _setup(tmp_path, admin_password="secret123")
+    status, payload = purge_orphaned_repos_payload(
+        config_path, store, _session(config_path, "wrong"), {"repo_ids": ["gone"]}
+    )
+    assert status == 401
+
+
+@pytest.mark.parametrize("body", [{}, {"repo_id": "x"}, {"repo_ids": []}, {"repo_ids": "x"}])
+def test_purge_orphaned_repos_payload_requires_a_nonempty_repo_ids_list(tmp_path, body):
+    config_path, store = _setup(tmp_path, admin_password="secret123")
+    status, payload = purge_orphaned_repos_payload(config_path, store, _session(config_path, "secret123"), body)
+    assert status == 400
+
+
+def test_purge_orphaned_repos_payload_deletes_and_excludes_configured_repos(tmp_path):
+    config_path, store = _setup(tmp_path, admin_password="secret123")
+    store.repositories.record_snapshot(RepoSnapshot("gone", {"a-1": "a.apk"}))
+    store.cache.record_warmed_package("gone", "a-1", "a.apk", True, 200)
+
+    status, payload = purge_orphaned_repos_payload(
+        config_path, store, _session(config_path, "secret123"),
+        {"repo_ids": ["gone", "alpine-test"]},  # alpine-test is still configured — must be a no-op
+    )
+
+    assert status == 200
+    assert payload["deleted"]["gone"]["repo_state"] == 1
+    assert payload["deleted"]["gone"]["warmed_packages"] == 1
+    assert "alpine-test" not in payload["deleted"]
+
+    status, follow_up = orphaned_repos_payload(config_path, store)
+    assert follow_up["orphaned"] == {}
+
+
+def test_zombie_packages_payload_lists_candidates_across_every_repository(tmp_path):
+    config_path = _write_config(
+        tmp_path,
+        """  - id: alpine-test
+    type: apk
+    upstream: https://example.org/alpine/v3.20/main
+    arch: x86_64
+  - id: arch-extra
+    type: pacman
+    upstream: https://example.org/extra/os/x86_64
+    arch: x86_64
+    repo_name: extra
+nginx:
+  enabled: true
+  enable_purge: true
+""",
+    )
+    store = ServiceState(load_config(config_path).state_db)
+    store.repositories.record_snapshot(RepoSnapshot("alpine-test", {"keep-1": "keep-1.apk"}))
+    store.cache.record_warmed_package("alpine-test", "keep-1", "keep-1.apk", True, 200)
+    store.cache.record_warmed_package("alpine-test", "gone-1", "gone-1.apk", True, 200)
+    store.repositories.record_snapshot(RepoSnapshot("arch-extra", {"firefox-156.0-1": "firefox-156.0-1.pkg"}))
+    store.cache.record_warmed_package("arch-extra", "firefox-155.0.1-1", "firefox-155.0.1-1.pkg", True, 200)
+
+    status, payload = zombie_packages_payload(config_path, store)
+
+    assert status == 200
+    assert payload["enable_purge"] is True
+    assert payload["candidates"] == [
+        {"repo_id": "alpine-test", "package_key": "gone-1", "filename": "gone-1.apk"},
+        {"repo_id": "arch-extra", "package_key": "firefox-155.0.1-1", "filename": "firefox-155.0.1-1.pkg"},
+    ]
+
+
+def test_zombie_packages_payload_reports_enable_purge_false(tmp_path):
+    config_path, store = _setup_purge(tmp_path, enable_purge=False)
+    status, payload = zombie_packages_payload(config_path, store)
+    assert status == 200
+    assert payload["enable_purge"] is False
+
+
+def test_purge_zombie_packages_payload_disabled_without_admin_password(tmp_path):
+    config_path, store = _setup_purge(tmp_path, admin_password=None)
+    status, payload = purge_zombie_packages_payload(
+        config_path, store, _session(config_path, "whatever"),
+        {"items": [{"repo_id": "alpine-test", "package_key": "x"}]},
+    )
+    assert status == 501
+
+
+def test_purge_zombie_packages_payload_rejects_wrong_password(tmp_path):
+    config_path, store = _setup_purge(tmp_path)
+    status, payload = purge_zombie_packages_payload(
+        config_path, store, _session(config_path, "wrong"),
+        {"items": [{"repo_id": "alpine-test", "package_key": "x"}]},
+    )
+    assert status == 401
+
+
+def test_purge_zombie_packages_payload_400_when_enable_purge_is_off(tmp_path):
+    config_path, store = _setup_purge(tmp_path, enable_purge=False)
+    status, payload = purge_zombie_packages_payload(
+        config_path, store, _session(config_path, "secret123"),
+        {"items": [{"repo_id": "alpine-test", "package_key": "x"}]},
+    )
+    assert status == 400
+    assert "enable_purge" in payload["error"]
+
+
+@pytest.mark.parametrize("body", [
+    {}, {"items": []}, {"items": "x"}, {"items": [{"repo_id": "a"}]},
+    {"items": [{"package_key": "x"}]}, {"items": [{"repo_id": "a", "package_key": 1}]},
+])
+def test_purge_zombie_packages_payload_requires_well_formed_items(tmp_path, body):
+    config_path, store = _setup_purge(tmp_path)
+    status, payload = purge_zombie_packages_payload(config_path, store, _session(config_path, "secret123"), body)
+    assert status == 400
+
+
+def test_purge_zombie_packages_payload_purges_across_repos_and_cleans_up_bookkeeping(tmp_path, monkeypatch):
+    config_path = _write_config(
+        tmp_path,
+        """  - id: alpine-test
+    type: apk
+    upstream: https://example.org/alpine/v3.20/main
+    arch: x86_64
+  - id: arch-extra
+    type: pacman
+    upstream: https://example.org/extra/os/x86_64
+    arch: x86_64
+    repo_name: extra
+nginx:
+  enabled: true
+  enable_purge: true
+""",
+        admin_password="secret123",
+    )
+    store = ServiceState(load_config(config_path).state_db)
+    store.cache.record_warmed_package("alpine-test", "gone-1", "gone-1.apk", True, 200)
+    store.cache.record_warmed_package("arch-extra", "firefox-155.0.1-1", "firefox-155.0.1-1.pkg", True, 200)
+
+    calls = []
+    async def fake_purge_selected(config, repo, items):
+        calls.append((repo.id, items))
+        return {key: "purged" for key in items}
+    monkeypatch.setattr("repowatch.operations.cleanup.purge_selected", fake_purge_selected)
+
+    status, payload = purge_zombie_packages_payload(
+        config_path, store, _session(config_path, "secret123"),
+        {"items": [
+            {"repo_id": "alpine-test", "package_key": "gone-1"},
+            {"repo_id": "arch-extra", "package_key": "firefox-155.0.1-1"},
+        ]},
+    )
+
+    assert status == 200
+    assert payload["results"] == {
+        "alpine-test": {"gone-1": "purged"},
+        "arch-extra": {"firefox-155.0.1-1": "purged"},
+    }
+    assert sorted(calls) == [
+        ("alpine-test", {"gone-1": "gone-1.apk"}),
+        ("arch-extra", {"firefox-155.0.1-1": "firefox-155.0.1-1.pkg"}),
+    ]
+    assert store.cache.get_warmed_packages("alpine-test") == []
+    assert store.cache.get_warmed_packages("arch-extra") == []
+
+
+def test_purge_zombie_packages_payload_skips_a_repo_not_in_config(tmp_path, monkeypatch):
+    config_path, store = _setup_purge(tmp_path)
+    store.cache.record_warmed_package("ghost-repo", "old-1", "old-1.apk", True, 200)
+
+    def boom(*a, **kw):
+        raise AssertionError("purge_selected must not be called for a repo not in config.repos")
+    monkeypatch.setattr("repowatch.operations.cleanup.purge_selected", boom)
+
+    status, payload = purge_zombie_packages_payload(
+        config_path, store, _session(config_path, "secret123"),
+        {"items": [{"repo_id": "ghost-repo", "package_key": "old-1"}]},
+    )
+
+    assert status == 200
+    assert payload["results"] == {}
+    assert [p["package_key"] for p in store.cache.get_warmed_packages("ghost-repo")] == ["old-1"]

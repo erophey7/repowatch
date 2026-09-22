@@ -24,7 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     stats_parser = sub.add_parser(
         "stats",
-        help="print state_db size and per-table row counts (docs_dev/ROADMAP.md item 27)",
+        help="print state_db size and per-table row counts",
     )
     stats_parser.add_argument(
         "--cache-dir", action="store_true",

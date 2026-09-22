@@ -45,7 +45,7 @@ these cannot be made operational by a universal default.
 | `check_interval` | int (seconds) | `300` | How often each repository's index is checked, unless overridden per-repository (see `repos[].check_interval`). |
 | `check_concurrency` | int | `8` | How many repositories to check at once per scheduler tick. Repositories are checked concurrently, not one at a time — a slow/hung upstream for one repo won't delay checking the others. |
 | `prefetch_concurrency` | int | `8` | How many files to warm in parallel per warm-up run. |
-| `prefetch_bandwidth_limit` | positive float (bytes/sec) or `null` | `null` | Shared warm-body read budget for the whole application process, including all repositories and manual/Nix warming. `null` means unlimited globally. See [Bandwidth schedules](#bandwidth-schedules). |
+| `prefetch_bandwidth_limit` | positive number (bytes/sec) or size string (e.g. `"10 MiB/s"`), or `null` | `null` | Shared warm-body read budget for the whole application process, including all repositories and manual/Nix warming. `null` means unlimited globally. See [Bandwidth schedules](#bandwidth-schedules). |
 | `prefetch_bandwidth_timezone` | IANA timezone name | `UTC` | Timezone for schedule windows. Non-UTC zones require system timezone data; no Python timezone package is added. |
 | `prefetch_bandwidth_schedule` | list of windows | `[]` | Non-overlapping weekly windows replacing the global limit, each with `start`, `end`, `limit`, and optional `days`. |
 | `event_retention_days` | int | `90` | How many days to keep the per-repository change log (`repo_events` — what changed and when). |
@@ -67,13 +67,13 @@ these cannot be made operational by a universal default.
 
 ```yaml
 # Outside schedule windows, share 5 MiB/s across all warm operations.
-prefetch_bandwidth_limit: 5242880
+prefetch_bandwidth_limit: "5 MiB/s"
 prefetch_bandwidth_timezone: Asia/Vladivostok
 prefetch_bandwidth_schedule:
   - days: [mon, tue, wed, thu, fri, sat, sun]
     start: "20:00"
     end: "09:00"
-    limit: 52428800  # 50 MiB/s overnight; null would remove the global cap.
+    limit: "50 MiB/s"  # overnight; null would remove the global cap.
 ```
 
 Days use `mon` through `sun`; omitted days mean every day. Windows include
@@ -83,6 +83,18 @@ day. Equal start/end times and overlapping windows (including week wrap) are
 rejected. All rates are positive finite bytes/sec or `null`; zero is not a
 pause setting. Outside windows the top-level limit applies. Per-repository
 limits remain additional ceilings even in an unlimited global window.
+
+Every rate (the two fields above, and each window's `limit`) accepts a plain
+number of bytes/sec as before, **or** a size string with an explicit unit —
+`B`, `KB`/`KiB`, `MB`/`MiB`, `GB`/`GiB`, `TB`/`TiB` (decimal/binary,
+case-insensitive), with an optional trailing `/s` for readability (`"10 MiB"`
+and `"10 MiB/s"` are equivalent). A bare numeric *string* in `config.yaml`
+(e.g. `"5000000"`, quoted) is rejected — YAML numbers must stay real numeric
+scalars; only an explicit unit makes a string acceptable. The dashboard's
+settings/repository forms accept and display the same size strings, and
+pre-fill existing values in human-readable form. `GET /api/config` and
+`GET /api/repos` still report the plain byte count (unrounded), not a
+formatted string — the dashboard formats it for display client-side.
 
 Rules use the named zone's local wall clock. During a daylight-saving fall
 back, both occurrences of a repeated local time use the same matching rule;
@@ -140,7 +152,7 @@ and adding a new one; there's no rename.
 | `nix_timeout` | positive int (seconds) | `600` | nix | Timeout for each CLI invocation, including source resolution and signature batches. |
 | `nix_max_paths` | positive int | `500000` | nix | Maximum catalog outputs and maximum store paths in any one dependency closure. |
 | `check_interval` | int (seconds) or `null` | `null` | all | Per-repository override of the top-level `check_interval`. `null` means "use the global value". |
-| `prefetch_bandwidth_limit` | positive float (bytes/sec) or `null` | `null` | all | Additional shared ceiling for all concurrent warm operations of this repository. It cannot bypass the global budget; `null` adds no repository ceiling. |
+| `prefetch_bandwidth_limit` | positive number (bytes/sec) or size string (e.g. `"512 KiB/s"`), or `null` | `null` | all | Additional shared ceiling for all concurrent warm operations of this repository. It cannot bypass the global budget; `null` adds no repository ceiling. |
 | `group` | string or `null` | `null` | all | Free-text label for grouping repositories in the dashboard into collapsible sections. Purely cosmetic — no validation, any string is allowed, and it isn't tied to `type`/distribution automatically. Repositories without a group show up under "Ungrouped". |
 | `url_template` | string or `null` | `null` | all | Custom local URL layout — see [`url_template` / `url_variables`](#url_template--url_variables). |
 | `url_variables` | mapping (string → string) | `{}` | all | Extra substitution values for `url_template`. |

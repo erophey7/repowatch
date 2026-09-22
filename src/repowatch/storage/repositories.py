@@ -373,6 +373,49 @@ class RepositoriesStore:
             return cur.rowcount
 
 
+    # Tables this store owns that are keyed by repo_id — shared by every
+    # method below with the sibling ones in CacheStore/NotificationsStore
+    # (see operations.cleanup.find_orphaned_repos/purge_orphaned_repos).
+    # request_events/request_counters/request_hourly are deliberately NOT
+    # here: they're a request LOG governed by its own retention settings,
+    # not repository bookkeeping — a request for a since-removed repo's URL
+    # is still meaningful history, not an orphan.
+    _REPO_TABLES = ('repo_state', 'repo_packages', 'repo_events', 'pending_replacements')
+
+    def get_repo_ids_with_data(self) -> set[str]:
+        """Every repo_id this store holds ANY row for, across its own
+        repo-keyed tables — the read side of orphan detection (see
+        operations.cleanup.find_orphaned_repos)."""
+        with self.db.connect() as conn:
+            return {
+                repo_id
+                for table in self._REPO_TABLES
+                for (repo_id,) in conn.execute(f'SELECT DISTINCT repo_id FROM {table}')
+            }
+
+    def count_repo_rows(self, repo_id: str) -> dict[str, int]:
+        """Row count per repo-keyed table, for previewing an orphan before
+        deleting it — zero-count tables are omitted, not shown as noise."""
+        with self.db.connect() as conn:
+            counts = {
+                table: conn.execute(f'SELECT COUNT(*) FROM {table} WHERE repo_id = ?', (repo_id,)).fetchone()[0]
+                for table in self._REPO_TABLES
+            }
+        return {table: count for table, count in counts.items() if count}
+
+    def delete_repo_rows(self, repo_id: str) -> dict[str, int]:
+        """Delete every row this store owns for one repo_id — the write side
+        of operations.cleanup.purge_orphaned_repos. Callers are responsible
+        for re-checking the repo_id is still absent from config.repos right
+        before calling this (see that function)."""
+        with self.db.connect() as conn:
+            counts = {
+                table: conn.execute(f'DELETE FROM {table} WHERE repo_id = ?', (repo_id,)).rowcount
+                for table in self._REPO_TABLES
+            }
+        return {table: count for table, count in counts.items() if count}
+
+
     def get_history(self, repo_id: str, limit: int = 20) -> list[dict]:
         with self.db.connect() as conn:
             rows = conn.execute(

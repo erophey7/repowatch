@@ -1,5 +1,25 @@
+// Same unit thresholds/multipliers as sizes.py's format_bytes() — binary
+// (KiB/MiB/GiB/TiB), one decimal place, values under 1 KiB shown as a
+// whole number of bytes. Kept in JS too (rather than round-tripping
+// through the server) so the dashboard can format instantly.
+const DISPLAY_UNITS = [['TiB', 1024 ** 4], ['GiB', 1024 ** 3], ['MiB', 1024 ** 2], ['KiB', 1024]];
+function formatBytes(n) {
+  const sign = n < 0 ? '-' : '';
+  n = Math.abs(n);
+  for (const [unit, size] of DISPLAY_UNITS) {
+    if (n >= size) return `${sign}${(n / size).toFixed(1)} ${unit}`;
+  }
+  return `${sign}${Math.round(n)} B`;
+}
+function formatByteRate(n) {
+  return n == null ? 'unlimited' : `${formatBytes(n)}/s`;
+}
+function bytesWithExact(n) {
+  return `${formatBytes(n)} (${n.toLocaleString()} bytes)`;
+}
+
 function renderStorageStats(stats) {
-  const bytes = n => `${n.toLocaleString()} bytes`;
+  const bytes = bytesWithExact;
   let html = `<p>state_db: ${bytes(stats.state_db_bytes)}</p><ul>`;
   for (const [table, count] of Object.entries(stats.tables)) {
     html += `<li>${esc(table)}: ${count.toLocaleString()} row(s)</li>`;
@@ -62,6 +82,162 @@ document.getElementById('calc-cache-size').addEventListener('click', async () =>
     note.textContent = `Error: ${err.message}`;
   } finally {
     button.disabled = false;
+  }
+});
+const orphansList = document.getElementById('orphans-list');
+const orphansActions = document.getElementById('orphans-actions');
+const orphansMsg = document.getElementById('orphans-msg');
+
+// silent=true (used right after a delete) updates the list/checkboxes
+// without touching orphansMsg — the same reasoning as packages.js'
+// scanForStaleEntries(silent): a re-scan's own "N found" would otherwise
+// immediately overwrite the "Deleted: ..." summary the operator just
+// clicked the button to see.
+async function scanForOrphans(silent = false) {
+  if (!silent) { orphansMsg.className = 'form-msg'; orphansMsg.textContent = 'Scanning…'; }
+  orphansActions.hidden = true;
+  try {
+    const res = await fetch('/api/storage/orphans');
+    const data = await res.json();
+    if (!res.ok) {
+      orphansList.hidden = true;
+      if (!silent) { orphansMsg.className = 'form-msg error'; orphansMsg.textContent = data.error || `HTTP ${res.status}`; }
+      return;
+    }
+    const ids = Object.keys(data.orphaned);
+    orphansList.hidden = false;
+    if (!ids.length) {
+      orphansList.innerHTML = '<div class="empty">no orphaned repositories found</div>';
+      if (!silent) orphansMsg.textContent = '';
+      return;
+    }
+    // All checked by default — the operator opts OUT of ones they don't want deleted.
+    orphansList.innerHTML = ids.map(id => {
+      const rows = Object.entries(data.orphaned[id]).map(([table, count]) => `${esc(table)}: ${count}`).join(', ');
+      return `<label class="pick-row"><input type="checkbox" value="${esc(id)}" checked> ` +
+        `${esc(id)} <span class="dim">(${rows})</span></label>`;
+    }).join('');
+    orphansActions.hidden = false;
+    if (!silent) orphansMsg.textContent = `${ids.length} orphaned repository/ies found.`;
+  } catch (err) {
+    if (!silent) { orphansMsg.className = 'form-msg error'; orphansMsg.textContent = `Network error: ${err.message}`; }
+  }
+}
+document.getElementById('scan-orphans-btn').addEventListener('click', () => scanForOrphans());
+document.getElementById('orphans-select-all-btn').addEventListener('click', () => {
+  orphansList.querySelectorAll('input').forEach(cb => { cb.checked = true; });
+});
+document.getElementById('orphans-clear-btn').addEventListener('click', () => {
+  orphansList.querySelectorAll('input').forEach(cb => { cb.checked = false; });
+});
+document.getElementById('orphans-delete-btn').addEventListener('click', async () => {
+  const ids = [...orphansList.querySelectorAll('input:checked')].map(cb => cb.value);
+  if (!ids.length) { orphansMsg.className = 'form-msg error'; orphansMsg.textContent = 'Nothing selected'; return; }
+  if (!confirm(`Delete SQL bookkeeping for ${ids.length} repository/ies? This does not touch cache files on disk.`)) return;
+  orphansMsg.className = 'form-msg';
+  orphansMsg.textContent = 'Deleting…';
+  try {
+    const res = await fetch('/api/storage/orphans', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ repo_ids: ids }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      orphansMsg.className = 'form-msg error';
+      orphansMsg.textContent = data.error || `HTTP ${res.status}`;
+      return;
+    }
+    orphansMsg.className = 'form-msg ok';
+    orphansMsg.textContent = `Deleted: ${Object.keys(data.deleted).length} repository/ies.`;
+    await scanForOrphans(true); // silent re-scan: keep the "Deleted: ..." summary on screen
+    await loadStorageStats(); // row counts shown above just changed too
+  } catch (err) {
+    orphansMsg.className = 'form-msg error';
+    orphansMsg.textContent = `Network error: ${err.message}`;
+  }
+});
+const zombiesList = document.getElementById('zombies-list');
+const zombiesActions = document.getElementById('zombies-actions');
+const zombiesMsg = document.getElementById('zombies-msg');
+
+// silent=true (used right after a purge) — same reasoning as
+// scanForOrphans(silent) above: a re-scan's own "N found" would otherwise
+// overwrite the "Purged: ..." summary the operator just clicked to see.
+async function scanForZombies(silent = false) {
+  if (!silent) { zombiesMsg.className = 'form-msg'; zombiesMsg.textContent = 'Scanning…'; }
+  zombiesActions.hidden = true;
+  try {
+    const res = await fetch('/api/storage/zombies');
+    const data = await res.json();
+    if (!res.ok) {
+      zombiesList.hidden = true;
+      if (!silent) { zombiesMsg.className = 'form-msg error'; zombiesMsg.textContent = data.error || `HTTP ${res.status}`; }
+      return;
+    }
+    if (!data.enable_purge) {
+      zombiesList.hidden = true;
+      if (!silent) {
+        zombiesMsg.className = 'form-msg error';
+        zombiesMsg.textContent = 'nginx.enable_purge is not enabled in config.yaml — nothing to purge.';
+      }
+      return;
+    }
+    zombiesList.hidden = false;
+    if (!data.candidates.length) {
+      zombiesList.innerHTML = '<div class="empty">no zombie packages found</div>';
+      if (!silent) zombiesMsg.textContent = '';
+      return;
+    }
+    // All checked by default — the operator opts OUT of ones they don't want purged.
+    zombiesList.innerHTML = data.candidates.map(c =>
+      `<label class="pick-row"><input type="checkbox" data-repo="${esc(c.repo_id)}" value="${esc(c.package_key)}" checked> ` +
+      `${esc(c.repo_id)} / ${esc(c.package_key)} <span class="dim">(${esc(c.filename)})</span></label>`).join('');
+    zombiesActions.hidden = false;
+    if (!silent) zombiesMsg.textContent = `${data.candidates.length} zombie package(s) found.`;
+  } catch (err) {
+    if (!silent) { zombiesMsg.className = 'form-msg error'; zombiesMsg.textContent = `Network error: ${err.message}`; }
+  }
+}
+document.getElementById('scan-zombies-btn').addEventListener('click', () => scanForZombies());
+document.getElementById('zombies-select-all-btn').addEventListener('click', () => {
+  zombiesList.querySelectorAll('input').forEach(cb => { cb.checked = true; });
+});
+document.getElementById('zombies-clear-btn').addEventListener('click', () => {
+  zombiesList.querySelectorAll('input').forEach(cb => { cb.checked = false; });
+});
+document.getElementById('zombies-purge-btn').addEventListener('click', async () => {
+  const items = [...zombiesList.querySelectorAll('input:checked')]
+    .map(cb => ({ repo_id: cb.dataset.repo, package_key: cb.value }));
+  if (!items.length) { zombiesMsg.className = 'form-msg error'; zombiesMsg.textContent = 'Nothing selected'; return; }
+  zombiesMsg.className = 'form-msg';
+  zombiesMsg.textContent = 'Purging…';
+  try {
+    const res = await fetch('/api/storage/zombies', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      zombiesMsg.className = 'form-msg error';
+      zombiesMsg.textContent = data.error || `HTTP ${res.status}`;
+      return;
+    }
+    const counts = { purged: 0, not_cached: 0, retained_shared: 0, error: 0 };
+    for (const repoResults of Object.values(data.results)) {
+      for (const outcome of Object.values(repoResults)) {
+        const bucket = outcome.startsWith('error') ? 'error' : outcome;
+        counts[bucket] = (counts[bucket] || 0) + 1;
+      }
+    }
+    zombiesMsg.className = counts.error ? 'form-msg error' : 'form-msg ok';
+    zombiesMsg.textContent = `Purged: ${counts.purged}, not cached: ${counts.not_cached}, shared artifacts retained: ${counts.retained_shared}` +
+      (counts.error ? `, errors: ${counts.error}` : '');
+    await scanForZombies(true); // silent re-scan: keep the "Purged: ..." summary on screen
+  } catch (err) {
+    zombiesMsg.className = 'form-msg error';
+    zombiesMsg.textContent = `Network error: ${err.message}`;
   }
 });
 document.getElementById('token-form').addEventListener('submit', async event => {

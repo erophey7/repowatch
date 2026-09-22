@@ -31,7 +31,6 @@ help:
 	@echo 'Integration: WITH_NGINX WITH_SYSTEMD NGINX_CONF NGINX_ENABLED_DIR SYSTEMD_UNIT_DIR'
 	@echo 'Docker: docker-generate docker-check docker-build docker-clean docker-features docker-compose-build'
 	@echo 'Docker options: DOCKER_EXPERIMENTAL=nix DOCKER_IMAGE=tag DOCKER_ENGINE=docker'
-	@echo 'Infrastructure commands: make -f Makefile.dev help'
 
 dev:
 	$(PYTHON) -m venv "$(DEV_VENV)"

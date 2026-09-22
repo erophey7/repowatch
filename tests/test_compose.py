@@ -146,27 +146,3 @@ def test_invalid_bind_group_does_not_create_directories(tmp_path, gid):
         bootstrap.initialize(tmp_path / 'config', tmp_path / 'state', tmp_path / 'nix',
                              SEED, owner=(10001, gid))
     assert list(tmp_path.iterdir()) == []
-
-
-
-@pytest.mark.skipif(not (ROOT / 'docker-compose.release.yml').exists(),
-                    reason='release Compose draft stays local until release preparation')
-def test_release_is_standalone_and_preserves_development_runtime_contract():
-    development = yaml.safe_load((ROOT / 'docker-compose.dev.yml').read_text())
-    release = yaml.safe_load((ROOT / 'docker-compose.release.yml').read_text())
-    assert release['name'] != development['name']
-    assert release['services'].keys() == development['services'].keys()
-    for name, service in release['services'].items():
-        assert service['pull_policy'] == 'always'
-        repository = 'repowatch-nginx' if name == 'nginx' else 'repowatch'
-        assert service['image'].startswith('docker.io/${DOCKERHUB_NAMESPACE:?')
-        assert '/' + repository + ':${REPOWATCH_VERSION:?' in service['image']
-        assert all(mount.startswith(('./config:', './data/')) for mount in service['volumes'])
-        expected = dict(development['services'][name])
-        expected['image'] = service['image']
-        expected['pull_policy'] = 'always'
-        expected['volumes'] = [mount for mount in expected['volumes']
-                               if not mount.startswith('./docker/')]
-        assert service == expected
-    assert release['services']['init']['image'] == release['services']['repowatch']['image']
-    assert 'volumes' not in release

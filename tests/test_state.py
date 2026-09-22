@@ -278,13 +278,58 @@ def test_find_stale_warmed_is_scoped_per_repo(tmp_path):
     assert store.cache.find_stale_warmed("repo-b") == []
 
 
-def test_get_warmed_filenames_returns_only_the_requested_existing_keys(tmp_path):
+def test_find_all_stale_warmed_spans_every_repository_at_once(tmp_path):
+    store = _store(tmp_path)
+    store.repositories.record_snapshot(RepoSnapshot("repo-a", {"keep-1": "keep-1.deb"}))
+    store.cache.record_warmed_package("repo-a", "keep-1", "keep-1.deb", True, 200)
+    store.cache.record_warmed_package("repo-a", "gone-1", "gone-1.deb", True, 200)
+    store.cache.record_warmed_package("repo-b", "gone-2", "gone-2.deb", True, 200)
+
+    assert store.cache.find_all_stale_warmed() == [
+        {"repo_id": "repo-a", "package_key": "gone-1", "filename": "gone-1.deb"},
+        {"repo_id": "repo-b", "package_key": "gone-2", "filename": "gone-2.deb"},
+    ]
+
+
+def test_find_all_stale_warmed_catches_a_version_bump_superseding_the_old_package_key(tmp_path):
+    # The motivating production case (2026-09-23): pacman's firefox-155.0.1-1
+    # replaced by firefox-156.0-1 under a DIFFERENT package_key — the old
+    # key vanishes from repo_packages immediately, but its warmed_packages
+    # row previously lingered up to warmed_retention_days (180 days)
+    # before even being considered for cleanup.
+    store = _store(tmp_path)
+    store.repositories.record_snapshot(RepoSnapshot(
+        "arch-extra", {"firefox-155.0.1-1": "firefox-155.0.1-1-x86_64.pkg.tar.zst"}))
+    store.cache.record_warmed_package(
+        "arch-extra", "firefox-155.0.1-1", "firefox-155.0.1-1-x86_64.pkg.tar.zst", True, 200)
+    assert store.cache.find_all_stale_warmed() == []
+
+    # New version replaces the old one in the same snapshot.
+    store.repositories.record_snapshot(RepoSnapshot(
+        "arch-extra", {"firefox-156.0-1": "firefox-156.0-1-x86_64.pkg.tar.zst"}))
+
+    assert store.cache.find_all_stale_warmed() == [{
+        "repo_id": "arch-extra", "package_key": "firefox-155.0.1-1",
+        "filename": "firefox-155.0.1-1-x86_64.pkg.tar.zst",
+    }]
+
+
+def test_find_all_stale_warmed_empty_when_nothing_stale(tmp_path):
+    store = _store(tmp_path)
+    assert store.cache.find_all_stale_warmed() == []
+    store.repositories.record_snapshot(RepoSnapshot("r", {"a-1": "a.deb"}))
+    store.cache.record_warmed_package("r", "a-1", "a.deb", True, 200)
+    assert store.cache.find_all_stale_warmed() == []
+
+
+def test_get_warmed_records_returns_only_the_requested_existing_keys(tmp_path):
     store = _store(tmp_path)
     store.cache.record_warmed_package("r", "a-1", "a.deb", True, 200)
     store.cache.record_warmed_package("r", "b-1", "b.deb", True, 200)
 
-    assert store.cache.get_warmed_filenames("r", ["a-1", "does-not-exist"]) == {"a-1": "a.deb"}
-    assert store.cache.get_warmed_filenames("r", []) == {}
+    filenames = lambda keys: {k: v[0] for k, v in store.cache.get_warmed_records("r", keys).items()}
+    assert filenames(["a-1", "does-not-exist"]) == {"a-1": "a.deb"}
+    assert filenames([]) == {}
 
 
 def test_get_storage_stats_reports_db_size_and_table_counts(tmp_path):
@@ -660,7 +705,7 @@ def test_bulk_warmed_selection_respects_sqlite_limit(tmp_path, monkeypatch):
             conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
             yield conn
     monkeypatch.setattr(store.database, 'connect', limited)
-    assert store.cache.get_warmed_filenames('r', keys + keys) == dict(zip(keys, keys))
+    assert {k: v[0] for k, v in store.cache.get_warmed_records('r', keys + keys).items()} == dict(zip(keys, keys))
     assert store.cache.remove_warmed_packages('r', keys + keys) == len(keys)
     assert store.cache.remove_warmed_packages('r', keys) == 0
 
@@ -673,7 +718,7 @@ def test_purge_does_not_forget_a_concurrent_rewarm(tmp_path, monkeypatch):
     store.cache.remove_warmed_package('r', 'a')
     store.cache.record_warmed_package('r', 'a', 'a.pkg', True, 200)
     assert store.cache.remove_purged_records('r', records, ['a']) == 0
-    assert store.cache.get_warmed_filenames('r', ['a']) == {'a': 'a.pkg'}
+    assert {k: v[0] for k, v in store.cache.get_warmed_records('r', ['a']).items()} == {'a': 'a.pkg'}
 
 
 def test_validators_belong_to_source_identity(tmp_path):
@@ -749,4 +794,101 @@ def test_request_rollups_upgrade_pre_client_ip_history(tmp_path):
     store.requests.record_request('r', '192.0.2.1', 'GET', '/new', '200', 'MISS')
     assert store.requests.get_top_client_ips() == [{'key': '192.0.2.1', 'count': 1}]
     assert store.requests.prune_requests_by_size(0) == 2
+
+
+def test_repositories_store_orphan_helpers_cover_all_four_repo_keyed_tables(tmp_path):
+    store = _store(tmp_path)
+    store.repositories.record_snapshot(RepoSnapshot("r", {"a-1": "a.deb"}))
+    with store.database.connect() as conn:
+        conn.execute(
+            "INSERT INTO pending_replacements (repo_id, package_key, targets_json, revision) "
+            "VALUES ('r', 'a-1', '[]', '1')"
+        )
+
+    assert store.repositories.get_repo_ids_with_data() == {"r"}
+    counts = store.repositories.count_repo_rows("r")
+    assert counts == {
+        "repo_state": 1, "repo_packages": 1, "repo_events": 1, "pending_replacements": 1,
+    }
+
+    deleted = store.repositories.delete_repo_rows("r")
+    assert deleted == counts
+    assert store.repositories.get_repo_ids_with_data() == set()
+    with store.database.connect() as conn:
+        for table in ("repo_state", "repo_packages", "repo_events", "pending_replacements"):
+            assert conn.execute(f"SELECT COUNT(*) FROM {table} WHERE repo_id = 'r'").fetchone()[0] == 0
+
+
+def test_repositories_store_orphan_helpers_omit_empty_tables_from_counts(tmp_path):
+    store = _store(tmp_path)
+    store.repositories.record_snapshot(RepoSnapshot("r", {"a-1": "a.deb"}))
+    counts = store.repositories.count_repo_rows("r")
+    assert "pending_replacements" not in counts
+    assert counts == {"repo_state": 1, "repo_packages": 1, "repo_events": 1}
+
+
+def test_repositories_store_orphan_helpers_are_scoped_per_repo(tmp_path):
+    store = _store(tmp_path)
+    store.repositories.record_snapshot(RepoSnapshot("keep", {"a-1": "a.deb"}))
+    store.repositories.record_snapshot(RepoSnapshot("drop", {"b-1": "b.deb"}))
+    store.repositories.delete_repo_rows("drop")
+    assert store.repositories.get_repo_ids_with_data() == {"keep"}
+    assert store.repositories.get_status("keep") is not None
+
+
+def test_cache_store_orphan_helpers_cover_all_four_repo_keyed_tables(tmp_path):
+    store = _store(tmp_path)
+    store.cache.record_warmed_package("r", "a-1", "a.deb", True, 200)
+    store.cache.ban_package("r", "banned-name")
+    store.cache.record_nix_artifacts("r", "a-1", [{"filename": "a.nar", "size": 10}])
+    store.cache.update_nix_trust("r", True, ["ABC"])
+
+    assert store.cache.get_repo_ids_with_data() == {"r"}
+    counts = store.cache.count_repo_rows("r")
+    assert counts == {
+        "warmed_packages": 1, "prefetch_bans": 1, "nix_artifacts": 1, "nix_trust": 1,
+    }
+
+    deleted = store.cache.delete_repo_rows("r")
+    assert deleted == counts
+    assert store.cache.get_repo_ids_with_data() == set()
+    with store.database.connect() as conn:
+        for table in ("warmed_packages", "prefetch_bans", "nix_artifacts", "nix_trust"):
+            assert conn.execute(f"SELECT COUNT(*) FROM {table} WHERE repo_id = 'r'").fetchone()[0] == 0
+
+
+def test_cache_store_orphan_helpers_omit_empty_tables_from_counts(tmp_path):
+    store = _store(tmp_path)
+    store.cache.ban_package("r", "banned-name")
+    counts = store.cache.count_repo_rows("r")
+    assert counts == {"prefetch_bans": 1}
+
+
+def test_cache_store_orphan_helpers_do_not_double_count_pending_replacements(tmp_path):
+    # pending_replacements is owned by RepositoriesStore's own _REPO_TABLES
+    # (see repositories.py) — CacheStore reads/writes that table elsewhere
+    # (get_pending_replacements/finish_replacement) but must not also claim
+    # it here, or operations.cleanup.find_orphaned_repos would double-count
+    # (and delete_repo_rows would attempt the same DELETE twice).
+    store = _store(tmp_path)
+    store.repositories.record_snapshot(RepoSnapshot("r", {"a-1": "a.deb"}))
+    with store.database.connect() as conn:
+        conn.execute(
+            "INSERT INTO pending_replacements (repo_id, package_key, targets_json, revision) "
+            "VALUES ('r', 'a-1', '[]', '1')"
+        )
+    assert "pending_replacements" not in store.cache.count_repo_rows("r")
+
+
+def test_notifications_store_orphan_helpers(tmp_path):
+    store = _store(tmp_path)
+    store.notifications.bump_failure("r", "gpg", "boom")
+
+    assert store.notifications.get_repo_ids_with_data() == {"r"}
+    assert store.notifications.count_repo_rows("r") == 1
+
+    deleted = store.notifications.delete_repo_rows("r")
+    assert deleted == 1
+    assert store.notifications.get_repo_ids_with_data() == set()
+    assert store.notifications.count_repo_rows("r") == 0
     assert store.requests.get_request_hit_stats() == {}

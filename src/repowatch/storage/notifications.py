@@ -68,6 +68,24 @@ class NotificationsStore:
             return bool(row[0])
 
 
+    # The CacheStore/RepositoriesStore siblings return a dict of
+    # {table: count} since they each own several repo-keyed tables; this
+    # store owns exactly one (failure_state, keyed by (repo_id, kind)), so a
+    # plain int is enough — operations.cleanup.find_orphaned_repos/
+    # purge_orphaned_repos wrap it under the 'failure_state' key themselves.
+    def get_repo_ids_with_data(self) -> set[str]:
+        with self.db.connect() as conn:
+            return {repo_id for (repo_id,) in conn.execute('SELECT DISTINCT repo_id FROM failure_state')}
+
+    def count_repo_rows(self, repo_id: str) -> int:
+        with self.db.connect() as conn:
+            return conn.execute('SELECT COUNT(*) FROM failure_state WHERE repo_id = ?', (repo_id,)).fetchone()[0]
+
+    def delete_repo_rows(self, repo_id: str) -> int:
+        with self.db.connect() as conn:
+            return conn.execute('DELETE FROM failure_state WHERE repo_id = ?', (repo_id,)).rowcount
+
+
     def get_failure_counts(self) -> dict[tuple[str, str], int]:
         """(repo_id, kind) -> current consecutive_failures, one query for all
         repos/kinds (for reporting.metrics.metrics_payload). A row only exists here while

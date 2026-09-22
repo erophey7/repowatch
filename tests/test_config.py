@@ -137,34 +137,6 @@ def test_effective_check_interval_per_repo_override():
     assert config.effective_check_interval(repo) == 30
 
 
-def test_effective_prefetch_bandwidth_limit_falls_back_to_global():
-    from repowatch.config.models import Config
-    from repowatch.config.models import StatusServerConfig
-
-    config = Config(
-        state_db="/tmp/x.sqlite3", check_interval=300,
-        cache_base_url="http://127.0.0.1:8080", status_server=StatusServerConfig(),
-        prefetch_bandwidth_limit=5.0,
-    )
-    repo = RepoConfig(id="r", type="apk", upstream="https://example.org", arch="x86_64")
-    assert config.effective_prefetch_bandwidth_limit(repo) == 5.0
-
-
-def test_effective_prefetch_bandwidth_limit_per_repo_override():
-    from repowatch.config.models import Config
-    from repowatch.config.models import StatusServerConfig
-
-    config = Config(
-        state_db="/tmp/x.sqlite3", check_interval=300,
-        cache_base_url="http://127.0.0.1:8080", status_server=StatusServerConfig(),
-        prefetch_bandwidth_limit=5.0,
-    )
-    repo = RepoConfig(
-        id="r", type="apk", upstream="https://example.org", arch="x86_64", prefetch_bandwidth_limit=1.0,
-    )
-    assert config.effective_prefetch_bandwidth_limit(repo) == 1.0
-
-
 def test_per_repo_check_interval_and_bandwidth_limit_load_from_yaml(tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
@@ -192,8 +164,77 @@ repos:
 
     assert config.effective_check_interval(fast) == 30
     assert config.effective_check_interval(slow) == 300
-    assert config.effective_prefetch_bandwidth_limit(fast) == 2.0
-    assert config.effective_prefetch_bandwidth_limit(slow) == 10.0
+    # The repository ceiling is stored as configured; how it combines with the global
+    # ceiling is the budget's job (tests/test_bandwidth.py).
+    assert fast.prefetch_bandwidth_limit == 2.0
+    assert slow.prefetch_bandwidth_limit is None
+    assert config.prefetch_bandwidth_limit == 10.0
+
+
+def test_human_size_bandwidth_limit_loads_from_yaml_globally_and_per_repo(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+state_db: /tmp/repowatch-test.sqlite3
+cache_base_url: http://127.0.0.1:8080
+prefetch_bandwidth_limit: "10 MiB"
+repos:
+  - id: fast-repo
+    type: apk
+    upstream: https://example.org
+    arch: x86_64
+    prefetch_bandwidth_limit: "512 KiB/s"
+"""
+    )
+    config = load_config(config_path)
+    assert config.prefetch_bandwidth_limit == 10 * 1024 ** 2
+    assert config.repo_by_id("fast-repo").prefetch_bandwidth_limit == 512 * 1024
+
+
+def test_human_size_bandwidth_limit_loads_from_yaml_in_a_schedule_window(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+state_db: /tmp/repowatch-test.sqlite3
+cache_base_url: http://127.0.0.1:8080
+prefetch_bandwidth_schedule:
+  - start: "00:00"
+    end: "06:00"
+    limit: "1 GiB"
+"""
+    )
+    config = load_config(config_path)
+    assert config.prefetch_bandwidth_schedule[0]["limit"] == 1024 ** 3
+
+
+def test_bare_numeric_string_bandwidth_limit_still_rejected_in_yaml(tmp_path):
+    """Preserves the 2026-09-16 B01/B02 hardening (see CLAUDE.md): a
+    quoted plain number in config.yaml must stay an explicit mistake to
+    fix, not something the new human-size parser silently accepts —
+    only an EXPLICIT unit suffix is a new, deliberate feature."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+state_db: /tmp/repowatch-test.sqlite3
+cache_base_url: http://127.0.0.1:8080
+prefetch_bandwidth_limit: "5000000"
+"""
+    )
+    with pytest.raises(ConfigError):
+        load_config(config_path)
+
+
+def test_malformed_human_size_bandwidth_limit_raises_config_error(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+state_db: /tmp/repowatch-test.sqlite3
+cache_base_url: http://127.0.0.1:8080
+prefetch_bandwidth_limit: "10 XiB"
+"""
+    )
+    with pytest.raises(ConfigError):
+        load_config(config_path)
 
 
 def test_syslog_listener_enabled_defaults_to_true(tmp_path):

@@ -45,7 +45,7 @@ def test_apt_parser_parses_fixture(monkeypatch):
     zlib = next(p for p in packages if p.name == "zlib1g")
     assert zlib.version == "1:1.2.13.dfsg-1"
     assert zlib.filename == "pool/main/z/zlib/zlib1g_1.2.13.dfsg-1_amd64.deb"
-    # docs_dev/ROADMAP.md item 29 — per-stanza SHA256:, not the by-hash SHA256
+    # Cross-repo dedup: per-stanza SHA256:, not the by-hash SHA256
     # of the whole Packages.gz checked above via InRelease.
     assert zlib.content_hash == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 

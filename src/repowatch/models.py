@@ -17,7 +17,7 @@ class RepoSnapshot:
     # bans by package name.
     names: dict[str, str] = field(default_factory=dict)
     # the same key -> SHA256 hex digest, only for keys where PackageRef.content_hash
-    # was known from the index (docs_dev/ROADMAP.md item 29) — missing keys
+    # was known from the index (cross-repo dedup) — missing keys
     # simply aren't candidates for dedup, not an error.
     content_hashes: dict[str, str] = field(default_factory=dict)
 
@@ -30,8 +30,8 @@ class DiffResult:
     removed_packages: list[str]
     # {package_key: filename} for exactly the packages in removed_packages —
     # captured from the previous snapshot before its rows are deleted below.
-    # Needed by operations.check.check_repo/cache.purge.purge_removed (docs_dev/ROADMAP.md
-    # item 24) to know which file to purge from nginx's cache — the key
+    # Needed by operations.check.check_repo/cache.purge.purge_removed (active cache eviction)
+    # to know which file to purge from nginx's cache — the key
     # alone isn't a filename.
     removed_filenames: dict[str, str]
     modified_packages: list[str] = field(default_factory=list)
@@ -48,7 +48,7 @@ class PackageRef:
     # relative path of the package file from the repository's upstream URL, if known
     filename: str | None = None
     # SHA256 hex digest of the package file, when the index publishes one
-    # (docs_dev/ROADMAP.md item 29 — cross-repository dedup). Deliberately
+    # (cross-repository dedup). Deliberately
     # left None for formats where a same-algorithm whole-file hash isn't
     # available without downloading the file itself: apk's APKINDEX `C:`
     # field is a different digest (SHA1, base64, "Q1" prefix) that would

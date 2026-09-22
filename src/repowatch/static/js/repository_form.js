@@ -64,7 +64,8 @@ function openEditForm(repo) {
   document.getElementById('f-apk-keys').value = cfg.apk_keys_dir ?? '';
   document.getElementById('f-apk-backend').value = cfg.apk_signature_backend ?? 'openssl';
   document.getElementById('f-check-interval').value = cfg.check_interval ?? '';
-  document.getElementById('f-prefetch-bandwidth-limit').value = cfg.prefetch_bandwidth_limit ?? '';
+  document.getElementById('f-prefetch-bandwidth-limit').value =
+    cfg.prefetch_bandwidth_limit != null ? formatByteRate(cfg.prefetch_bandwidth_limit) : '';
 
   updateConditionalFields();
   $formMsg.textContent = '';
@@ -151,8 +152,12 @@ $addForm.addEventListener('submit', async (ev) => {
   const checkInterval = document.getElementById('f-check-interval').value.trim();
   if (checkInterval) body.check_interval = Number(checkInterval);
 
+  // Sent as-is (a plain number like "5000000" or a human size like
+  // "10 MiB/s") — the server parses either (see operations.repositories'
+  // _with_parsed_bandwidth_limit / sizes.parse_byte_rate_loose) and
+  // reports a clear error for anything else, same as other validation.
   const bandwidthLimit = document.getElementById('f-prefetch-bandwidth-limit').value.trim();
-  if (bandwidthLimit) body.prefetch_bandwidth_limit = Number(bandwidthLimit);
+  if (bandwidthLimit) body.prefetch_bandwidth_limit = bandwidthLimit;
 
   const group = document.getElementById('f-group').value.trim();
   if (group) body.group = group;

@@ -74,9 +74,33 @@ def test_timezone_dst_repeated_hour_and_full_day(tmp_path):
     assert scheduled_limit(c, datetime(2026,9,15,3,59,tzinfo=timezone.utc)) == 20
 
 
+def _bytes_released(c, repository, seconds=10):
+    """Bytes the real budget lets one repository's pending request through in `seconds`."""
+    budget = BandwidthBudget()
+    budget.limiter(c, repository)
+    request = _Request(repository.id, 100000)
+    budget._requests.append(request)
+    for tick in range(seconds * 10 + 1):
+        budget._step(tick / 10)
+    return 100000 - request.remaining
+
+
 def test_repository_cannot_raise_global_ceiling(tmp_path):
-    c = config(tmp_path, prefetch_bandwidth_limit=10)
-    assert c.effective_prefetch_bandwidth_limit(repo(limit=100)) == 10
+    repository = repo(limit=100)
+    c = config(tmp_path, repos=[repository], prefetch_bandwidth_limit=10)
+    assert _bytes_released(c, repository) == pytest.approx(100, abs=11)  # ~10 B/s for 10 s, not 1000
+
+
+def test_repository_without_its_own_limit_follows_the_global_ceiling(tmp_path):
+    repository = repo()
+    c = config(tmp_path, repos=[repository], prefetch_bandwidth_limit=5)
+    assert _bytes_released(c, repository) == pytest.approx(50, abs=6)
+
+
+def test_repository_limit_below_global_ceiling_wins(tmp_path):
+    repository = repo(limit=1)
+    c = config(tmp_path, repos=[repository], prefetch_bandwidth_limit=5)
+    assert _bytes_released(c, repository) == pytest.approx(10, abs=2)
 
 
 def test_shared_budget_across_threads_and_event_loops(tmp_path):

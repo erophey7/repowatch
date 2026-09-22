@@ -79,7 +79,7 @@ def test_prune_warmed_packages_noop_when_nothing_old(tmp_path):
 def test_get_stale_warmed_packages_matches_what_prune_would_delete(tmp_path):
     """Read-only counterpart to prune_warmed_packages — used by
     watcher.prune_all to purge the real cache entry before the bookkeeping
-    row disappears (docs_dev/ROADMAP.md item 33). Must select exactly the
+    row disappears (auto-unwarm). Must select exactly the
     same rows prune_warmed_packages would delete, not an approximation."""
     store = ServiceState(tmp_path / "state.sqlite3")
     now = datetime.now(timezone.utc)
@@ -173,10 +173,10 @@ def test_prune_requests_by_size_keeps_n_most_recent_globally(tmp_path):
     removed = store.requests.prune_requests_by_size(max_rows=2)
 
     assert removed == 2
-    remaining = store.requests.get_recent_requests(limit=10)
+    remaining = store.queries.get_page("requests", None, limit=10)["items"]
     assert len(remaining) == 2
-    assert remaining[0]["ts"] == (now - timedelta(minutes=0)).isoformat(timespec="seconds")
-    assert remaining[1]["ts"] == (now - timedelta(minutes=1)).isoformat(timespec="seconds")
+    assert sorted(item["ts"] for item in remaining) == sorted(
+        (now - timedelta(minutes=minutes)).isoformat(timespec="seconds") for minutes in (0, 1))
 
 
 def test_prune_requests_by_size_noop_when_under_limit(tmp_path):
@@ -186,4 +186,4 @@ def test_prune_requests_by_size_noop_when_under_limit(tmp_path):
     removed = store.requests.prune_requests_by_size(max_rows=10)
 
     assert removed == 0
-    assert len(store.requests.get_recent_requests(limit=10)) == 1
+    assert len(store.queries.get_page("requests", None, limit=10)["items"]) == 1

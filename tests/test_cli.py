@@ -77,6 +77,20 @@ def test_stats_cache_dir_flag_walks_the_configured_directory(tmp_path, capsys):
     assert "1 file(s)" in out
 
 
+def test_stats_reports_human_readable_sizes_alongside_exact_bytes(tmp_path, capsys):
+    cache_dir = tmp_path / "nginx-cache"
+    (cache_dir / "1").mkdir(parents=True)
+    (cache_dir / "1" / "f").write_bytes(b"x" * (2 * 1024 * 1024))
+    config_path = _write_config(tmp_path, f"nginx:\n  enabled: true\n  cache_dir: {cache_dir}\n")
+
+    rc = main(["-c", str(config_path), "stats", "--cache-dir"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "2.0 MiB" in out
+    assert "2,097,152 bytes" in out
+
+
 def test_stats_cache_dir_flag_fails_clearly_for_a_missing_directory(tmp_path, capsys):
     missing = tmp_path / "does-not-exist"
     config_path = _write_config(tmp_path, f"nginx:\n  enabled: true\n  cache_dir: {missing}\n")
@@ -88,7 +102,7 @@ def test_stats_cache_dir_flag_fails_clearly_for_a_missing_directory(tmp_path, ca
 
 
 def test_stats_cache_dir_flag_prefers_cache_probe_when_enabled(tmp_path, capsys):
-    """docs_dev/ROADMAP.md item 8 hooked up to item 27 — with
+    """With
     nginx.enable_cache_probe on, `stats --cache-dir` uses the njs-based
     ground-truth scan instead of os.walk(), even without nginx.cache_dir
     set locally."""

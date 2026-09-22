@@ -6,10 +6,41 @@ import yaml
 from pathlib import Path
 from repowatch.config.models import RepoConfig, StatusServerConfig, SyslogListenerConfig, NginxConfig, Config
 from repowatch.errors import ConfigError
+from repowatch.sizes import parse_byte_rate
 from typing import Any
 
 # Optional acceleration already supplied by PyYAML; retain its safe Python fallback.
 _SAFE_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
+
+def _with_parsed_bandwidth_limit(value: Any) -> Any:
+    """Applied to a repo dict (RepoConfig(**...) kwargs) — replaces a
+    human-size string prefetch_bandwidth_limit ("10 MiB") with the float
+    bytes/sec RepoConfig itself expects; a plain YAML number passes
+    through parse_byte_rate() unchanged. Left as-is (including any
+    malformed non-dict entry) if there's nothing to convert — the
+    existing RepoConfig(**r)/ConfigError path reports that error."""
+    if not isinstance(value, dict) or 'prefetch_bandwidth_limit' not in value:
+        return value
+    value = dict(value)
+    value['prefetch_bandwidth_limit'] = parse_byte_rate(value['prefetch_bandwidth_limit'])
+    return value
+
+
+def _with_parsed_schedule(schedule: Any) -> Any:
+    """Same conversion as _with_parsed_bandwidth_limit(), for each
+    bandwidth schedule window's own limit — a separate human size, not
+    reachable from the top-level/per-repo field above."""
+    if not isinstance(schedule, list):
+        return schedule
+    result = []
+    for window in schedule:
+        if isinstance(window, dict) and 'limit' in window:
+            window = dict(window)
+            window['limit'] = parse_byte_rate(window['limit'])
+        result.append(window)
+    return result
+
 
 def load_config(path: str | Path) -> Config:
     path = Path(path)
@@ -28,7 +59,7 @@ def load_config(path: str | Path) -> Config:
         if not isinstance(repos_raw, list):
             raise ConfigError("repos must be a list; use repos: [] for an empty installation")
 
-        repos = [RepoConfig(**r) for r in repos_raw]
+        repos = [RepoConfig(**_with_parsed_bandwidth_limit(r)) for r in repos_raw]
 
         ids = [r.id for r in repos]
         dupes = {i for i in ids if ids.count(i) > 1}
@@ -58,9 +89,9 @@ def load_config(path: str | Path) -> Config:
             prefetch_concurrency=raw.get("prefetch_concurrency", 8),
             check_concurrency=raw.get("check_concurrency", 8),
             public_cache_url=(str(raw["public_cache_url"]).rstrip("/") if raw.get("public_cache_url") else None),
-            prefetch_bandwidth_limit=raw.get('prefetch_bandwidth_limit'),
+            prefetch_bandwidth_limit=parse_byte_rate(raw.get('prefetch_bandwidth_limit')),
             prefetch_bandwidth_timezone=raw.get('prefetch_bandwidth_timezone', 'UTC'),
-            prefetch_bandwidth_schedule=raw.get('prefetch_bandwidth_schedule', []),
+            prefetch_bandwidth_schedule=_with_parsed_schedule(raw.get('prefetch_bandwidth_schedule', [])),
             notify_webhook_url=(str(raw["notify_webhook_url"]) if raw.get("notify_webhook_url") else None),
             notify_after_failures=raw.get("notify_after_failures", 3),
             notify_events=raw.get("notify_events", ["repository.failing", "repository.recovered"]),

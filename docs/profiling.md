@@ -81,6 +81,32 @@ These numbers cannot be presented as external client latency or maximum capacity
 For sustained saturation tests on an isolated synthetic server, use the existing
 `scripts/load-test.py` instead.
 
+## Garbage-collector pauses
+
+The service keeps each catalog in memory as lookup tables for the syslog listener,
+and building an index creates tens of thousands of short-lived objects. A full
+collection stops every thread of the process, so its duration is a floor for
+request latency spikes. `scripts/measure-gc.py` builds a comparable heap, repeats
+index-parsing work and prints every collection's pause by generation, with and
+without `gc.freeze()` applied to the long-lived tables:
+
+```sh
+sudo -u repowatch nice -n 15 /usr/local/lib/repowatch/venv/bin/python - \
+  --config /etc/repowatch/config.yaml --rounds 5 < scripts/measure-gc.py \
+  > /tmp/repowatch-gc.jsonl
+```
+
+With `--config` the catalogs are read from the existing database in read-only mode;
+without it a synthetic heap is used (`--synthetic-heap`). Run it with the service's
+own Python: the collector's behavior differs between interpreter releases, so
+numbers from another version do not transfer. It never touches the running service.
+`gc.freeze()` is only a diagnostic here and is not used by the service, because
+it also freezes whatever transient cyclic garbage exists at that moment.
+
+The route tables keep their owners as tuples of strings, which the collector stops
+tracking; a list per route would add one tracked container per catalog file to every
+full collection.
+
 ## Routing and configuration optimizations
 
 Bulk cache operations prepare validated routes once per operation and bind

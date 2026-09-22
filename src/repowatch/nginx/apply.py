@@ -80,21 +80,28 @@ def apply(config_path: str, policy_path: str, *, force: bool = False, use_system
                 f"nginx.cache_dir in config.yaml to the real path, or change the real one with "
                 f"CACHE_DIR=... make install && sudo make activate."
             )
+        # find_duplicate_files() is a real query over repo_packages — only
+        # run it when dedup is actually on, so leaving it off costs nothing
+        # extra on every apply cycle (this timer runs every 15s). Computed
+        # BEFORE render(), which needs the resolved pairs to size the map's
+        # nginx-level hash tables for its actual entry count (see
+        # nginx.render._dedup_hash_sizes) — a real production catalog has
+        # enough duplicate files that nginx's own small defaults fail to
+        # build the hash table at all, not just perform poorly.
+        dedup_rows = (CacheStore(Database(config.state_db, read_only=True)).find_duplicate_files()
+                      if config.nginx.enable_dedup and config.state_db.is_file() else [])
+        dedup_pairs = resolve_dedup_pairs(config, dedup_rows)
         candidate = render(config, cache_dir=policy['cache_dir'], access_log=policy['access_log'],
                             purge_conf=str(purge_path), dedup_conf=str(dedup_path),
-                            probe_conf=str(probe_conf_path), probe_js=str(probe_js_path))
+                            probe_conf=str(probe_conf_path), probe_js=str(probe_js_path),
+                            dedup_pairs=dedup_pairs)
         # render_purge()/render_dedup()/render_probe_conf()/render_probe_js()
         # are written unconditionally (empty/comment-only when their flag is
         # off) — render() only ever `include`s/`js_import`s them when the
         # corresponding flag is on, so an idle file on disk changes nothing;
         # this avoids conditionally creating/deleting a file across toggles.
         purge_candidate = render_purge(config)
-        # find_duplicate_files() is a real query over repo_packages — only
-        # run it when dedup is actually on, so leaving it off costs nothing
-        # extra on every apply cycle (this timer runs every 15s).
-        dedup_rows = (CacheStore(Database(config.state_db, read_only=True)).find_duplicate_files()
-                      if config.nginx.enable_dedup and config.state_db.is_file() else [])
-        dedup_candidate = render_dedup(config, resolve_dedup_pairs(config, dedup_rows))
+        dedup_candidate = render_dedup(config, dedup_pairs)
         probe_conf_candidate = render_probe_conf(config)
         probe_js_candidate = render_probe_js(config, cache_dir=policy['cache_dir'])
         digest = hashlib.sha256((

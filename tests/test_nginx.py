@@ -265,7 +265,7 @@ def test_real_nginx_proxy_routes_and_cache(tmp_path):
 
 
 def test_real_nginx_dedup_shares_the_canonical_cache_entry(tmp_path):
-    """docs_dev/ROADMAP.md item 29, end-to-end: a request for the duplicate
+    """Cross-repo dedup, end-to-end: a request for the duplicate
     repo's copy of a byte-identical file must HIT the CANONICAL repo's own
     cache entry (same bytes, same key) instead of creating a second one —
     real nginx, two distinct real backends, no mocks. This also guards
@@ -427,7 +427,7 @@ def test_apply_rejects_cache_dir_mismatch_without_touching_anything(tmp_path, mo
     assert not (tmp_path / 'active.conf').exists()
 
 
-# --- active cache purge on package removal (docs_dev/ROADMAP.md item 24) ---
+# --- active cache purge on package removal ---
 
 def test_purge_disabled_by_default_renders_no_purge_locations():
     text = nginx_render.render(config([apt()]))
@@ -535,7 +535,7 @@ def test_purge_location_omitted_entirely_when_disabled_even_with_cache_key_versi
     assert 'proxy_cache_purge' not in nginx_render.render_purge(c)
 
 
-# --- cross-repository dedup of byte-identical files (docs_dev/ROADMAP.md item 29) ---
+# --- cross-repository dedup of byte-identical files ---
 
 def test_nginx_config_enable_dedup_defaults_to_false_and_validates_type():
     assert NginxConfig().enable_dedup is False
@@ -594,6 +594,91 @@ def test_dedup_include_path_is_configurable_and_validated():
         nginx_render.render(c, dedup_conf='relative/dedup.map')
 
 
+# --- production incident 2026-09-22 (continued): nginx's own map_hash
+# defaults are too small once resolve_dedup_pairs() actually returns tens of
+# thousands of real entries — "could not build map_hash, you should
+# increase map_hash_bucket_size" from a real nginx -t on the production
+# catalog, after the self-mapped/duplicate-key fix above stopped hiding it
+# behind "conflicting parameter". Both directives must precede the map{}
+# block (they're http-context, invalid inside it).
+
+def test_dedup_without_pairs_emits_nginx_own_defaults_explicitly():
+    c = config([apt()])
+    c = replace(c, nginx=replace(c.nginx, enable_dedup=True))
+    text = nginx_render.render(c)
+    # No real data yet (a preview render, or a repo with no duplicates) —
+    # still emitted, at exactly nginx's own defaults, so the directive is
+    # never silently absent depending on catalog state.
+    assert 'map_hash_max_size 2048;' in text
+    assert 'map_hash_bucket_size 64;' in text
+
+
+def test_dedup_hash_sizes_precede_the_map_block_and_scale_with_real_data():
+    c = config([apt()])
+    c = replace(c, nginx=replace(c.nginx, enable_dedup=True))
+    pairs = [(f'/ubuntu/pool/main/p{i}/p{i}_1.0_amd64.deb', f'/debian/pool/main/p{i}/p{i}_1.0_amd64.deb')
+             for i in range(50000)]
+    text = nginx_render.render(c, dedup_pairs=pairs)
+    max_line = next(l for l in text.splitlines() if l.startswith('map_hash_max_size'))
+    bucket_line = next(l for l in text.splitlines() if l.startswith('map_hash_bucket_size'))
+    max_size = int(max_line.split()[1].rstrip(';'))
+    bucket_size = int(bucket_line.split()[1].rstrip(';'))
+    # Comfortably above nginx's own small defaults for a map this size.
+    assert max_size >= len(pairs)
+    assert bucket_size >= 64
+    assert text.index('map_hash_max_size') < text.index('map_hash_bucket_size') < text.index('map $uri')
+    # http-context directives, so strictly before server{} too.
+    assert text.index('map_hash_max_size') < text.index('server {')
+
+
+def test_dedup_hash_bucket_size_fits_the_longest_real_key():
+    c = config([apt()])
+    c = replace(c, nginx=replace(c.nginx, enable_dedup=True))
+    long_key = '/ubuntu/pool/main/' + 'x' * 150 + '.deb'
+    text = nginx_render.render(c, dedup_pairs=[(long_key, '/debian/short.deb')])
+    bucket_size = int(next(l for l in text.splitlines() if l.startswith('map_hash_bucket_size')).split()[1].rstrip(';'))
+    assert bucket_size >= len(long_key) + 4  # quoting adds two bytes
+
+
+def test_dedup_hash_sizes_are_powers_of_two_with_a_sane_floor():
+    assert nginx_render._dedup_hash_sizes([]) == (2048, 64)
+    max_size, bucket_size = nginx_render._dedup_hash_sizes([('/a', '/b')])
+    assert max_size == 2048  # floor, not 4 rounded up
+    assert bucket_size == 64  # floor, tiny key
+    for size in (max_size, bucket_size):
+        assert size & (size - 1) == 0  # a power of two
+
+
+def test_real_nginx_accepts_a_large_dedup_map_alongside_the_prefetch_map(tmp_path):
+    """The actual production failure (2026-09-22): with syslog_listener.enabled
+    (the default) AND enable_dedup, there are TWO map{} blocks in one http
+    context. nginx builds one shared hash table per context for every map{}
+    in it, reading map_hash_max_size/map_hash_bucket_size only from the
+    FIRST map{} it parses onward — a real nginx rejected a single valid
+    declaration placed between the two maps as "directive is duplicate",
+    confirmed by hand before this test existed. Both must precede BOTH maps,
+    not just the one that needs the larger sizing."""
+    import shutil
+    binary = shutil.which('nginx')
+    if not binary:
+        pytest.skip('nginx is an optional system dependency')
+    c = config([apt('debian'), apt('ubuntu', 'http://archive.ubuntu.com/ubuntu')])
+    c = replace(c, nginx=replace(c.nginx, enable_dedup=True))
+    assert c.syslog_listener.enabled  # exercises both map{} blocks, not just dedup's
+    pairs = [(f'/ubuntu/pool/main/p{i}/p{i}_1.0-1_amd64.deb', f'/debian/pool/main/p{i}/p{i}_1.0-1_amd64.deb')
+             for i in range(20000)]
+    text = nginx_render.render(c, cache_dir=str(tmp_path / 'cache'), access_log=str(tmp_path / 'access.log'),
+                               dedup_conf=str(tmp_path / 'dedup.map'), dedup_pairs=pairs)
+    (tmp_path / 'dedup.map').write_text(nginx_render.render_dedup(c, pairs))
+    conf = tmp_path / 'nginx.conf'
+    conf.write_text(
+        f"worker_processes 1;\npid {tmp_path / 'n.pid'};\nerror_log {tmp_path / 'e.log'};\n"
+        f"events {{}}\nhttp {{\n{text}\n}}\n"
+    )
+    result = subprocess.run([binary, '-t', '-c', str(conf)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
 def test_render_dedup_empty_by_default():
     assert nginx_render.render_dedup(config([apt()]), []) == '# Generated by repowatch; edit YAML parameters, not this file.\n'
 
@@ -622,6 +707,91 @@ def test_resolve_dedup_pairs_skips_rows_for_repos_no_longer_in_config():
     c = config([apt('debian')])
     rows = [('removed-repo', 'debian', 'a.deb'), ('debian', 'removed-repo', 'a.deb')]
     assert nginx_render.resolve_dedup_pairs(c, rows) == []
+
+
+# --- production incident 2026-09-22: several repos sharing one nginx route ---
+# collapsed to the same local URI, producing self-mapped and duplicate-key
+# `map` entries that made a real nginx-apply fail with "conflicting parameter"
+# (see docs_dev/NGINX.md). Every apt suite here shares the /ubuntu prefix.
+
+def test_resolve_dedup_pairs_drops_self_mapped_rows_sharing_one_nginx_route(caplog):
+    c = config([
+        apt('ubuntu-noble-main', 'http://archive.ubuntu.com/ubuntu'),
+        apt('ubuntu-jammy-main', 'http://archive.ubuntu.com/ubuntu'),
+    ])
+    rows = [('ubuntu-noble-main', 'ubuntu-jammy-main', 'pool/main/a/a.deb')]
+    with caplog.at_level('WARNING'):
+        pairs = nginx_render.resolve_dedup_pairs(c, rows)
+    # Both repos resolve to the identical /ubuntu/pool/main/a/a.deb — nothing
+    # to redirect, and emitting it would rewrite a location to itself.
+    assert pairs == []
+    assert 'skipped 1 self-mapped and 0 conflicting' in caplog.text
+
+
+def test_resolve_dedup_pairs_collapses_duplicate_keys_from_the_same_shared_route(caplog):
+    c = config([
+        apt('ubuntu-noble-main', 'http://archive.ubuntu.com/ubuntu'),
+        apt('ubuntu-resolute-main', 'http://archive.ubuntu.com/ubuntu'),
+        apt('debian-bookworm-main', 'http://deb.debian.org/debian'),
+    ])
+    # Real production shape: two different apt suites (both collapsing to the
+    # same /ubuntu route) are each a duplicate of the same debian canonical
+    # for the same filename — two rows resolve to the identical (key, value)
+    # pair, which nginx's map directive rejects as a repeated key
+    # ("conflicting parameter" in the journal, reproduced by hand against a
+    # real nginx before this fix).
+    rows = [
+        ('ubuntu-noble-main', 'debian-bookworm-main', 'pool/main/liba/a.deb'),
+        ('ubuntu-resolute-main', 'debian-bookworm-main', 'pool/main/liba/a.deb'),
+    ]
+    with caplog.at_level('WARNING'):
+        pairs = nginx_render.resolve_dedup_pairs(c, rows)
+    # Exactly one entry, not two identical ones — the second row is a no-op
+    # once the first already set the same target, not a warned-about conflict.
+    assert pairs == [('/ubuntu/pool/main/liba/a.deb', '/debian/pool/main/liba/a.deb')]
+    assert 'conflicting' not in caplog.text
+
+
+def test_resolve_dedup_pairs_drops_a_key_proposed_two_different_targets(caplog):
+    c = config([
+        apt('ubuntu-a', 'http://archive.ubuntu.com/ubuntu'),
+        apt('ubuntu-b', 'http://archive.ubuntu.com/ubuntu'),
+        apt('debian-old', 'http://deb.debian.org/debian'),
+        RepoConfig('arch-core', 'pacman', 'https://mirror.test/core/os/x86_64', 'x86_64', repo_name='core'),
+    ])
+    # Two unrelated (filename, content_hash) groups happen to share a
+    # filename and both propose a duplicate row for the SAME apt-collapsed
+    # local URI, but with genuinely different canonical prefixes (/debian vs
+    # /arch) — not observed on production, but not excluded by the schema;
+    # must not guess.
+    rows = [
+        ('ubuntu-a', 'debian-old', 'pool/main/a.deb'),
+        ('ubuntu-b', 'arch-core', 'pool/main/a.deb'),
+    ]
+    with caplog.at_level('WARNING'):
+        pairs = nginx_render.resolve_dedup_pairs(c, rows)
+    assert pairs == []
+    assert 'conflicting' in caplog.text
+
+
+def test_resolve_dedup_pairs_output_has_no_duplicate_keys_and_no_self_mappings_under_fuzzing():
+    import random
+    rng = random.Random(20260922)
+    repos = [apt(f'ubuntu-{i}', 'http://archive.ubuntu.com/ubuntu') for i in range(6)]
+    repos += [apt(f'debian-{i}', 'http://deb.debian.org/debian') for i in range(3)]
+    c = config(repos)
+    ids = [r.id for r in repos]
+    filenames = [f'pool/main/p{i}.deb' for i in range(4)]
+    rows = [(rng.choice(ids), rng.choice(ids), rng.choice(filenames)) for _ in range(500)]
+    pairs = nginx_render.resolve_dedup_pairs(c, rows)
+    keys = [key for key, _ in pairs]
+    assert len(keys) == len(set(keys))
+    assert all(key != value for key, value in pairs)
+    # render_dedup() must therefore accept this without nginx ever seeing a
+    # repeated map key — the actual regression this whole file's incident was.
+    text = nginx_render.render_dedup(c, pairs)
+    lines = [line for line in text.splitlines() if line.startswith('"')]
+    assert len(lines) == len(set(lines))
 
 
 def test_apply_writes_dedup_map_and_includes_it_when_enabled(tmp_path, monkeypatch):
@@ -742,7 +912,7 @@ def test_prefetch_marker_map_and_log_format_present_when_syslog_listener_enabled
     assert text.index('map $http_user_agent') < text.index('server {')
 
 
-# --- read-only cache introspection via njs (docs_dev/ROADMAP.md item 8, unifies items 23/33) ---
+# --- read-only cache introspection via njs ---
 
 def test_nginx_config_enable_cache_probe_defaults_to_false_and_validates_type():
     assert NginxConfig().enable_cache_probe is False

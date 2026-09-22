@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 async def _check_key_expiry(config: Config, repo: RepoConfig, store: ServiceState) -> None:
-    """Trust state (docs_dev/ROADMAP.md item 20) — runs unconditionally at
+    """Trust state (GPG key expiry) — runs unconditionally at
     the very start of every check cycle, independent of whether the index
     itself turns out to be unchanged: a quiet repository that rarely
     changes must still get its signing key's expiry reassessed on
@@ -159,7 +159,7 @@ async def check_repo(config: Config, repo: RepoConfig, store: ServiceState) -> N
         await warm_cache(config, repo, store, new_packages)
 
     if diff.removed_packages:
-        # Active proxy_cache eviction (docs_dev/ROADMAP.md item 24) — a
+        # Active proxy_cache eviction — a
         # no-op unless nginx.enable_purge is set (see purge_removed), so
         # this doesn't change behavior for any config that hasn't opted in.
         await purge_removed(config, repo, diff.removed_filenames)

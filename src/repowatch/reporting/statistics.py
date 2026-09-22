@@ -10,7 +10,10 @@ from pathlib import Path
 from repowatch.config.load import load_config
 from repowatch.config.models import Config
 from repowatch.errors import ConfigError
+from repowatch.operations.cleanup import find_orphaned_repos, purge_orphaned_repos, purge_removed_from_index
 from repowatch.runtime.context import ServiceState
+from repowatch.storage.access import AdminSession
+from repowatch.web.access import load_admin_config, load_request_config
 from urllib.parse import parse_qs
 
 def paged_payload(store: ServiceState, kind: str, repo_id: str | None, query: str) -> tuple[int, dict]:
@@ -49,7 +52,7 @@ def requests_summary_payload(store: ServiceState, repo_id: str | None, timeline_
 
 
 def prefetch_efficiency_payload(store: ServiceState) -> tuple[int, dict]:
-    """docs_dev/ROADMAP.md item 19 — of what repowatch actively prefetched
+    """Of what repowatch actively prefetched
     ahead of demand per repo, how much was actually requested by a client
     afterward. See ServiceState.requests.get_prefetch_efficiency for the exact
     correlation. Always 200: an empty list (no repo has prefetched anything
@@ -59,7 +62,7 @@ def prefetch_efficiency_payload(store: ServiceState) -> tuple[int, dict]:
 
 
 def cache_dir_stats(cache_dir: str) -> dict:
-    """docs_dev/ROADMAP.md item 27 — a full filesystem walk (proxy_cache_path's
+    """A full filesystem walk (proxy_cache_path's
     levels=1:2 tree can be hundreds of thousands of small files), so this is
     deliberately NOT part of the always-on stats_payload below: it's only
     run when explicitly requested (dashboard "Calculate cache size" button /
@@ -82,7 +85,7 @@ def cache_dir_stats(cache_dir: str) -> dict:
         # owned by the nginx worker user (e.g. www-data) — regardless of
         # the top-level cache_dir's own permissions. repowatch usually runs
         # as a DIFFERENT, unprivileged service user (privilege separation
-        # from nginx is deliberate, see CLAUDE.md), so it typically cannot
+        # from nginx is deliberate), so it typically cannot
         # descend into any of them at all. os.walk()'s default onerror is a
         # silent no-op, which would make a permission-blocked cache look
         # EXACTLY like a genuinely empty one (0 bytes) — actively
@@ -112,7 +115,7 @@ def stats_payload(
     included; the nginx package cache directory's size is only walked when
     include_cache_dir is set (see cache_dir_stats).
 
-    docs_dev/ROADMAP.md item 8: when nginx.enable_cache_probe is on, this
+    When nginx.enable_cache_probe is on, this
     prefers cache.probe.cache_dir_size() (the njs-based ground-truth scan)
     over the os.walk()-based cache_dir_stats() below — it runs inside the
     nginx worker itself (already the cache's own owner), so it never hits
@@ -123,8 +126,7 @@ def stats_payload(
 
     Without enable_cache_probe, behavior is unchanged: cache_dir_stats()
     (os.walk()) is used, and it's only reported when the operator has
-    opted into NginxConfig.cache_dir being visible to repowatch at all (see
-    docs_dev/ROADMAP.md item 12) — otherwise there is no path to walk, and
+    opted into NginxConfig.cache_dir being visible to repowatch at all) — otherwise there is no path to walk, and
     that's a normal, expected configuration, not an error.
     """
     payload = store.database.get_storage_stats()
@@ -150,3 +152,96 @@ def stats_payload(
             except OSError as exc:
                 payload["cache_dir"] = {"error": str(exc)}
     return 200, payload
+
+
+def orphaned_repos_payload(
+    config_path: str | Path, store: ServiceState, *, current: Config | None = None,
+) -> tuple[int, dict]:
+    """Storage tab, step 1 ("Scan for orphaned repositories"): repo ids with
+    SQL bookkeeping left over from a repository no longer in config.yaml —
+    see operations.cleanup.find_orphaned_repos for exactly what this does
+    and does not cover (SQL rows only, never physical cache files).
+    Read-only, so no admin_session check (matches purge_candidates_payload's
+    own reasoning), though the route itself is still admin-only."""
+    current, error = load_request_config(config_path, current)
+    if error is not None:
+        return error
+    return 200, {"orphaned": find_orphaned_repos(current, store)}
+
+
+def purge_orphaned_repos_payload(
+    config_path: str | Path,
+    store: ServiceState,
+    admin_session: AdminSession | None,
+    body: dict,
+) -> tuple[int, dict]:
+    """Storage tab, step 2 ("Delete selected"): the operator has reviewed
+    the orphans from orphaned_repos_payload and picked a subset to remove.
+    body: {"repo_ids": ["repo-id", ...]}. Re-checks each id is still absent
+    from config.repos before deleting (operations.cleanup.purge_orphaned_repos)
+    — an id that was re-added since the scan is silently skipped, not an
+    error, the same defensive posture as the rest of the purge feature."""
+    current, error = load_admin_config(config_path, admin_session)
+    if error is not None:
+        return error
+
+    if not isinstance(body, dict) or not isinstance(body.get("repo_ids"), list) or not body["repo_ids"]:
+        return 400, {"error": 'request body must be {"repo_ids": ["repo-id", ...]}'}
+
+    repo_ids = [str(r) for r in body["repo_ids"]]
+    return 200, {"deleted": purge_orphaned_repos(current, store, repo_ids)}
+
+
+def zombie_packages_payload(
+    config_path: str | Path, store: ServiceState, *, current: Config | None = None,
+) -> tuple[int, dict]:
+    """Storage tab, step 1 ("Scan for zombie packages"): packages tracked
+    as warmed but already replaced/removed from the current index
+    snapshot, across every repository at once — see
+    ServiceState.cache.find_all_stale_warmed for exactly what this catches
+    (a package superseded by a new version under a different package_key,
+    which warmed_retention_days alone can leave cached for months — a real
+    production example is in that method's own docstring) and
+    operations.cleanup.purge_removed_from_index for how purging works.
+    Reports whether nginx.enable_purge is even on (same reasoning as
+    purge_candidates_payload). Read-only, so no admin_session check,
+    though the route itself is still admin-only."""
+    current, error = load_request_config(config_path, current)
+    if error is not None:
+        return error
+    return 200, {
+        "enable_purge": current.nginx.enable_purge,
+        "candidates": store.cache.find_all_stale_warmed(),
+    }
+
+
+def purge_zombie_packages_payload(
+    config_path: str | Path,
+    store: ServiceState,
+    admin_session: AdminSession | None,
+    body: dict,
+) -> tuple[int, dict]:
+    """Storage tab, step 2 ("Purge selected"): the operator has reviewed
+    the candidates from zombie_packages_payload and picked a subset.
+    body: {"items": [{"repo_id": ..., "package_key": ...}, ...]} — a flat
+    package_key list (as the per-repo purge_selected_payload takes) isn't
+    enough here: candidates span multiple repositories, and package_key is
+    only unique within one. Filenames are always re-derived server-side
+    from warmed_packages (see purge_removed_from_index), never trusted
+    from the request body."""
+    current, error = load_admin_config(config_path, admin_session)
+    if error is not None:
+        return error
+
+    if not current.nginx.enable_purge:
+        return 400, {"error": "nginx.enable_purge is not enabled in config.yaml — nothing to purge"}
+
+    items = body.get("items") if isinstance(body, dict) else None
+    if not isinstance(items, list) or not items or any(
+        not isinstance(i, dict) or not isinstance(i.get("repo_id"), str) or not isinstance(i.get("package_key"), str)
+        for i in items
+    ):
+        return 400, {"error": 'request body must be {"items": [{"repo_id": "...", "package_key": "..."}, ...]}'}
+
+    results = asyncio.run(purge_removed_from_index(current, store, items))
+    return 200, {"results": results}

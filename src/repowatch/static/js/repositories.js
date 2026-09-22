@@ -2,7 +2,7 @@ function fmtTs(ts) {
   return ts ? ts.replace('T', ' ').replace(/\+00:00$/, ' UTC') : '—';
 }
 
-// docs_dev/ROADMAP.md item 20 — trust state. repo.key_expires_at/
+// Trust state: repo.key_expires_at/
 // key_expiring_soon come pre-computed from the last check cycle (see
 // api.repos_list_payload); this just renders them, no live gpg call from
 // the browser. '—' covers apk repos, repos without verify_signature, and

@@ -186,8 +186,7 @@ setup.
 
 See [Docker builds](docs/docker.md) for generated build files, Make targets and
 optional experimental features and [docker-compose.dev.yml](docker-compose.dev.yml).
-The Docker Hub release Compose draft stays local until release preparation. Container runtime
-validation is still pending.
+Container runtime validation is still pending.
 
 ## License
 

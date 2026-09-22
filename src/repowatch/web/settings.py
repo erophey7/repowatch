@@ -10,6 +10,7 @@ from repowatch.config.models import Config
 from repowatch.config.edit import atomic_config, locked_config
 from repowatch.config.load import load_config
 from repowatch.errors import ConfigError
+from repowatch.sizes import parse_byte_rate_loose
 from repowatch.storage.access import AdminSession
 from repowatch.web.access import load_admin_config, load_request_config
 from typing import Any, Callable
@@ -25,10 +26,30 @@ def _cast_int(value: Any) -> int:
     raise ValueError('an integer is required')
 
 
-def _cast_optional_float(value: Any) -> float | None:
+def _cast_bandwidth_limit(value: Any) -> float | None:
+    """Empty/None means "no limit". A bare numeric string ("5000000")
+    keeps working exactly as before; a human-size string ("10 MiB",
+    "512 KB/s") is now also accepted (see sizes.parse_byte_rate_loose's
+    own docstring for why this specific boundary stays permissive about
+    bare numeric strings, unlike the stricter YAML-facing parser)."""
     if value in (None, ""):
         return None
-    return float(value)
+    return parse_byte_rate_loose(value)
+
+
+def _cast_schedule(value: Any) -> Any:
+    """Same JSON-string-or-already-a-list handling as before, plus the
+    same human-size conversion as _cast_bandwidth_limit for each window's
+    own limit — a separate value the outer cast never reaches."""
+    schedule = json.loads(value) if isinstance(value, str) else value
+    if not isinstance(schedule, list):
+        return schedule
+    result = []
+    for window in schedule:
+        if isinstance(window, dict) and 'limit' in window:
+            window = {**window, 'limit': _cast_bandwidth_limit(window['limit'])}
+        result.append(window)
+    return result
 
 
 def _cast_optional_int(value: Any) -> int | None:
@@ -67,9 +88,9 @@ SAFE_CONFIG_FIELDS: dict[str, Callable[[Any], Any]] = {
     "request_max_rows": _cast_optional_int,
     "prefetch_concurrency": _cast_int,
     "check_concurrency": _cast_int,
-    "prefetch_bandwidth_limit": _cast_optional_float,
+    "prefetch_bandwidth_limit": _cast_bandwidth_limit,
     "prefetch_bandwidth_timezone": str,
-    "prefetch_bandwidth_schedule": lambda value: json.loads(value) if isinstance(value, str) else value,
+    "prefetch_bandwidth_schedule": _cast_schedule,
     "cache_base_url": _cast_url,
     "public_cache_url": _cast_optional_url,
     "notify_after_failures": _cast_int,

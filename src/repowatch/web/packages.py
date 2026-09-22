@@ -44,8 +44,7 @@ def purge_candidates_payload(
     config_path: str | Path, store: ServiceState, repo_id: str,
     *, current: Config | None = None,
 ) -> tuple[int, dict]:
-    """Manual cache purge, step 1 (dashboard "Scan for stale entries",
-    docs_dev/ROADMAP.md): candidates computed from repowatch's own records
+    """Manual cache purge, step 1 (dashboard "Scan for stale entries"): candidates computed from repowatch's own records
     (see ServiceState.cache.find_stale_warmed) — no nginx/network call yet. Reports
     whether nginx.enable_purge is even on, so the dashboard can show a clear
     "enable it first" message instead of a confusing empty list — read-only,
@@ -131,7 +130,7 @@ def remove_warmed_package_payload(
     already uses — before dropping the bookkeeping row.
     Previously this only ever touched the warmed_packages tracking row and
     left the actual cached file alone, which was the precise disconnect
-    docs_dev/ROADMAP.md item 33 flagged: "un-warming" a package that's
+    found in review: "un-warming" a package that's
     still physically on disk made it invisible to future stale-scans
     (find_stale_warmed() needs the row to exist to find the file at all),
     turning it into a permanent, undiscoverable orphan until nginx's own

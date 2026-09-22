@@ -102,8 +102,12 @@ def match_repo_id(path: str, repos: list[RepoConfig]) -> str | None:
     return RepoMatcher(repos).match(path)
 
 
-def package_path_index(repo: RepoConfig, packages: dict[str, str]) -> dict[str, list[str]]:
-    """Index complete local routes, preserving every owner of the same file."""
+def package_path_index(repo: RepoConfig, packages: dict[str, str]) -> dict[str, tuple[str, ...]]:
+    """Index complete local routes, preserving every owner of the same file.
+
+    Owners are tuples: the collector stops tracking a tuple of strings, so a
+    catalog of hundreds of thousands of routes does not add a container per
+    route to every full garbage collection, which stops all threads."""
     index: dict[str, list[str]] = {}
     prefix = package_prefix(repo) + "/"
     for key, filename in packages.items():
@@ -115,20 +119,20 @@ def package_path_index(repo: RepoConfig, packages: dict[str, str]) -> dict[str, 
             if path.startswith('//') or any(char in path for char in '%?#\t\r\n'):
                 path = unquote(urlsplit(path).path)
             index.setdefault(path, []).append(key)
-    return index
+    return {path: tuple(keys) for path, keys in index.items()}
 
 
 def match_all_package_keys(path: str, by_path: dict[str, dict[str, list[str]]]) -> list[tuple[str, str]]:
     """Match the actual route; shared pool URLs can have several catalog owners."""
     path = unquote(urlsplit(path).path)
-    return [(repo_id, key) for repo_id, index in by_path.items() for key in index.get(path, [])]
+    return [(repo_id, key) for repo_id, index in by_path.items() for key in index.get(path, ())]
 
 
 def refresh_package_indexes(
     repos: list[RepoConfig],
     store: ServiceState,
     packages_by_repo: dict[str, dict[str, str]],
-    by_path: dict[str, dict[str, list[str]]],
+    by_path: dict[str, dict[str, tuple[str, ...]]],
     last_revision: dict[str, tuple[int | None, str]],
 ) -> None:
     """Refresh changed generations/routes and discard removed repositories.
@@ -191,7 +195,7 @@ def run_listener(config_path: str, initial_config: Config, store: ServiceState,
     repos = initial_config.repos
     matcher = RepoMatcher(repos)
     packages_by_repo: dict[str, dict[str, str]] = {}
-    by_path: dict[str, dict[str, list[str]]] = {}
+    by_path: dict[str, dict[str, tuple[str, ...]]] = {}
     last_revision: dict[str, tuple[int | None, str]] = {}
 
     refresh_package_indexes(repos, store, packages_by_repo, by_path, last_revision)

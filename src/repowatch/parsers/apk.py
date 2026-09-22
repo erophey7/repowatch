@@ -8,7 +8,7 @@ fields:
     (there's no separate field for the full filename — it's built as
      <P>-<V>.apk)
 
-TODO (see CLAUDE.md):
+TODO:
 - honor the architecture from the A: field, for mixed-arch repositories."""
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ def _parse_apkindex_tar_gz(raw: bytes, url: str) -> list[PackageRef]:
 
         text = extracted.read().decode("utf-8", errors="replace")
 
-    # docs_dev/ROADMAP.md item 29 (cross-repo dedup): APKINDEX's "C:" field
+    # Cross-repo dedup: APKINDEX's "C:" field
     # is not read into PackageRef.content_hash on purpose — it's a different
     # digest (SHA1, base64, "Q1"-prefixed) from the SHA256 hex the other
     # formats publish, so it could never match a real cross-format duplicate,

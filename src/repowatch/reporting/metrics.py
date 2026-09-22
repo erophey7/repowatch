@@ -78,7 +78,7 @@ def metrics_payload(config_path: str | Path, store: ServiceState, *, current: Co
 
     lines.append(
         "# HELP repowatch_repo_key_expires_at_timestamp_seconds Unix timestamp of the soonest "
-        "expiring GPG key in this repo's keyring (docs_dev/ROADMAP.md item 20) — absent for apk "
+        "expiring GPG key in this repo's keyring — absent for apk "
         "repos, repos without verify_signature, or when unknown."
     )
     lines.append("# TYPE repowatch_repo_key_expires_at_timestamp_seconds gauge")

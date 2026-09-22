@@ -170,11 +170,10 @@ def test_cli_uses_install_default_and_explicit_override(tmp_path, monkeypatch, c
 
 def test_make_defaults_are_read_only_help():
     root = Path(__file__).parents[1]
-    for makefile in ('Makefile', 'Makefile.dev'):
-        result = subprocess.run(['make', '-f', makefile], cwd=root, capture_output=True, text=True)
-        assert result.returncode == 0, result.stderr
-        assert 'make check' in result.stdout
-        assert 'ssh ' not in result.stdout
+    result = subprocess.run(['make', '-f', 'Makefile'], cwd=root, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert 'make check' in result.stdout
+    assert 'ssh ' not in result.stdout
 
 
 def test_activation_nginx_failure_removes_new_link_and_never_starts_services(tmp_path, monkeypatch):

@@ -65,7 +65,7 @@ def repos_list_payload(config_path: str | Path, store: ServiceState, *, current:
                 "check_interval": current.effective_check_interval(repo),
                 "last_check": status.get("last_check"),
                 "changed_at": status.get("changed_at"),
-                # Trust state (docs_dev/ROADMAP.md item 20) — the soonest
+                # Trust state — the soonest
                 # expiring key in this repo's keyring, from the last check
                 # cycle (see verification.gpg.soonest_key_expiry). None for apk
                 # repos, repos without verify_signature, or when unknown

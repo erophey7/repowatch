@@ -140,8 +140,7 @@ class CacheStore:
 
 
     def find_duplicate_files(self) -> list[tuple[str, str, str]]:
-        """Byte-identical files across DIFFERENT repositories (docs_dev/
-        ROADMAP.md item 29), identified by (filename, content_hash) — not
+        """Byte-identical files across DIFFERENT repositories (cross-repo dedup), identified by (filename, content_hash) — not
         by package_key, since the same file can be named differently or
         carry a different key format between distros/formats.
 
@@ -255,8 +254,7 @@ class CacheStore:
 
 
     def find_stale_warmed(self, repo_id: str) -> list[dict]:
-        """Manual cache purge (dashboard "Scan for stale entries",
-        docs_dev/ROADMAP.md) — candidates for garbage: warmed_packages rows
+        """Manual cache purge (dashboard "Scan for stale entries") — candidates for garbage: warmed_packages rows
         (repowatch believes/believed this file was fetched and cached at
         some point) whose package_key no longer exists in the CURRENT
         repo_packages snapshot for this repo (the package has since been
@@ -283,12 +281,30 @@ class CacheStore:
         return [{"package_key": key, "filename": filename} for key, filename in rows]
 
 
-    def get_warmed_filenames(self, repo_id: str, package_keys: list[str]) -> dict[str, str]:
-        """{package_key: filename} for exactly the given keys — used to
-        re-derive filenames server-side for a purge request instead of
-        trusting whatever the client echoes back (see
-        web.packages.purge_selected_payload)."""
-        return {key: item[0] for key, item in self.get_warmed_records(repo_id, package_keys).items()}
+    def find_all_stale_warmed(self) -> list[dict]:
+        """Same signal as find_stale_warmed (warmed but no longer a current
+        package for its repository) across every repository at once, for
+        the Storage tab's cross-repo "zombie packages" scan and for
+        operations.cleanup.prune_all's per-cycle immediate cleanup — see
+        both for why this is a stronger, faster signal than the generic
+        warmed_retention_days sweep: a package replaced by a new version
+        (a new package_key) can never be requested again under its old
+        key, so there's no reason to wait out the same 180-day "not
+        recently touched" window a still-current-but-unpopular package
+        gets. On one production repository with frequent releases
+        (pacman's firefox, 2026-09-23) this found 2300 superseded versions
+        sitting untouched for lack of exactly this check."""
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT w.repo_id, w.package_key, w.filename FROM warmed_packages w
+                LEFT JOIN repo_packages p ON p.repo_id = w.repo_id AND p.package_key = w.package_key
+                WHERE p.package_key IS NULL
+                ORDER BY w.repo_id, w.package_key
+                """
+            ).fetchall()
+        return [{"repo_id": repo_id, "package_key": key, "filename": filename}
+                for repo_id, key, filename in rows]
 
 
     def get_warmed_records(self, repo_id: str, package_keys: list[str],
@@ -394,3 +410,39 @@ class CacheStore:
             else:
                 conn.execute("UPDATE pending_replacements SET last_error=? WHERE repo_id=? AND package_key=? AND revision=?",
                              (error, repo_id, key, revision))
+
+
+    # Tables this store owns that are keyed by repo_id — the CacheStore side
+    # of orphan detection (see operations.cleanup.find_orphaned_repos and
+    # RepositoriesStore._REPO_TABLES's own docstring for the full picture).
+    # pending_replacements is deliberately NOT listed here even though this
+    # store reads/writes it too (get_pending_replacements/finish_replacement
+    # above) — it's counted and deleted once, by RepositoriesStore (which
+    # also writes it, from record_snapshot), not twice.
+    _REPO_TABLES = ('warmed_packages', 'prefetch_bans', 'nix_artifacts', 'nix_trust')
+
+    def get_repo_ids_with_data(self) -> set[str]:
+        with self.db.connect() as conn:
+            return {
+                repo_id
+                for table in self._REPO_TABLES
+                for (repo_id,) in conn.execute(f'SELECT DISTINCT repo_id FROM {table}')
+            }
+
+    def count_repo_rows(self, repo_id: str) -> dict[str, int]:
+        with self.db.connect() as conn:
+            counts = {
+                table: conn.execute(f'SELECT COUNT(*) FROM {table} WHERE repo_id = ?', (repo_id,)).fetchone()[0]
+                for table in self._REPO_TABLES
+            }
+        return {table: count for table, count in counts.items() if count}
+
+    def delete_repo_rows(self, repo_id: str) -> dict[str, int]:
+        """Bookkeeping only — see operations.cleanup.purge_orphaned_repos for
+        why the physical cache files themselves are not touched here."""
+        with self.db.connect() as conn:
+            counts = {
+                table: conn.execute(f'DELETE FROM {table} WHERE repo_id = ?', (repo_id,)).rowcount
+                for table in self._REPO_TABLES
+            }
+        return {table: count for table, count in counts.items() if count}

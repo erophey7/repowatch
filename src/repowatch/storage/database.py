@@ -50,7 +50,7 @@ class Database:
 
 
     def get_storage_stats(self) -> dict:
-        """docs_dev/ROADMAP.md item 27 — cheap, always-safe numbers about
+        """Cheap, always-safe numbers about
         state_db itself: file size (a single stat(), not a walk) and a row
         count per table. Deliberately does NOT touch the nginx package cache
         directory — that's a potentially large filesystem walk, a different

@@ -92,7 +92,7 @@ def _parse_repodata(raw: bytes) -> list[PackageRef]:
             raise ValueError(f"xbps: missing architecture for {pkgname!r}")
         filename = f"{pkgver}.{architecture}.xbps"
 
-        # docs_dev/ROADMAP.md item 29 (cross-repo dedup) — filename-sha256
+        # Cross-repo dedup — filename-sha256
         # is a real whole-file SHA256, the same algorithm apt/pacman/dnf
         # already publish, so it's safe to participate in cross-format
         # matches (unlike apk's different-algorithm "C:" field).

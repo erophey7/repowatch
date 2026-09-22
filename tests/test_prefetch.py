@@ -531,7 +531,7 @@ def test_xbps_prefix_uses_repo_id_flat_namespace():
     assert match_repo_id(path, [repo]) == repo.id
 
 
-# --- active cache purge on package removal (docs_dev/ROADMAP.md item 24) ---
+# --- active cache purge on package removal ---
 
 def _purge_config(**overrides):
     from repowatch.config.models import NginxConfig

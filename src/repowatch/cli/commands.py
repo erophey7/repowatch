@@ -10,6 +10,7 @@ from repowatch.operations.cleanup import prune_all
 from repowatch.runtime.context import ServiceState
 from repowatch.runtime.scheduler import check_all
 from repowatch.runtime.service import start_listeners
+from repowatch.sizes import format_bytes
 
 def command_hash_password(args) -> int:
     """Execute the hash-password command."""
@@ -69,12 +70,13 @@ def command_stats(args, config) -> int:
     store = ServiceState(config.state_db)
     store.bandwidth.bind(args.config)
     stats = store.database.get_storage_stats()
-    print(f"state_db: {config.state_db} ({stats['state_db_bytes']:,} bytes)")
+    print(f"state_db: {config.state_db} ({format_bytes(stats['state_db_bytes'])}, "
+          f"{stats['state_db_bytes']:,} bytes)")
     for table, count in stats["tables"].items():
         print(f"  {table}: {count:,} row(s)")
     if args.cache_dir:
         if config.nginx.enable_cache_probe:
-            # docs_dev/ROADMAP.md item 8/27 — the njs-based ground-truth
+            # The njs-based ground-truth
             # scan runs inside the nginx worker itself, so it doesn't
             # need nginx.cache_dir set locally at all and never hits the
             # 0700-subdirectory permission gap the os.walk() path below
@@ -82,8 +84,8 @@ def command_stats(args, config) -> int:
             try:
                 cache = asyncio.run(cache_probe.cache_dir_size(config.cache_base_url))
                 path = config.nginx.cache_dir or config.cache_base_url
-                print(f"cache_dir: {path} (via cache-probe) — {cache['size_bytes']:,} bytes, "
-                      f"{cache['file_count']:,} file(s)")
+                print(f"cache_dir: {path} (via cache-probe) — {format_bytes(cache['size_bytes'])} "
+                      f"({cache['size_bytes']:,} bytes), {cache['file_count']:,} file(s)")
                 if cache.get("unreadable_keys"):
                     print(f"  NOTE: {cache['unreadable_keys']:,} file(s) had an unreadable "
                           "stored key (not identifiable individually).",
@@ -103,8 +105,8 @@ def command_stats(args, config) -> int:
         else:
             try:
                 cache = cache_dir_stats(config.nginx.cache_dir)
-                print(f"cache_dir: {cache['path']} — {cache['size_bytes']:,} bytes, "
-                      f"{cache['file_count']:,} file(s)")
+                print(f"cache_dir: {cache['path']} — {format_bytes(cache['size_bytes'])} "
+                      f"({cache['size_bytes']:,} bytes), {cache['file_count']:,} file(s)")
                 if cache.get("inaccessible_directories"):
                     print(f"  WARNING: {cache['inaccessible_directories']:,} subdirector"
                           "y/ies could not be read (permission denied) — the numbers above "

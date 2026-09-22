@@ -1,7 +1,6 @@
 """Client for the optional /cache-probe, /cache-scan and /purge-raw
 endpoints served by nginx's njs module (see nginx.render.render_probe_js()/
-render_probe_conf(), docs_dev/ROADMAP.md item 8, which unifies items 23 and
-33) — ground-truth cache introspection, running inside the nginx worker
+render_probe_conf()) — ground-truth cache introspection, running inside the nginx worker
 itself so it can read proxy_cache_path's 0700-owned subdirectories
 repowatch's own unprivileged process cannot.
 
@@ -116,8 +115,8 @@ async def full_inventory(base_url: str, *, concurrency: int = 8) -> Inventory:
     side: Python already knows the whole namespace from the hardcoded
     levels=1:2 scheme, njs only ever answers "what's in this one directory".
 
-    This is the expensive, on-demand-only operation both docs_dev/ROADMAP.md
-    item 23 (completeness) and item 33 (real orphan discovery) build on —
+    This is the expensive, on-demand-only operation that cache completeness
+    reporting and real orphan discovery build on —
     never call this on a background timer, same posture as
     ServiceState.cache_dir_stats()'s full os.walk().
 
@@ -152,8 +151,8 @@ async def full_inventory(base_url: str, *, concurrency: int = 8) -> Inventory:
 
 async def cache_dir_size(base_url: str, *, concurrency: int = 8) -> dict:
     """Ground-truth cache directory size/file count via the njs full
-    inventory (docs_dev/ROADMAP.md item 27, hooked up to item 8's
-    infrastructure) — the accurate counterpart to reporting.statistics.cache_dir_stats()'s
+    inventory (storage statistics, hooked up to the njs
+    introspection infrastructure) — the accurate counterpart to reporting.statistics.cache_dir_stats()'s
     os.walk(), for when nginx.enable_cache_probe is on. Unlike that
     os.walk(), this runs inside the nginx worker itself (already the
     cache's own owner), so it never hits the 0700-subdirectory PERMISSION
@@ -214,7 +213,7 @@ async def purge_raw(client: httpx.AsyncClient, base_url: str, key: str) -> str:
     """Evicts a cache entry by its exact literal key, independent of any
     current repo route (see nginx.render.render_purge()'s /purge-raw location,
     only emitted when both enable_purge and enable_cache_probe are on) —
-    the only way to clean up a genuine orphan (docs_dev/ROADMAP.md item 33)
+    the only way to clean up a genuine orphan
     whose repo/config no longer exists to rebuild a normal per-route purge
     URL for. Same result contract as cache.purge.purge_selected(): "purged" |
     "not_cached" | "error (...)".

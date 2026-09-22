@@ -77,8 +77,7 @@ def repo_prefix(repo: RepoConfig) -> str:
         # same prefix in match_repo_id (see runtime/syslog.py). This
         # doesn't remove ambiguity entirely — several suites of the same
         # component (noble/noble-updates/noble-backports) physically share
-        # the same pool/, and there's nothing to be done about that (see
-        # CLAUDE.md/ROADMAP).
+        # the same pool/, and there's nothing to be done about that.
         return f"{apt_prefix(repo)}/pool/{repo.component}"
     if repo.type == "nix":
         return f"/nix/{repo.id}"
@@ -140,7 +139,7 @@ def warm_url(config: Config, repo: RepoConfig, filename: str) -> str:
 def purge_url(config: Config, repo: RepoConfig, filename: str) -> str:
     """Local URL that, when GET-requested, purges this package's
     proxy_cache entry — see nginx/render.py's purge location, only emitted when
-    nginx.enable_purge is set (docs_dev/ROADMAP.md item 24). Same local
+    nginx.enable_purge is set. Same local
     path as warm_url, under a /purge prefix nginx/render.py matches with a
     dedicated, loopback-only location per repository."""
     return f"{config.cache_base_url}/purge{package_path(repo, filename)}"
@@ -160,7 +159,7 @@ def compute_cache_key(config: Config, repo: RepoConfig, filename: str) -> str:
     apply here since this never touches upstream or proxy_cache at all, only
     stat()s a file); and to recognize which raw keys /cache-scan reads back
     from disk belong to a still-configured package, so anything left over is
-    an orphan candidate for docs_dev/ROADMAP.md item 33.
+    an orphan candidate.
 
     Reuses compute_routes() — the same single source of truth render() and
     render_purge() already draw from — specifically to avoid reintroducing

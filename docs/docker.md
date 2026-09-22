@@ -1,7 +1,7 @@
 # Generated Docker builds (experimental packaging)
 
 The generator builds the application image and a companion nginx image.
-The development Compose file is included; the release Compose draft is ignored until release preparation; actual image builds, container integration
+The development Compose file is included; actual image builds, container integration
 and multi-architecture validation remain pending.
 Build commands do not start services; starting either Compose stack is explicit.
 
@@ -40,11 +40,9 @@ The wrapper removes `.dockerignore` after a build attempt, including an engine
 failure or Python exception. Explicit generation leaves it for inspection;
 run `make docker-clean` before committing. After a hard kill, clean it explicitly
 as well. Cleanup only removes a file bearing the generator's marker. Keep
-`/.dockerignore` in your local `.gitignore`; this repository's existing ignore
-file is local rather than tracked. The old tracked `.dockerignore` is removed
-with this change. No commit hook, staging or commit is performed automatically.
+`/.dockerignore` in your `.gitignore`. No commit hook, staging or commit is
+performed automatically.
 
-The Make targets live in the main Makefile, so Makefile.dev inherits them.
 Neither the default target, normal tests, installation nor deployment invokes
 Docker implicitly.
 
@@ -216,8 +214,7 @@ Keep key files readable by the application group and reference container paths
 such as `/etc/repowatch/keys/debian.gpg` in YAML.
 
 Keep `/config/config.yaml`, `/config/keys/`, `/data/` and `/.env` excluded from Git
-in your local ignore rules. The repository's existing `.gitignore` is local and
-untracked. The generated build context already excludes these runtime files.
+in your ignore rules. The generated build context already excludes these runtime files.
 
 The nginx service owns the network namespace; repowatch joins it with
 `network_mode: service:nginx`. Existing loopback-only purge, cache probes and
@@ -277,60 +274,6 @@ Topology references: [Compose service configuration](https://docs.docker.com/ref
 and [Compose startup order](https://docs.docker.com/compose/how-tos/startup-order/).
 
 
-## Release Compose stack
-
-`docker-compose.release.yml` is currently a local draft, excluded from Git until
-release preparation. The following instructions describe that draft; it is not
-yet distributed with the repository. It is a standalone file, not an override of the
-development file. It pulls two images from Docker Hub with a matching version:
-
-- `docker.io/<namespace>/repowatch:<version>` for the application and init.
-- `docker.io/<namespace>/repowatch-nginx:<version>` for nginx and its helper.
-
-`DOCKERHUB_NAMESPACE` and `REPOWATCH_VERSION` are required; there is no implicit
-`latest` tag or assumed publishing account. Both images must be published first.
-The release file uses `pull_policy: always`; running `up` checks the registry.
-The bootstrap script and seed configuration are bundled in the application image,
-so no source checkout, Makefile or `docker/` directory is needed on the target.
-Existing YAML is still preserved. Bind mounts, group permissions, localhost ports
-and the shared network namespace match the development stack above.
-
-Copy the release YAML into a separate deployment directory, then run from there
-(replace the example namespace and version with your published values):
-
-```sh
-export DOCKERHUB_NAMESPACE=your-dockerhub-namespace
-export REPOWATCH_VERSION=0.1.0
-export REPOWATCH_GID="$(id -g)"
-docker compose -f docker-compose.release.yml config
-docker compose -f docker-compose.release.yml up -d
-docker compose -f docker-compose.release.yml ps
-docker compose -f docker-compose.release.yml exec repowatch \
-  repowatch -c /etc/repowatch/config.yaml set-password
-```
-
-Store those three values in that directory's `.env` for subsequent commands;
-use a positive, non-root host GID. No registry credentials belong in that file.
-The same `config/` and `data/` layout is created beside the release YAML. Run the
-development and release stacks in separate directories; different project names
-do not isolate bind-mounted files or avoid published-port conflicts. Do not run
-both against the same data simultaneously. Both still bind the same localhost
-ports by default.
-
-To upgrade, keep the group and namespace stable, choose a new published version,
-pull it, then stop the stack before initialization/migration of shared SQLite:
-
-```sh
-docker compose -f docker-compose.release.yml pull
-docker compose -f docker-compose.release.yml down
-# Back up config/ and data/state/ while stopped before upgrading.
-docker compose -f docker-compose.release.yml up -d
-```
-
-This recreates nginx and repowatch together for their shared network namespace.
-Stopping the stack retains bind-mounted data. Merely selecting an older image
-tag is not a database rollback; retain the matching backup when upgrading.
-
 ## Publishing images to Docker Hub
 
 Create the `repowatch` and `repowatch-nginx` repositories in your Docker Hub user
@@ -361,15 +304,14 @@ docker push "$DOCKER_NGINX_IMAGE"
 Docker documents this [tag-and-push workflow](https://docs.docker.com/docker-hub/repos/manage/hub-images/push/)
 and [interactive login](https://docs.docker.com/reference/cli/docker/login/).
 Check both tags in Docker Hub after pushing. Publish a new version tag for each
-release and do not overwrite old release tags; the Compose pair assumes that
-identical version strings identify the matching application and companion.
+release and do not overwrite old release tags; the two images are a pair, so
+identical version strings must identify the matching application and companion.
 
 For Nix, select `DOCKER_EXPERIMENTAL=nix` when building and use a distinct common
 tag such as `0.1.0-nix` for both images. Recompute/export both image variables
-with that tag before running Make. Consumers set `REPOWATCH_VERSION=0.1.0-nix`;
-no separate release Compose file is needed.
+with that tag before running Make.
 
 These commands build for the local builder's architecture. They do not create a
 multi-architecture manifest; that remains unimplemented/unverified. No automatic
 push target, credentials, CI publication or actual Docker Hub upload is included
-in this change. Image builds and release startup still need testing on Docker.
+in this change. Image builds and container startup still need testing on Docker.

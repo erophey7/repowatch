@@ -333,7 +333,7 @@ def test_check_repo_end_to_end_version_churn_updates_packages_and_history(tmp_pa
 
 
 def test_check_repo_calls_purge_removed_with_removed_filenames(tmp_path, monkeypatch):
-    """docs_dev/ROADMAP.md item 24: check_repo must hand the REMOVED
+    """Active cache eviction: check_repo must hand the REMOVED
     package's filename (not just its key) to purge_removed the moment the
     diff confirms it's gone — purge_removed itself no-ops unless
     nginx.enable_purge is set, this test is only about the wiring."""
@@ -374,15 +374,20 @@ def test_check_repo_calls_purge_removed_with_removed_filenames(tmp_path, monkeyp
     assert purge_calls == [("r", {"linux-headers-6.11.2-1": "linux-headers-6.11.2-1-x86_64.pkg.tar.zst"})]
 
 
-# --- auto-unwarm expiry (docs_dev/ROADMAP.md item 33, 2026-09-14) ---
+# --- auto-unwarm expiry (2026-09-14) ---
 
 def test_prune_all_skips_warmed_expiry_entirely_when_syslog_listener_disabled(tmp_path):
     """Without real client-request visibility, warmed_at only ever advances
     at first warm — ageing rows out (let alone purging them) would be
     acting on a timer that doesn't mean what it's supposed to mean. See
     SyslogListenerConfig's own docstring for why enabled defaults to True
-    now specifically to avoid this trap."""
+    now specifically to avoid this trap. old-1.0 is kept in the current
+    snapshot (still a valid package, just old/unpopular) so this stays
+    isolated to the time-based sweep and doesn't also trip the separate,
+    syslog-independent "removed from the index" immediate purge covered by
+    its own tests below."""
     store = ServiceState(tmp_path / "state.sqlite3")
+    store.repositories.record_snapshot(RepoSnapshot("r", {"old-1.0": "old-1.0.apk"}))
     store.cache.record_warmed_package("r", "old-1.0", "old-1.0.apk", True, 200)
     with store.database.connect() as conn:
         conn.execute("UPDATE warmed_packages SET warmed_at = '2020-01-01T00:00:00+00:00'")
@@ -434,8 +439,14 @@ def test_prune_all_purges_stale_warmed_packages_when_enable_purge_is_on(tmp_path
     exact invisible-orphan problem item 33 is about, just unattended.
     Same conservative rule as the manual path: only confirmed-gone keys
     ("purged"/"not_cached") lose their row, an errored one stays tracked
-    for the next hourly retry."""
+    for the next hourly retry. All four keys are kept in the current
+    snapshot (still valid, just old/unpopular) so this stays isolated to
+    the time-based sweep — the separate "removed from the index" immediate
+    purge has its own tests below."""
     store = ServiceState(tmp_path / "state.sqlite3")
+    store.repositories.record_snapshot(RepoSnapshot("r", {
+        key: f"{key}.apk" for key in ("purged-1.0", "already-gone-1.0", "flaky-1.0", "recent-1.0")
+    }))
     for key in ("purged-1.0", "already-gone-1.0", "flaky-1.0", "recent-1.0"):
         store.cache.record_warmed_package("r", key, f"{key}.apk", True, 200)
     with store.database.connect() as conn:
@@ -495,6 +506,148 @@ def test_prune_all_drops_bookkeeping_without_purging_for_a_repo_no_longer_in_con
     asyncio.run(prune_all(config, store))
 
     assert store.cache.get_warmed_packages("gone-repo") == []
+
+
+def test_prune_all_purges_packages_removed_from_the_index_immediately(tmp_path, monkeypatch):
+    """Real behavior gap found 2026-09-23 (concrete production example:
+    pacman's firefox, superseded roughly monthly under a new package_key
+    each time — record_snapshot immediately drops the old package_key from
+    repo_packages, but nothing purged its cached bytes until it happened
+    to also age past warmed_retention_days, sometimes many months later).
+    A package no longer listed in the index can never be requested again
+    under its old key, so this must purge on the very next cycle — NOT
+    wait for warmed_at to age past retention, unlike the generic
+    time-based sweep below it in prune_all."""
+    store = ServiceState(tmp_path / "state.sqlite3")
+    store.repositories.record_snapshot(RepoSnapshot("r", {"firefox-155-1": "firefox-155-1.pkg"}))
+    store.cache.record_warmed_package("r", "firefox-155-1", "firefox-155-1.pkg", True, 200)
+    # New version replaces the old one under a different package_key —
+    # warmed_at on the old row stays fresh (just recorded above).
+    store.repositories.record_snapshot(RepoSnapshot("r", {"firefox-156-1": "firefox-156-1.pkg"}))
+
+    repo = RepoConfig(id="r", type="pacman", upstream="https://example.org", arch="x86_64", repo_name="extra")
+    config = _config(
+        repos=[repo],
+        syslog_listener=SyslogListenerConfig(enabled=True),
+        nginx=NginxConfig(enabled=True, enable_purge=True),
+        warmed_retention_days=180,  # nowhere near expiring under the old rule
+    )
+
+    calls = []
+    async def fake_purge_selected(cfg, r, items):
+        calls.append((r.id, items))
+        return {"firefox-155-1": "purged"}
+    monkeypatch.setattr(operations_cleanup, "purge_selected", fake_purge_selected)
+
+    asyncio.run(prune_all(config, store))
+
+    assert calls == [("r", {"firefox-155-1": "firefox-155-1.pkg"})]
+    assert store.cache.get_warmed_packages("r") == []
+
+
+def test_prune_all_removed_from_index_purge_runs_even_when_syslog_listener_disabled(tmp_path, monkeypatch):
+    """Unlike the generic warmed_retention_days sweep (which needs
+    syslog_listener's request visibility to mean anything — see the
+    docstring on the test right above the sweep's own gate), "no longer
+    in the current index" is known purely from record_snapshot's own diff
+    and must not be skipped just because syslog_listener is off."""
+    store = ServiceState(tmp_path / "state.sqlite3")
+    store.repositories.record_snapshot(RepoSnapshot("r", {"old-1": "old-1.pkg"}))
+    store.cache.record_warmed_package("r", "old-1", "old-1.pkg", True, 200)
+    store.repositories.record_snapshot(RepoSnapshot("r", {"new-1": "new-1.pkg"}))
+
+    repo = RepoConfig(id="r", type="apk", upstream="https://example.org", arch="x86_64")
+    config = _config(
+        repos=[repo],
+        syslog_listener=SyslogListenerConfig(enabled=False),
+        nginx=NginxConfig(enabled=True, enable_purge=True),
+    )
+
+    calls = []
+    async def fake_purge_selected(cfg, r, items):
+        calls.append((r.id, items))
+        return {"old-1": "purged"}
+    monkeypatch.setattr(operations_cleanup, "purge_selected", fake_purge_selected)
+
+    asyncio.run(prune_all(config, store))
+
+    assert calls == [("r", {"old-1": "old-1.pkg"})]
+    assert store.cache.get_warmed_packages("r") == []
+
+
+def test_prune_all_removed_from_index_purge_skipped_when_enable_purge_is_off(tmp_path, monkeypatch):
+    """No purge mechanism configured — the row must be left tracked by this
+    new immediate path (unwarming without purging would make the real
+    cache entry invisible to future discovery, the same anti-pattern
+    already avoided elsewhere, see remove_warmed_package_payload). The
+    existing generic warmed_retention_days sweep remains the only way it's
+    ever forgotten without a purge backend, unchanged."""
+    store = ServiceState(tmp_path / "state.sqlite3")
+    store.repositories.record_snapshot(RepoSnapshot("r", {"old-1": "old-1.pkg"}))
+    store.cache.record_warmed_package("r", "old-1", "old-1.pkg", True, 200)
+    store.repositories.record_snapshot(RepoSnapshot("r", {"new-1": "new-1.pkg"}))
+
+    repo = RepoConfig(id="r", type="apk", upstream="https://example.org", arch="x86_64")
+    config = _config(
+        repos=[repo],
+        syslog_listener=SyslogListenerConfig(enabled=True),
+        nginx=NginxConfig(enabled=True, enable_purge=False),
+    )
+
+    def boom(*a, **kw):
+        raise AssertionError("purge_selected must not be called when enable_purge is off")
+    monkeypatch.setattr(operations_cleanup, "purge_selected", boom)
+
+    asyncio.run(prune_all(config, store))
+
+    assert [p["package_key"] for p in store.cache.get_warmed_packages("r")] == ["old-1"]
+
+
+def test_prune_all_removed_from_index_purge_skips_a_repo_not_in_config(tmp_path, monkeypatch):
+    """Same reasoning as the equivalent time-based-sweep test above: a
+    fully removed repository has no RepoConfig to compute a cache key
+    from — that's find_orphaned_repos/purge_orphaned_repos' job, not this
+    one, so the row is left exactly as-is here."""
+    store = ServiceState(tmp_path / "state.sqlite3")
+    store.repositories.record_snapshot(RepoSnapshot("gone-repo", {"old-1": "old-1.pkg"}))
+    store.cache.record_warmed_package("gone-repo", "old-1", "old-1.pkg", True, 200)
+    store.repositories.record_snapshot(RepoSnapshot("gone-repo", {"new-1": "new-1.pkg"}))
+
+    config = _config(
+        repos=[RepoConfig(id="other", type="apk", upstream="https://example.org", arch="x86_64")],
+        syslog_listener=SyslogListenerConfig(enabled=True),
+        nginx=NginxConfig(enabled=True, enable_purge=True),
+    )
+
+    def boom(*a, **kw):
+        raise AssertionError("purge_selected must not be called for a repo not in config.repos")
+    monkeypatch.setattr(operations_cleanup, "purge_selected", boom)
+
+    asyncio.run(prune_all(config, store))
+
+    assert [p["package_key"] for p in store.cache.get_warmed_packages("gone-repo")] == ["old-1"]
+
+
+def test_prune_all_removed_from_index_purge_leaves_errored_keys_tracked_for_retry(tmp_path, monkeypatch):
+    store = ServiceState(tmp_path / "state.sqlite3")
+    store.repositories.record_snapshot(RepoSnapshot("r", {"old-1": "old-1.pkg"}))
+    store.cache.record_warmed_package("r", "old-1", "old-1.pkg", True, 200)
+    store.repositories.record_snapshot(RepoSnapshot("r", {"new-1": "new-1.pkg"}))
+
+    repo = RepoConfig(id="r", type="apk", upstream="https://example.org", arch="x86_64")
+    config = _config(
+        repos=[repo],
+        syslog_listener=SyslogListenerConfig(enabled=True),
+        nginx=NginxConfig(enabled=True, enable_purge=True),
+    )
+
+    async def fake_purge_selected(cfg, r, items):
+        return {"old-1": "error (timeout)"}
+    monkeypatch.setattr(operations_cleanup, "purge_selected", fake_purge_selected)
+
+    asyncio.run(prune_all(config, store))
+
+    assert [p["package_key"] for p in store.cache.get_warmed_packages("r")] == ["old-1"]
 
 
 def test_run_forever_invokes_check_all_and_prune_all_on_its_own_timer(tmp_path, monkeypatch):
@@ -743,4 +896,4 @@ def test_retention_uses_raw_purge_and_keeps_concurrently_refreshed_record(tmp_pa
         return {'a': 'purged'}
     monkeypatch.setattr(operations_cleanup.cache_probe, 'purge_selected_raw', purge)
     asyncio.run(prune_all(config, store))
-    assert store.cache.get_warmed_filenames('r', ['a']) == {'a': 'a.apk'}
+    assert {k: v[0] for k, v in store.cache.get_warmed_records('r', ['a']).items()} == {'a': 'a.apk'}

@@ -14,7 +14,11 @@ from repowatch.config.load import load_config
 from repowatch.config.models import Config
 from repowatch.errors import ConfigError
 from repowatch.reporting.metrics import metrics_payload
-from repowatch.reporting.statistics import paged_payload, requests_summary_payload, prefetch_efficiency_payload, stats_payload
+from repowatch.reporting.statistics import (
+    paged_payload, requests_summary_payload, prefetch_efficiency_payload, stats_payload,
+    orphaned_repos_payload, purge_orphaned_repos_payload,
+    zombie_packages_payload, purge_zombie_packages_payload,
+)
 from repowatch.reporting.status import repos_list_payload, status_payload, healthz_payload
 from repowatch.runtime.context import ServiceState
 from repowatch.storage.access import AccessStore, SESSION_SECONDS
@@ -280,6 +284,16 @@ def make_handler(
                 self._json(payload, status=status)
                 return
 
+            if parsed.path == "/api/storage/orphans":
+                status, payload = orphaned_repos_payload(config_path, store, current=self.current)
+                self._json(payload, status=status)
+                return
+
+            if parsed.path == "/api/storage/zombies":
+                status, payload = zombie_packages_payload(config_path, store, current=self.current)
+                self._json(payload, status=status)
+                return
+
             if parsed.path == "/api/requests/summary":
                 qs = parse_qs(parsed.query)
                 repo_id = qs.get("repo_id", [None])[0]
@@ -446,6 +460,16 @@ def make_handler(
                 and parts[4] == "remove"
             ):
                 status, payload = unban_package_payload(config_path, store, parts[2], password, body)
+                self._json(payload, status=status)
+                return
+
+            if parsed.path == "/api/storage/orphans":
+                status, payload = purge_orphaned_repos_payload(config_path, store, password, body)
+                self._json(payload, status=status)
+                return
+
+            if parsed.path == "/api/storage/zombies":
+                status, payload = purge_zombie_packages_payload(config_path, store, password, body)
                 self._json(payload, status=status)
                 return
 

@@ -3,12 +3,49 @@
 from __future__ import annotations
 
 import ipaddress
+import logging
 import re
 from pathlib import Path
 from repowatch.config.models import Config
 from repowatch.errors import ConfigError
 from repowatch.parsers.base import USER_AGENT
 from repowatch.routing import compute_routes, package_path
+
+logger = logging.getLogger(__name__)
+
+def _next_power_of_two(value: int) -> int:
+    power = 1
+    while power < value:
+        power *= 2
+    return power
+
+
+def _dedup_hash_sizes(pairs: list[tuple[str, str]]) -> tuple[int, int]:
+    """(map_hash_max_size, map_hash_bucket_size) sized from the actual dedup
+    entries, not guessed once and left to bit-rot as the catalog grows.
+
+    A real production apply (2026-09-22, ~78000 real cross-repository pairs
+    after fixing resolve_dedup_pairs()'s self-mapped/duplicate-key rows —
+    see there) failed nginx -t with "could not build map_hash, you should
+    increase map_hash_bucket_size: 128" — nginx's defaults (bucket_size one
+    processor cache line, typically 32-128 bytes; max_size 2048 buckets) only
+    suit small maps. bucket_size must fit the longest key (as it's actually
+    written to the file, i.e. quoted/escaped — see _map_literal()) plus the
+    hash element's own pointer/length overhead, rounded up to a size nginx's
+    allocator likes; max_size must give the table enough buckets that most
+    entries don't collide, or nginx fails building the table the same way
+    regardless of bucket_size. Both are plain powers of two with generous
+    headroom — cheap (a few bytes of memory per bucket) even oversized by a
+    large factor, and re-computed on every apply, so the map can keep growing
+    without another surprise nginx -t failure."""
+    if not pairs:
+        return 2048, 64  # nginx's own defaults — nothing to size for.
+    longest_key = max(len(_map_literal(key)) for key, _ in pairs)
+    return (
+        max(2048, _next_power_of_two(len(pairs) * 4)),
+        max(64, _next_power_of_two(longest_key + 32)),
+    )
+
 
 def _path(value: str) -> str:
     if not isinstance(value, str) or not re.fullmatch(r'/[A-Za-z0-9_./+-]+', value) or '..' in value.split('/'):
@@ -21,7 +58,8 @@ def render(config: Config, *, cache_dir: str = '/var/cache/nginx/repowatch',
            purge_conf: str = '/etc/nginx/repowatch/purge.conf',
            dedup_conf: str = '/etc/nginx/repowatch/dedup.map',
            probe_conf: str = '/etc/nginx/repowatch/probe.conf',
-           probe_js: str = '/etc/nginx/repowatch/probe.js') -> str:
+           probe_js: str = '/etc/nginx/repowatch/probe.js',
+           dedup_pairs: list[tuple[str, str]] | None = None) -> str:
     settings = config.nginx
     _path(cache_dir)
     _path(access_log)
@@ -31,6 +69,19 @@ def render(config: Config, *, cache_dir: str = '/var/cache/nginx/repowatch',
         f'proxy_cache_path {cache_dir} levels=1:2 keys_zone=repo_cache:64m max_size={settings.cache_max_size} inactive=180d use_temp_path=off;',
         "log_format cache_status '$remote_addr - $request \"$upstream_cache_status\" -> $upstream_addr';",
     ]
+    if settings.enable_dedup:
+        # nginx builds ONE shared hash table per http-context for every
+        # map{} block in it (not one per map): map_hash_max_size/
+        # map_hash_bucket_size are read only from the FIRST map{} nginx
+        # parses onward, and REJECT a later declaration as "directive is
+        # duplicate" even though nothing else set it explicitly — confirmed
+        # by hand against a real nginx (2026-09-22) with two map{} blocks and
+        # a single map_hash_max_size between them. They therefore have to
+        # precede every map{} in this file, not just the dedup one that
+        # actually needs the larger sizing — see _dedup_hash_sizes() for
+        # why fixed defaults aren't safe once the map has real entries.
+        max_size, bucket_size = _dedup_hash_sizes(dedup_pairs or [])
+        lines += [f'map_hash_max_size {max_size};', f'map_hash_bucket_size {bucket_size};']
     if config.syslog_listener.enabled:
         # Distinguishes repowatch's OWN traffic (index checks + prefetch/
         # warm_cache — see parsers/base.py's USER_AGENT, already sent on
@@ -70,6 +121,8 @@ def render(config: Config, *, cache_dir: str = '/var/cache/nginx/repowatch',
         # DOES update after `rewrite`, so the second pass (now already at
         # the canonical path) maps to "" and the loop terminates in one hop.
         _path(dedup_conf)
+        # map_hash_max_size/map_hash_bucket_size are emitted earlier, before
+        # ANY map{} in this file — see the comment there.
         lines += [
             'map $uri $repowatch_canonical_uri {',
             f'    include {dedup_conf};',
@@ -206,7 +259,7 @@ def render(config: Config, *, cache_dir: str = '/var/cache/nginx/repowatch',
 
 
 def render_purge(config: Config) -> str:
-    """Cache-eviction locations (docs_dev/ROADMAP.md item 24), generated
+    """Cache-eviction locations, generated
     separately from render() and pulled into the server block via a single
     `include` line there. Meant to be written to the path passed as
     render()'s purge_conf and included verbatim inside `server { ... }`, so
@@ -264,7 +317,7 @@ def render_purge(config: Config) -> str:
                 '    }',
             ]
         if settings.enable_cache_probe:
-            # Route-independent purge (docs_dev/ROADMAP.md item 8) — accepts
+            # Route-independent purge — accepts
             # an arbitrary already-known key verbatim, unlike the per-route
             # locations above. Needed for genuine orphans: a repo that was
             # removed from config.yaml (or had its dedup/url_template
@@ -293,7 +346,7 @@ def _js_string(value: str) -> str:
 
 def render_probe_js(config: Config, *, cache_dir: str = '/var/cache/nginx/repowatch') -> str:
     """njs script body for the /cache-probe and /cache-scan locations
-    (docs_dev/ROADMAP.md item 8, render_probe_conf()) — read-only cache
+    (see render_probe_conf()) — read-only cache
     introspection running inside the nginx worker itself (already `user
     www-data`-equivalent, unlike repowatch's own unprivileged process).
 
@@ -365,23 +418,58 @@ def resolve_dedup_pairs(config: Config, rows: list[tuple[str, str, str]]) -> lis
     content location actually serves.
 
     A repo id that no longer exists in config.repos (removed since the hash
-    was recorded — repo_packages rows are orphaned on repo removal, see
-    CLAUDE.md) is silently skipped, same tolerance already applied to
+    was recorded — repo_packages rows are orphaned on repo removal)
+    is silently skipped, same tolerance already applied to
     warmed_packages/prefetch_bans elsewhere.
+
+    Several repositories can resolve to the very same local URI — most
+    commonly several apt suites sharing one top-level nginx route (e.g. every
+    noble/noble-updates/noble-backports component collapses to /ubuntu, since
+    the pool/ path is physically shared upstream). Real production data (2026
+    -09-22) confirmed both consequences of that: about a quarter of all rows
+    map a URI to itself (duplicate_repo and canonical_repo differ, but their
+    local URI does not — there's nothing to redirect, and if it were emitted,
+    `rewrite ... last` to the request's own URI would trip nginx's "rewrite or
+    internal redirection cycle" guard), and over a thousand distinct keys were
+    produced by more than one row — nginx's `map` directive rejects an
+    outright repeated key, which is exactly the "conflicting parameter" error
+    that broke a real nginx-apply. Both are handled here rather than by
+    render_dedup(), so the pairs it receives are already a valid map: unique
+    keys, no self-mappings. A key that gets proposed two DIFFERENT canonical
+    targets (both real /ubuntu/pool/... rows collapsing to it, but from two
+    (filename, content_hash) groups that disagree — not observed on
+    production, but not excluded by the schema either) is dropped ENTIRELY,
+    not resolved by picking whichever row happened to come first: guessing
+    could serve one suite's request with a different suite's bytes under it.
+    Losing dedup for that one file is the safe outcome — its own repo route
+    still serves it correctly, just without the cross-repo cache share.
     """
     by_id = {repo.id: repo for repo in config.repos}
-    pairs: list[tuple[str, str]] = []
+    targets: dict[str, set[str]] = {}
+    self_mapped = 0
     for duplicate_id, canonical_id, filename in rows:
         duplicate_repo = by_id.get(duplicate_id)
         canonical_repo = by_id.get(canonical_id)
         if duplicate_repo is None or canonical_repo is None:
             continue
-        pairs.append((package_path(duplicate_repo, filename), package_path(canonical_repo, filename)))
-    return pairs
+        duplicate_uri = package_path(duplicate_repo, filename)
+        canonical_uri = package_path(canonical_repo, filename)
+        if duplicate_uri == canonical_uri:
+            self_mapped += 1
+            continue
+        targets.setdefault(duplicate_uri, set()).add(canonical_uri)
+    conflicting = sum(1 for values in targets.values() if len(values) > 1)
+    if self_mapped or conflicting:
+        logger.warning(
+            'nginx dedup: skipped %d self-mapped and %d conflicting duplicate-file '
+            'pairs (repositories sharing an nginx route collapse to the same local URI)',
+            self_mapped, conflicting,
+        )
+    return [(key, next(iter(values))) for key, values in targets.items() if len(values) == 1]
 
 
 def render_dedup(config: Config, pairs: list[tuple[str, str]]) -> str:
-    """Cross-repository dedup map (docs_dev/ROADMAP.md item 29), generated
+    """Cross-repository dedup map, generated
     separately from render() and pulled in via the `map { include ...; }`
     block there (see render()) — unlike render_purge()'s location{} blocks,
     a bare list of "key" "value"; lines here IS valid nginx map-file syntax

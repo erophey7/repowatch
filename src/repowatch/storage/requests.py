@@ -45,38 +45,6 @@ class RequestsStore:
             )
 
 
-    def get_recent_requests(self, repo_id: str | None = None, limit: int = 100) -> list[dict]:
-        with self.db.connect() as conn:
-            if repo_id:
-                rows = conn.execute(
-                    """
-                    SELECT ts, repo_id, client_ip, method, path, status, cache_status
-                    FROM request_events WHERE repo_id = ? ORDER BY ts DESC LIMIT ?
-                    """,
-                    (repo_id, limit),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """
-                    SELECT ts, repo_id, client_ip, method, path, status, cache_status
-                    FROM request_events ORDER BY ts DESC LIMIT ?
-                    """,
-                    (limit,),
-                ).fetchall()
-        return [
-            {
-                "ts": ts,
-                "repo_id": rid,
-                "client_ip": client_ip,
-                "method": method,
-                "path": path,
-                "status": status,
-                "cache_status": cache_status,
-            }
-            for ts, rid, client_ip, method, path, status, cache_status in rows
-        ]
-
-
     def _top(self, kind: str, repo_id: str | None, limit: int) -> list[dict]:
         """Highest counts of one rollup kind, globally or for one repository."""
         with self.db.connect() as conn:
@@ -130,7 +98,7 @@ class RequestsStore:
 
     def get_requests_timeline(self, repo_id: str | None = None, hours: int = 24) -> list[dict]:
         """Hourly request-count buckets for the last `hours` hours, oldest
-        first — docs_dev/ROADMAP.md item 19's "timeline" chart. Read from
+        first — the dashboard's "timeline" chart. Read from
         request_hourly, whose bucket is the 'YYYY-MM-DDTHH' prefix of the ISO-8601
         `ts` (fixed width, UTC — see _utcnow). Buckets are whole hours: the
         oldest one includes the requests from before the exact cut-off within
@@ -157,7 +125,7 @@ class RequestsStore:
     def get_prefetch_efficiency(self) -> list[dict]:
         """Per-repo: of the packages repowatch actively prefetched ahead of
         demand (warmed_packages.source = "prefetch"), how many were later
-        actually requested by a real client — docs_dev/ROADMAP.md item 19.
+        actually requested by a real client.
         Answers "was prefetching this repo worth it", as opposed to
         get_request_hit_stats (nginx's cache HIT/MISS, which also counts
         packages that became cached only because an earlier client

@@ -12,7 +12,9 @@ const SETTINGS_FIELDS = {
   'request_max_rows': 's-request-max-rows',
   'prefetch_concurrency': 's-prefetch-concurrency',
   'check_concurrency': 's-check-concurrency',
-  'prefetch_bandwidth_limit': 's-prefetch-bandwidth-limit',
+  // prefetch_bandwidth_limit is handled separately below (human-size
+  // display via formatByteRate, not a blind value copy) — see
+  // showBandwidthLimit.
   'prefetch_bandwidth_timezone': 's-bandwidth-timezone',
   'cache_base_url': 's-cache-base-url',
   'public_cache_url': 's-public-cache-url',
@@ -27,7 +29,7 @@ function addBandwidthWindow(window = {}) {
     ['days', 'Days (mon,tue,wed,thu,fri,sat,sun)', (window.days || ['mon','tue','wed','thu','fri','sat','sun']).join(',')],
     ['start', 'Start (HH:MM)', window.start || '00:00'],
     ['end', 'End (HH:MM)', window.end || '24:00'],
-    ['limit', 'Bytes/sec (empty = unlimited)', window.limit ?? ''],
+    ['limit', 'Rate, e.g. 10 MiB/s (empty = unlimited)', window.limit != null ? formatByteRate(window.limit) : ''],
   ];
   for (const [name, title, value] of fields) {
     const label = document.createElement('label');
@@ -46,6 +48,9 @@ function showBandwidthSchedule(windows) {
   document.getElementById('s-bandwidth-windows').replaceChildren();
   for (const window of windows || []) addBandwidthWindow(window);
 }
+function showBandwidthLimit(value) {
+  document.getElementById('s-prefetch-bandwidth-limit').value = value != null ? formatByteRate(value) : '';
+}
 document.getElementById('s-bandwidth-add').addEventListener('click', () => addBandwidthWindow());
 
 async function openSettingsForm() {
@@ -59,6 +64,7 @@ async function openSettingsForm() {
     for (const [field, elId] of Object.entries(SETTINGS_FIELDS)) {
       document.getElementById(elId).value = data[field] ?? (field === 'prefetch_bandwidth_timezone' ? 'UTC' : '');
     }
+    showBandwidthLimit(data.prefetch_bandwidth_limit);
     showBandwidthSchedule(data.prefetch_bandwidth_schedule);
     $settingsMsg.textContent = '';
   } catch (err) {
@@ -84,16 +90,17 @@ $settingsForm.addEventListener('submit', async (ev) => {
   for (const [field, elId] of Object.entries(SETTINGS_FIELDS)) {
     body[field] = document.getElementById(elId).value.trim();
   }
+  // Sent as-is (a plain number like "5000000" or a human size like
+  // "10 MiB/s") — the server parses either (see web.settings._cast_bandwidth_limit)
+  // and reports a clear error for anything else.
+  body.prefetch_bandwidth_limit = document.getElementById('s-prefetch-bandwidth-limit').value.trim();
 
   try {
     body.prefetch_bandwidth_schedule = [...document.querySelectorAll('.bandwidth-window')].map(row => {
       const value = name => row.querySelector(`[data-field="${name}"]`).value.trim();
       const rate = value('limit');
-      if (rate && (!Number.isFinite(Number(rate)) || Number(rate) <= 0)) {
-        throw new Error('Bandwidth limits must be positive numbers or empty');
-      }
       return {days: value('days').split(',').map(s => s.trim()).filter(Boolean),
-              start: value('start'), end: value('end'), limit: rate ? Number(rate) : null};
+              start: value('start'), end: value('end'), limit: rate || null};
     });
     const res = await fetch('/api/config', {
       method: 'POST',
@@ -111,6 +118,7 @@ $settingsForm.addEventListener('submit', async (ev) => {
     for (const [field, elId] of Object.entries(SETTINGS_FIELDS)) {
       document.getElementById(elId).value = data[field] ?? (field === 'prefetch_bandwidth_timezone' ? 'UTC' : '');
     }
+    showBandwidthLimit(data.prefetch_bandwidth_limit);
     showBandwidthSchedule(data.prefetch_bandwidth_schedule);
     loadRepos(); // check_interval may have changed — refresh the "interval" column
   } catch (err) {

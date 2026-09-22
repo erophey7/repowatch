@@ -12,8 +12,8 @@
 #                    longer than event_retention_days: this is a snapshot of
 #                    ALL state for restoration, not one repository's log)
 #
-# For restore instructions, see docs_dev/DEPLOYMENT.md, section "Backup and
-# restore of state.sqlite3".
+# For restore instructions, see docs/deployment.md, section
+# "Backups".
 
 set -euo pipefail
 

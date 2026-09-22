@@ -38,6 +38,35 @@
     <div id="storage-body">Loading…</div>
     <button type="button" id="calc-cache-size">Calculate cache directory size</button>
     <span id="cache-size-note" class="dim"></span>
+
+    <h3>Orphaned repositories</h3>
+    <p class="dim">SQL bookkeeping (snapshots, history, warmed/ban state, Nix artifacts,
+      failure streaks) left over from a repository no longer in config.yaml — for example
+      after a delete, or an id rename (delete + add). This never touches physical cache
+      files on disk, only these rows.</p>
+    <button type="button" id="scan-orphans-btn">Scan for orphaned repositories</button>
+    <div id="orphans-list" hidden></div>
+    <div id="orphans-actions" hidden>
+      <button type="button" id="orphans-select-all-btn">Select all</button>
+      <button type="button" id="orphans-clear-btn">Clear</button>
+      <button type="button" id="orphans-delete-btn">Delete selected</button>
+    </div>
+    <p id="orphans-msg" role="status" class="form-msg"></p>
+
+    <h3>Zombie packages</h3>
+    <p class="dim">Packages tracked as warmed but already replaced or removed from the
+      current index across every repository — e.g. an old version superseded by a new
+      one under a different key. These can never be requested again under their old key,
+      so they're usually safe to purge right away rather than waiting out the normal
+      warmed-package retention window. Requires nginx.enable_purge.</p>
+    <button type="button" id="scan-zombies-btn">Scan for zombie packages</button>
+    <div id="zombies-list" hidden></div>
+    <div id="zombies-actions" hidden>
+      <button type="button" id="zombies-select-all-btn">Select all</button>
+      <button type="button" id="zombies-clear-btn">Clear</button>
+      <button type="button" id="zombies-purge-btn">Purge selected</button>
+    </div>
+    <p id="zombies-msg" role="status" class="form-msg"></p>
   </details>
 
   <div id="repos-groups"></div>
@@ -171,8 +200,8 @@
     </div>
 
     <div class="field">
-      <label for="f-prefetch-bandwidth-limit">Repository warm limit (bytes/sec, optional)</label>
-      <input type="text" id="f-prefetch-bandwidth-limit" placeholder="empty — shared budget only">
+      <label for="f-prefetch-bandwidth-limit">Repository warm limit (optional)</label>
+      <input type="text" id="f-prefetch-bandwidth-limit" placeholder="e.g. 10 MiB/s — empty for shared budget only">
     </div>
 
     <div class="form-actions">
@@ -224,7 +253,7 @@
       <input type="text" id="s-check-concurrency">
     </div>
     <div class="field">
-      <label for="s-prefetch-bandwidth-limit">Shared warm limit (bytes/sec, empty — unlimited)</label>
+      <label for="s-prefetch-bandwidth-limit">Shared warm limit (e.g. 10 MiB/s, empty — unlimited)</label>
       <input type="text" id="s-prefetch-bandwidth-limit">
     </div>
     <div class="field">

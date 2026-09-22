@@ -94,17 +94,17 @@ def test_match_repo_id_ambiguous_prefix_returns_none():
 
 def test_package_path_index_pacman_style_filenames():
     packages = {"linux-6.11.2-1": "linux-6.11.2-1-x86_64.pkg.tar.zst"}
-    assert package_path_index(_pacman_repo("r", "core"), packages) == {"/arch/core/os/x86_64/linux-6.11.2-1-x86_64.pkg.tar.zst": ["linux-6.11.2-1"]}
+    assert package_path_index(_pacman_repo("r", "core"), packages) == {"/arch/core/os/x86_64/linux-6.11.2-1-x86_64.pkg.tar.zst": ("linux-6.11.2-1",)}
 
 
 def test_package_path_index_apt_style_filenames_with_path():
     packages = {"linux-1-2": "pool/main/l/linux/linux_1-2_amd64.deb"}
-    assert package_path_index(RepoConfig(id="r", type="apt", upstream="https://example.org/ubuntu", arch="amd64", distribution="noble", component="main"), packages) == {"/ubuntu/pool/main/l/linux/linux_1-2_amd64.deb": ["linux-1-2"]}
+    assert package_path_index(RepoConfig(id="r", type="apt", upstream="https://example.org/ubuntu", arch="amd64", distribution="noble", component="main"), packages) == {"/ubuntu/pool/main/l/linux/linux_1-2_amd64.deb": ("linux-1-2",)}
 
 
 def test_package_path_index_skips_empty_filenames():
     packages = {"broken-1": "", "ok-1": "ok-1.apk"}
-    assert package_path_index(_pacman_repo("r", "core"), packages) == {"/arch/core/os/x86_64/ok-1.apk": ["ok-1"]}
+    assert package_path_index(_pacman_repo("r", "core"), packages) == {"/arch/core/os/x86_64/ok-1.apk": ("ok-1",)}
 
 
 def test_match_all_package_keys_finds_match_in_any_repo():
@@ -154,7 +154,7 @@ def test_refresh_package_indexes_builds_everything_on_first_call(tmp_path):
     refresh_package_indexes([repo], store, packages_by_repo, by_path, last_revision)
 
     assert packages_by_repo["arch-core"] == {"linux-1": "linux-1-x86_64.pkg.tar.zst"}
-    assert by_path["arch-core"] == {"/arch/core/os/x86_64/linux-1-x86_64.pkg.tar.zst": ["linux-1"]}
+    assert by_path["arch-core"] == {"/arch/core/os/x86_64/linux-1-x86_64.pkg.tar.zst": ("linux-1",)}
     assert "arch-core" in last_revision
 
 
@@ -207,8 +207,8 @@ def test_refresh_package_indexes_rebuilds_when_changed_at_moves(tmp_path):
         "vim-1": "vim-1-x86_64.pkg.tar.zst",
     }
     assert by_path["arch-core"] == {
-        "/arch/core/os/x86_64/linux-1-x86_64.pkg.tar.zst": ["linux-1"],
-        "/arch/core/os/x86_64/vim-1-x86_64.pkg.tar.zst": ["vim-1"],
+        "/arch/core/os/x86_64/linux-1-x86_64.pkg.tar.zst": ("linux-1",),
+        "/arch/core/os/x86_64/vim-1-x86_64.pkg.tar.zst": ("vim-1",),
     }
     # last_revision was refreshed to the current real value
     assert last_revision["arch-core"] == (store.repositories.get_snapshot_revisions()["arch-core"], repo.catalog_identity())
@@ -298,7 +298,7 @@ repos:
 
 
 def test_run_listener_ignores_repowatch_own_prefetch_traffic(tmp_path):
-    """docs_dev/ROADMAP.md — repowatch's own index checks/prefetch (marked
+    """repowatch's own index checks/prefetch (marked
     via nginx.py's $repowatch_is_prefetch map) must not show up in "Recent
     client requests" (request_events), and must not produce a redundant
     warmed_packages write either (warm_cache already records that directly)."""
@@ -512,7 +512,7 @@ def test_path_index_preserves_decoding_queries_and_alias_owners(monkeypatch):
         'a': 'pool/main/a%20b.deb?hash=one',
         'alias': 'pool/main/a%20b.deb?hash=two',
         'empty': '',
-    }) == {'/ubuntu/pool/main/a b.deb': ['a', 'alias']}
+    }) == {'/ubuntu/pool/main/a b.deb': ('a', 'alias')}
     assert calls == ['r']
 
 
@@ -543,7 +543,7 @@ def test_path_index_shortcut_matches_url_oracle():
         for key, filename in packages.items():
             path = unquote(urlsplit(package_prefix(repo) + '/' + filename).path)
             expected.setdefault(path, []).append(key)
-        assert package_path_index(repo, packages) == expected
+        assert package_path_index(repo, packages) == {path: tuple(keys) for path, keys in expected.items()}
 
 
 def test_listener_rebuilds_repo_matcher_on_config_reload(tmp_path, monkeypatch):
@@ -580,3 +580,14 @@ def test_path_index_retains_url_parser_errors_for_authorities():
                       arch='amd64', distribution='stable', component='main')
     with pytest.raises(ValueError):
         package_path_index(repo, {'broken': '/[invalid-authority'})
+
+
+def test_path_index_owners_are_not_tracked_by_the_collector():
+    """Tuples of strings leave the collector's working set, so a large catalog does not
+    add one container per route to every full collection."""
+    import gc
+    repo = _pacman_repo("r", "core")
+    index = package_path_index(repo, {f"p{i}-1": f"p{i}-1.pkg.tar.zst" for i in range(50)})
+    gc.collect()
+    assert len(index) == 50 and all(isinstance(owners, tuple) for owners in index.values())
+    assert not any(gc.is_tracked(owners) for owners in index.values())

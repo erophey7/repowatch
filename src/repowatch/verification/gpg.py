@@ -104,7 +104,7 @@ def soonest_key_expiry(keyring_path: str) -> str | None:
 
     Requires the full `gpg` binary, not just `gpgv` — gpgv only verifies
     signatures, it has no key-listing capability. This is strictly a
-    diagnostic feature (docs_dev/ROADMAP.md item 20, "trust state"): unlike
+    diagnostic feature ("trust state", key expiry warnings): unlike
     everywhere else in this module, failure here is never raised, only
     logged and treated as "unknown" — a host with `gpgv` but not the full
     `gpg` package must not lose the ability to VERIFY signatures just

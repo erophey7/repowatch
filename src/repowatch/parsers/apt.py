@@ -152,8 +152,7 @@ def _parse_packages(data: bytes) -> list[PackageRef]:
         else:
             # Standard per-stanza field, distinct from the by-hash SHA256 of
             # the whole Packages.gz index checked elsewhere (verification/gpg.py) —
-            # this one is per package file, used for cross-repo dedup
-            # (docs_dev/ROADMAP.md item 29).
+            # this one is per package file, used for cross-repo dedup.
             content_hash = value if _SHA256_HEX.fullmatch(value) else None
 
     if name and version:

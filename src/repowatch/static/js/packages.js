@@ -151,7 +151,7 @@ async function toggleDetail(tr, repoId) {
         <div class="subsection-title">Cache purge (stale warmed entries)</div>
         <p class="field-hint">Warmed entries whose package no longer exists in the current
           index — real candidates for cleanup, but nginx is only asked when you purge, not
-          before (see docs_dev/ROADMAP.md for why a live pre-check risks the cache itself).</p>
+          before (a live pre-check could itself poison the cache or cost origin traffic).</p>
         <button type="button" data-slot="purge-scan-btn">Scan for stale entries</button>
         <div class="scroll-list checklist" data-slot="purge-list" hidden></div>
         <div class="bulk-actions" data-slot="purge-actions" hidden>

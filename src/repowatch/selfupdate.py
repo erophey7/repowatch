@@ -10,8 +10,7 @@ environment. It does not touch config.yaml, state_db, or nginx — only the
 installed Python package.
 
 No new runtime dependency: GitHub's REST API is plain HTTPS JSON, fetched
-with the already-required httpx (async, per the project's convention — see
-CLAUDE.md); the checksum itself is stdlib hashlib, the same primitive
+with the already-required httpx (async, per the project's convention); the checksum itself is stdlib hashlib, the same primitive
 parsers/dnf.py and parsers/apt_rpm.py already use for index integrity.
 
 This protects against a corrupted download or a network-level tamper — NOT

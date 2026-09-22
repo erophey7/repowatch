@@ -79,3 +79,34 @@ def test_isolated_load_seed_uses_current_warm_schema(tmp_path):
         assert conn.execute('SELECT COUNT(*) FROM warmed_packages').fetchone()[0] == 4
         assert conn.execute('SELECT COUNT(*) FROM request_events').fetchone()[0] == 3
         assert conn.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+
+
+def test_gc_pause_tool_reports_both_variants_and_needs_no_service(tmp_path):
+    result = subprocess.run([sys.executable,str(ROOT/'scripts/measure-gc.py'),
+        '--synthetic-heap','300','--parse-packages','200','--rounds','2'],
+        check=True,capture_output=True,text=True,timeout=60)
+    rows = [json.loads(line) for line in result.stdout.splitlines()]
+    assert [row['kind'] for row in rows] == ['environment','forced_full_collection_ms','gc_pauses',
+        'forced_full_collection_ms','gc_pauses','complete']
+    assert rows[0]['catalog_packages'] == 300 and rows[0]['heap_source'] == 'synthetic'
+    assert [row['variant'] for row in rows if row['kind'] == 'gc_pauses'] == ['as_is','frozen_heap']
+    assert rows[1]['frozen'] is False and rows[3]['frozen'] is True
+
+
+@pytest.mark.parametrize('arguments',[['--rounds','0'],['--parse-packages','100001'],['--synthetic-heap','0']])
+def test_gc_pause_tool_rejects_unbounded_arguments(arguments):
+    result = subprocess.run([sys.executable,str(ROOT/'scripts/measure-gc.py'),*arguments],
+        capture_output=True,text=True,timeout=30)
+    assert result.returncode == 2 and result.stdout == '' and '--synthetic-heap 1..1000000' in result.stderr
+
+
+def test_gc_pause_summary_orders_percentiles_per_generation():
+    spec = importlib.util.spec_from_file_location('measure_gc',ROOT / 'scripts/measure-gc.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    pauses = module.Pauses()
+    pauses.samples = [(0,1.0),(0,3.0),(2,10.0),(2,30.0),(2,20.0)]
+    summary = pauses.summary()
+    assert summary['gen0']['collections'] == 2 and summary['gen0']['max_ms'] == 3.0
+    assert summary['gen2'] == dict(collections=3,total_ms=60.0,median_ms=20.0,p99_ms=30.0,max_ms=30.0)
+    assert 'gen1' not in summary

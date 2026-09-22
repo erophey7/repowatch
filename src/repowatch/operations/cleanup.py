@@ -45,6 +45,53 @@ async def _purge_and_unwarm_stale(
             )
 
 
+async def purge_removed_from_index(
+    config: Config, store: ServiceState, items: list[dict]
+) -> dict[str, dict[str, str]]:
+    """Purge candidates already known to be removed from the current index
+    snapshot — e.g. from ServiceState.cache.find_all_stale_warmed(). Each
+    item needs only "repo_id" and "package_key" (an optional "filename",
+    as find_all_stale_warmed() includes, is ignored — the real filename
+    and revision are always re-derived from warmed_packages itself just
+    before purging, the same "never trust a stale/caller-supplied
+    filename" reasoning as web.packages.purge_selected_payload). Shared by
+    the automatic per-cycle sweep in prune_all and the Storage tab's
+    manual cross-repo "zombie packages" purge.
+
+    Unlike _purge_and_unwarm_stale, this does NOT re-check
+    warmed_retention_days: "no longer listed in the current index" is
+    itself sufficient justification, known purely from record_snapshot's
+    own diff — waiting out the same 180-day "not recently touched" window
+    a still-current package gets would defeat the whole point (see
+    prune_all and find_all_stale_warmed's own docstrings for the concrete
+    firefox example that motivated this, 2026-09-23).
+
+    A repo_id not currently in config.repos is skipped — a fully removed
+    repository has no RepoConfig to compute its cache key from, and is
+    find_orphaned_repos/purge_orphaned_repos' job, not this one. Returns
+    {repo_id: {package_key: outcome}} for every repo actually purged, so
+    a manual caller can report results; the automatic caller only logs
+    the aggregate error count."""
+    by_repo: dict[str, set[str]] = {}
+    for item in items:
+        by_repo.setdefault(item["repo_id"], set()).add(item["package_key"])
+
+    all_results: dict[str, dict[str, str]] = {}
+    for repo_id, candidates in by_repo.items():
+        repo = config.repo_by_id(repo_id)
+        if repo is None:
+            continue
+        records = store.cache.get_warmed_records(repo_id, list(candidates))
+        filenames = {key: record[0] for key, record in records.items()}
+        if not filenames:
+            continue
+        results = await purge_items(config, repo, filenames, store)
+        resolved = resolved_purge_keys(results)
+        store.cache.remove_purged_records(repo_id, records, resolved)
+        all_results[repo_id] = results
+    return all_results
+
+
 async def prune_all(config: Config, store: ServiceState) -> None:
     pruned = store.repositories.prune_events(config.event_retention_days)
     if pruned:
@@ -56,6 +103,20 @@ async def prune_all(config: Config, store: ServiceState) -> None:
     pruned_requests = await asyncio.to_thread(store.requests.prune_requests, config.request_retention_days)
     if pruned_requests:
         logger.debug("cleaned up %d stale request_events rows", pruned_requests)
+
+    if config.nginx.enable_purge:
+        # Independent of syslog_listener.enabled below: "no longer in the
+        # current index" doesn't need client-request visibility to be a
+        # reliable signal, unlike the generic time-based retention that
+        # follows — see purge_removed_from_index's own docstring.
+        removed = store.cache.find_all_stale_warmed()
+        if removed:
+            results = await purge_removed_from_index(config, store, removed)
+            errored = sum(1 for repo_results in results.values()
+                          for outcome in repo_results.values() if outcome.startswith("error"))
+            if errored:
+                logger.warning(
+                    "%d package(s) removed from the index failed to purge, will retry next cycle", errored)
 
     if not config.syslog_listener.enabled:
         # Without real client-request visibility, warmed_at only ever
@@ -93,6 +154,67 @@ async def prune_all(config: Config, store: ServiceState) -> None:
                 "cleaned up %d request_events rows over the global %d-row limit",
                 pruned_requests_by_size, config.request_max_rows,
             )
+
+
+def find_orphaned_repos(config: Config, store: ServiceState) -> dict[str, dict[str, int]]:
+    """Repo ids with SQL bookkeeping (repo_state/repo_packages/repo_events/
+    pending_replacements/warmed_packages/prefetch_bans/nix_artifacts/
+    nix_trust/failure_state) that no longer appear in config.repos —
+    typically a repository removed from config.yaml, or left over from a
+    renamed id (see RepoConfig.id being immutable, "Что сделано" above:
+    a rename is a delete+add, not an update).
+
+    request_events/host_tokens are deliberately excluded: the former has
+    its own separate, already-implemented retention
+    (event_retention_days/request_max_rows) and a nullable repo_id shared
+    across repos with overlapping URL prefixes, not a per-repo ownership
+    concept this cleanup can reason about; the latter is a host-auth
+    concern (token scoping), unrelated to repository state.
+
+    This only reports/deletes SQL rows, never physical cache files — a
+    removed repository has no current RepoConfig to recompute its nginx
+    cache key format from, so there is nothing here that could locate its
+    files on disk. Finding those (true "zombie" cache entries) is the
+    separate, not-yet-built scan-based detector already tracked in
+    docs_dev/ROADMAP.md (item 8/33) — this function is a different,
+    narrower kind of orphan (bookkeeping, not bytes)."""
+    active = {repo.id for repo in config.repos}
+    orphaned = (
+        store.repositories.get_repo_ids_with_data()
+        | store.cache.get_repo_ids_with_data()
+        | store.notifications.get_repo_ids_with_data()
+    ) - active
+    counts: dict[str, dict[str, int]] = {}
+    for repo_id in sorted(orphaned):
+        rows = {**store.repositories.count_repo_rows(repo_id), **store.cache.count_repo_rows(repo_id)}
+        failure_rows = store.notifications.count_repo_rows(repo_id)
+        if failure_rows:
+            rows['failure_state'] = failure_rows
+        counts[repo_id] = rows
+    return counts
+
+
+def purge_orphaned_repos(config: Config, store: ServiceState, repo_ids: list[str]) -> dict[str, dict[str, int]]:
+    """Delete SQL bookkeeping for the given repo_ids, re-checking each is
+    still absent from config.repos right before deleting (the same
+    defensive re-check pattern as _purge_and_unwarm_stale/purge_items —
+    the operator could re-add a repository with the same id between the
+    scan the dashboard showed and this call). Ids still in config.repos
+    are silently skipped, not an error: the caller (web layer) already
+    only sends what find_orphaned_repos reported, so this only matters for
+    a genuine race."""
+    active = {repo.id for repo in config.repos}
+    results: dict[str, dict[str, int]] = {}
+    for repo_id in repo_ids:
+        if repo_id in active:
+            continue
+        rows = {**store.repositories.delete_repo_rows(repo_id), **store.cache.delete_repo_rows(repo_id)}
+        failure_rows = store.notifications.delete_repo_rows(repo_id)
+        if failure_rows:
+            rows['failure_state'] = failure_rows
+        if rows:
+            results[repo_id] = rows
+    return results
 
 
 async def purge_items(config: Config, repo: RepoConfig, items: dict[str, str], store: ServiceState) -> dict[str, str]:

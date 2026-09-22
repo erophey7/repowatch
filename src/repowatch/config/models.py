@@ -146,12 +146,12 @@ class RepoConfig:
                 # (<file>.xbps.sig2), checked by the real xbps client at
                 # install time — a different shape of verification (at
                 # warm-time, per package) than anything else here, not
-                # implemented yet (see docs_dev/ROADMAP.md item 21). Refusing
+                # implemented yet. Refusing
                 # outright avoids a false sense of security, same reasoning
                 # as apk's original GPG rejection before verification/apk.py existed.
                 raise ConfigError(
                     f'{self.id}: verify_signature is not yet supported for xbps '
-                    f'(no signed index is published upstream; see docs_dev/ROADMAP.md item 21)'
+                    f'(no signed index is published upstream)'
                 )
             elif not self.keyring_path:
                 raise ConfigError(f'{self.id}: verify_signature=true requires keyring_path')
@@ -244,8 +244,7 @@ class NginxConfig:
     # read. To actually change the cache directory, use
     # `CACHE_DIR=... make install && sudo make activate`/`nginx-apply`.
     cache_dir: str | None = None
-    # Active cache eviction on package removal (see docs_dev/ROADMAP.md item
-    # 24) via the third-party ngx_cache_purge nginx module — NOT bundled
+    # Active cache eviction on package removal via the third-party ngx_cache_purge nginx module — NOT bundled
     # with stock nginx, and NOT the nginx-plus proxy_cache_purge API. Off by
     # default: without it, behavior is exactly as before (inactive=/
     # max_size= are the only eviction, see nginx/render.py) — enabling this doesn't
@@ -257,7 +256,7 @@ class NginxConfig:
     # nginx-apply catches a missing module with a clear error and rolls
     # back, same as any other bad generated config.
     enable_purge: bool = False
-    # docs_dev/ROADMAP.md item 29 — reroute a package request to another
+    # Cross-repository dedup: reroute a package request to another
     # repository's already-cached copy when the index reports the SAME
     # filename+SHA256 in more than one repo (real dedup, saves both origin
     # bandwidth and cache disk — see nginx.render.render_dedup()). Off by default,
@@ -265,7 +264,7 @@ class NginxConfig:
     # apt/pacman/dnf packages currently carry a comparable SHA256 (see
     # PackageRef.content_hash) — apk/apt-rpm files never participate.
     enable_dedup: bool = False
-    # docs_dev/ROADMAP.md item 8 (unifies items 23/33) — read-only cache
+    # Read-only cache
     # introspection (nginx.render.render_probe_js()/render_probe_conf()) via the
     # third-party ngx_http_js_module (njs), NOT bundled with stock nginx.
     # Off by default, no effect on existing configs' rendered output when
@@ -273,8 +272,8 @@ class NginxConfig:
     # enable_dedup. The njs script runs INSIDE the nginx worker (already
     # running as nginx's own `user`), so it can read proxy_cache_path's
     # subdirectories (0700, owned by that user) that repowatch's own
-    # unprivileged process cannot — see CLAUDE.md's cache_dir_stats()
-    # permission finding. The operator must separately add
+    # unprivileged process cannot (see reporting.statistics.cache_dir_stats()'s
+    # note on the permission problem). The operator must separately add
     # `load_module ".../ngx_http_js_module.so";` to their own main
     # nginx.conf (a main-context directive, same limitation as
     # enable_purge's load_module); nginx -t during nginx-apply catches a
@@ -451,9 +450,3 @@ class Config:
         """Per-repository check timers — RepoConfig.check_interval overrides
         the global value when set."""
         return repo.check_interval if repo.check_interval is not None else self.check_interval
-
-    def effective_prefetch_bandwidth_limit(self, repo: RepoConfig) -> float | None:
-        """Current per-repo ceiling; the global budget is also shared with others."""
-        from repowatch.bandwidth import scheduled_limit
-        limits = [limit for limit in (scheduled_limit(self), repo.prefetch_bandwidth_limit) if limit is not None]
-        return min(limits) if limits else None

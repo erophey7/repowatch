@@ -11,6 +11,7 @@ from pathlib import Path
 from repowatch.config.edit import atomic_config
 from repowatch.config.models import Config, RepoConfig
 from repowatch.errors import ConfigError
+from repowatch.sizes import parse_byte_rate_loose
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,26 @@ class RepositoryNotFound(LookupError):
 
 class RepositoryConflict(ValueError):
     """The requested repository identifier is already in use."""
+
+
+def _with_parsed_bandwidth_limit(body: dict) -> dict:
+    """Same conversion as config.load's own copy, for the add/edit
+    repository API — the dashboard's per-repo bandwidth field can now
+    also carry a human size ("10 MiB", "512 KB/s"), on top of the plain
+    numeric-string form it already sent. The RESULT (not the raw string)
+    is what both RepoConfig(**...) validates AND what gets persisted to
+    config.yaml below — writing the unparsed string would round-trip
+    into a bare-numeric YAML scalar that config.load's own stricter
+    parse_byte_rate() (no bare-numeric-string leniency there, see
+    sizes.py) would then reject on the next load."""
+    if not isinstance(body.get('prefetch_bandwidth_limit'), str):
+        return body
+    try:
+        limit = parse_byte_rate_loose(body['prefetch_bandwidth_limit'])
+    except ValueError as exc:
+        raise InvalidRepository(f'prefetch_bandwidth_limit: {exc}')
+    return {**body, 'prefetch_bandwidth_limit': limit}
+
 
 def delete_repo(config_path: str | Path, current: Config, repo_id: str) -> dict:
     """Remove a repository; an empty installation remains available for administration."""
@@ -52,7 +73,7 @@ def update_repo(config_path: str | Path, current: Config, repo_id: str, body: di
     if body.get("id", repo_id) != repo_id:
         raise InvalidRepository('cannot change id via edit — delete and re-add instead')
 
-    new_body = {**body, "id": repo_id}
+    new_body = _with_parsed_bandwidth_limit({**body, "id": repo_id})
     try:
         updated_repo = RepoConfig(**new_body)
     except (ConfigError, TypeError) as exc:
@@ -79,6 +100,7 @@ def add_repo(config_path: str | Path, current: Config, body: dict) -> dict:
     if not isinstance(body, dict):
         raise InvalidRepository('request body must be a JSON object')
 
+    body = _with_parsed_bandwidth_limit(body)
     try:
         new_repo = RepoConfig(**body)
     except (ConfigError, TypeError) as exc:
