@@ -80,3 +80,11 @@ Relaxing a list does not itself enqueue old packages for ordinary repository
 formats: automatic warming normally reacts to index changes. Use manual warming
 to fill newly allowed existing entries. Nix's existing retry scan also considers
 allowed catalog roots without a successful warm record on subsequent checks.
+
+To measure what is actually present on disk, use **Storage → Measure cache
+coverage and size** in the administrator dashboard. Its denominator is the complete
+current catalog, not the warming whitelist: intentionally warming a subset can
+therefore produce a low percentage without indicating a warming failure. Warm
+bookkeeping alone is not proof that nginx still has a file. See
+[physical cache completeness](access.md#physical-cache-completeness) for scan
+limits, deduplication and Nix closure handling.

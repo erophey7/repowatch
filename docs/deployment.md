@@ -36,7 +36,7 @@ The shipped profile enables purge and cache inventory: install and load both
 - `systemd`, unless you're supervising the process yourself with
   `WITH_SYSTEMD=0`.
 - `gpgv`, if any repository has `verify_signature: true` (apt, pacman,
-  RPM-MD/dnf, apt-rpm).
+  RPM-MD/dnf, apt-rpm, Slackware).
 - `openssl`, or `apk-tools >= 3.0`, if any apk repository has
   `verify_signature: true` — see `apk_signature_backend` in
   [configuration.md](configuration.md).
@@ -53,7 +53,7 @@ disk or the network beyond reading local files.
 ## Install
 
 ```bash
-make check                                    # diagnostics only, safe to run any time
+sudo make check                               # read-only diagnostics for system paths
 sudo make install PREFIX=/usr/local           # builds wheels, lays down files — no services touched
 sudoedit /etc/repowatch/config.yaml            # review settings before activation
 sudo make activate                            # creates the system user, enables and starts services
@@ -136,6 +136,14 @@ failure — it will not activate a broken installation.
 `repowatch run` — a single process that does everything: the scheduled
 index checks, cache warming, the syslog listener (if `syslog_listener.
 enabled`), and the `status.json`/dashboard HTTP server, all together.
+
+The daemon keeps an independent task for each repository and reloads configuration
+every ten seconds. A long warm does not hold up that reload or the separate
+retention scheduler. Index checks and cache work share `check_concurrency`, with
+capacity reserved for checks; see the [configuration reference](configuration.md#top-level-fields).
+A repository's next check waits for its own previous check and cache work to finish.
+Editing its settings takes effect on the next operation; removing it cancels and
+drains its active task. Ordinary interrupted warming is not a persistent retry queue.
 
 **`repowatch-status.service` + `repowatch-check.timer`** is the split
 alternative: a long-running `serve-status` process for the HTTP side, paired
@@ -227,7 +235,7 @@ sure the config you're running matches what you expect separately.
 ## Upgrading
 
 ```bash
-make upgrade-plan MANIFEST=/usr/local/share/repowatch/install.json WHEELHOUSE=build/wheels
+sudo make upgrade-plan MANIFEST=/usr/local/share/repowatch/install.json WHEELHOUSE=build/wheels
 sudo make upgrade  MANIFEST=/usr/local/share/repowatch/install.json WHEELHOUSE=build/wheels
 ```
 
@@ -276,6 +284,10 @@ that aren't up yet, before you commit to the real upgrade.
    swallowed, but it also means rollback isn't unconditionally guaranteed to
    finish cleanly on every kind of failure.
 
+If a managed service is still activating or deactivating (for example a running
+`repowatch-nginx.service` reconciliation), the upgrade refuses to proceed.
+Wait for that operation to finish and retry; do not bypass the state check.
+
 It refuses to run against a `DESTDIR`-staged layout or with `WITH_SYSTEMD=0`
 — this specific automated path assumes a systemd-managed installation is
 what's being upgraded in place.
@@ -314,7 +326,7 @@ service: restart it afterwards using your usual supervisor.
 ## Running without systemd
 
 `repowatch run` itself has no systemd dependency at all — it's a single
-process with its own `asyncio` scheduler (`watcher.run_forever`), same as
+process with its own `asyncio` scheduler (`runtime.scheduler.run_forever`), same as
 `make install WITH_SYSTEMD=0` already assumes. What's missing without
 systemd is a replacement for the *other* two units: `repowatch-nginx.timer`
 (periodic nginx reconciliation) and `repowatch-backup.timer` (daily backup).
@@ -349,8 +361,8 @@ its own timeout; this is not a hard real-time shutdown guarantee.
 
 Unexpected non-SQLite errors in an individual repository operation are logged
 and isolated from other repositories. Shared SQLite failures are fatal and
-cancel the current batch, so the service cannot continue retention with a known
-failed database or listener. `check-once` returns nonzero for these isolated
+cancel and drain running repository tasks, so the service cannot continue
+retention with a known failed database or listener. `check-once` returns nonzero for these isolated
 operation failures; existing fetch-error logging behavior remains unchanged.
 
 **The `--nginx` root requirement, and what you give up without systemd.**

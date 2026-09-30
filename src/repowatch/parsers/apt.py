@@ -1,13 +1,13 @@
-"""apt index parser: Packages(.gz) in deb822 format.
+"""apt index parser: Packages indexes (gzip, xz or uncompressed) in deb822 format.
 
 Multiple architectures are expressed as separate RepoConfig entries with
 different id/arch; each architecture's snapshot and history are independent.
 
 GPG verification (repo.verify_signature): InRelease is clearsigned, the
-signature is checked with gpgv, then the expected SHA256 for the specific
-Packages.gz is extracted from the verified body and compared after
-download — i.e. we don't trust Packages.gz itself (nobody signs it
-separately), but the chain InRelease signature -> SHA256 -> Packages.gz."""
+signature is checked with gpgv, then the expected SHA256 for the selected
+Packages index is extracted from the verified body and compared after
+download — i.e. we don't trust the index itself (nobody signs it
+separately), but the chain InRelease signature -> SHA256 -> index bytes."""
 
 from __future__ import annotations
 
@@ -16,10 +16,11 @@ import gzip
 import hashlib
 import httpx
 import logging
+import lzma
 import re
 from repowatch.errors import SignatureError
 from repowatch.models import PackageRef
-from repowatch.parsers.base import IndexParser
+from repowatch.parsers.base import IndexHeadResult, IndexParser
 from repowatch.verification.gpg import find_sha256_in_release, verify_clearsigned, _extract_clearsigned_body
 
 logger = logging.getLogger(__name__)
@@ -27,29 +28,48 @@ logger = logging.getLogger(__name__)
 
 class AptParser(IndexParser):
     def index_url(self) -> str:
-        repo = self.repo
-        # apt repository structure:
-        # <upstream>/dists/<distribution>/<component>/binary-<arch>/Packages.gz
-        return (
-            f"{repo.upstream}/dists/{repo.distribution}/{repo.component}"
-            f"/binary-{repo.arch}/Packages.gz"
-        )
-
-    def _inrelease_url(self) -> str:
+        # Release metadata tracks all encodings, including transitions between them.
         return f"{self.repo.upstream}/dists/{self.repo.distribution}/InRelease"
+
+    async def check_index_changed(
+        self, client: httpx.AsyncClient, prev_etag: str | None,
+        prev_last_modified: str | None,
+    ) -> IndexHeadResult:
+        """Check release metadata with validators scoped to the metadata URL."""
+        # Stored validators used to describe Packages.gz. Never send or compare
+        # those against InRelease, even if the origin reuses a date or ETag.
+        prefix = "apt-inrelease:"
+        etag = prev_etag.removeprefix(prefix) if prev_etag and prev_etag.startswith(prefix) else None
+        modified = (prev_last_modified.removeprefix(prefix)
+                    if prev_last_modified and prev_last_modified.startswith(prefix) else None)
+        try:
+            head = await super().check_index_changed(client, etag, modified)
+        except httpx.HTTPStatusError as exc:
+            if self.repo.verify_signature or exc.response.status_code not in (404, 410):
+                raise
+            # Legacy unsigned repositories can lack InRelease. Fetch Release or
+            # Packages.gz each cycle instead of caching a validator for another URL.
+            return IndexHeadResult(False, None, None)
+        return IndexHeadResult(
+            head.unchanged and bool(etag or modified),
+            prefix + head.etag if head.etag else None,
+            prefix + head.last_modified if head.last_modified else None,
+        )
 
     async def fetch_packages(self, client: httpx.AsyncClient) -> list[PackageRef]:
         repo = self.repo
-        url = self.index_url()
+        filename = "Packages.gz"
+        index_base = (self.index_url().removesuffix("InRelease")
+                      + f"{repo.component}/binary-{repo.arch}/")
         expected_sha256 = None
         release_body = None
         try:
-            release_raw = await self._http_get(client, self._inrelease_url())
+            release_raw = await self._http_get(client, self.index_url())
         except httpx.HTTPStatusError as exc:
             if repo.verify_signature or exc.response.status_code not in (404, 410):
                 raise
             try:
-                release_body = await self._http_get(client, self._inrelease_url().removesuffix("InRelease") + "Release")
+                release_body = await self._http_get(client, self.index_url().removesuffix("InRelease") + "Release")
             except httpx.HTTPStatusError as release_exc:
                 if release_exc.response.status_code not in (404, 410):
                     raise
@@ -59,32 +79,43 @@ class AptParser(IndexParser):
             else:
                 release_body = _extract_clearsigned_body(release_raw)
         if release_body is not None:
-            expected_sha256 = find_sha256_in_release(
-                release_body, f"{repo.component}/binary-{repo.arch}/Packages.gz")
+            for filename in ("Packages.gz", "Packages.xz", "Packages"):
+                try:
+                    expected_sha256 = find_sha256_in_release(
+                        release_body, f"{repo.component}/binary-{repo.arch}/{filename}")
+                except SignatureError:
+                    # This helper raises only for a missing entry. An invalid
+                    # advertised digest is checked below and must not fall back.
+                    continue
+                break
+            else:
+                raise SignatureError("No supported Packages index in Release SHA256 section")
             if not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256):
                 raise SignatureError("Invalid SHA256 in Release")
-            if re.search(rb"(?mi)^Acquire-By-Hash:\s*yes\s*$", release_body):
-                url = url.rsplit("/", 1)[0] + "/by-hash/SHA256/" + expected_sha256
+        direct_url = index_base + filename
+        url = direct_url
+        if release_body is not None and re.search(rb"(?mi)^Acquire-By-Hash:\s*yes\s*$", release_body):
+            url = index_base + "by-hash/SHA256/" + expected_sha256
         logger.debug("apt: fetching %s", url)
         try:
             raw = await self._http_get(client, url)
         except httpx.HTTPStatusError as exc:
-            if url == self.index_url() or exc.response.status_code not in (404, 410):
+            if url == direct_url or exc.response.status_code not in (404, 410):
                 raise
             # A mirror may advertise by-hash before syncing the object.
             # Fallback still MUST match the hash from the same Release.
-            raw = await self._http_get(client, self.index_url())
+            raw = await self._http_get(client, direct_url)
 
         if expected_sha256 is not None:
             actual_sha256 = hashlib.sha256(raw).hexdigest()
             if actual_sha256 != expected_sha256:
                 raise SignatureError(
-                    f"{repo.id}: Packages.gz SHA256 does not match InRelease "
+                    f"{repo.id}: {filename} SHA256 does not match Release "
                     f"({actual_sha256} != {expected_sha256}) — possible tampering"
                 )
-            logger.debug("%s: Packages.gz SHA256 confirmed via InRelease", repo.id)
+            logger.debug("%s: %s SHA256 confirmed via Release", repo.id, filename)
 
-        return await asyncio.to_thread(_parse_packages_gz, raw)
+        return await asyncio.to_thread(_decode_packages, raw, filename)
 
 
 # Fast path: only the four consumed fields are located, with a literal "\n" prefix
@@ -106,6 +137,15 @@ _LEAD_BYTE_SCAN_LIMIT = 4096
 # threads of the same process. Scan in slices of this many bytes instead; the
 # interpreter can hand the GIL over between calls.
 _SCAN_SLICE = 1024 * 1024
+
+
+def _decode_packages(raw: bytes, filename: str) -> list[PackageRef]:
+    """Decode the Release-selected representation off the event loop."""
+    if filename.endswith(".gz"):
+        return _parse_packages_gz(raw)
+    if filename.endswith(".xz"):
+        raw = lzma.decompress(raw)
+    return _parse_packages(raw)
 
 
 def _parse_packages_gz(raw: bytes) -> list[PackageRef]:

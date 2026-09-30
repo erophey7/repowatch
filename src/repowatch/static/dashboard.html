@@ -39,6 +39,15 @@
     <button type="button" id="calc-cache-size">Calculate cache directory size</button>
     <span id="cache-size-note" class="dim"></span>
 
+    <h3>Repository cache coverage and size</h3>
+    <p class="dim">Packages from the current index found on disk, including shared copies.
+      This scans the cache only when requested. It measures file presence, not freshness
+      or signature validity, and includes packages outside the warm list.
+      Physical and available sizes are calculated from the same scan.</p>
+    <button type="button" id="scan-completeness-btn">Measure cache coverage and size</button>
+    <p id="completeness-msg" role="status" class="form-msg"></p>
+    <div id="completeness-results"></div>
+
     <h3>Orphaned repositories</h3>
     <p class="dim">SQL bookkeeping (snapshots, history, warmed/ban state, Nix artifacts,
       failure streaks) left over from a repository no longer in config.yaml — for example

@@ -43,7 +43,7 @@ these cannot be made operational by a universal default.
 | `cache_base_url` | URL | — (required) | Where repowatch itself sends warm-up requests — the address of your nginx cache, from repowatch's point of view. Often `http://127.0.0.1:8080`. |
 | `public_cache_url` | URL or `null` | `null` | The address a human would use to browse the cache — shown as clickable links in the dashboard. Separate from `cache_base_url` because that one is usually a loopback address, useless as a link in your browser. If unset, `cache_base_url` is reused. |
 | `check_interval` | int (seconds) | `300` | How often each repository's index is checked, unless overridden per-repository (see `repos[].check_interval`). |
-| `check_concurrency` | int | `8` | How many repositories to check at once per scheduler tick. Repositories are checked concurrently, not one at a time — a slow/hung upstream for one repo won't delay checking the others. |
+| `check_concurrency` | int | `8` | Shared capacity for scheduler index checks and cache work. Warming cannot use the final quarter of slots (rounded up). With `1`, one check and one cache operation may overlap. Checks can queue behind other checks; long repository tasks do not block configuration reloads or retention scheduling. Lowering the limit lets active operations finish before admitting work under the new limits. Manual API jobs and retention are outside this pool. |
 | `prefetch_concurrency` | int | `8` | How many files to warm in parallel per warm-up run. |
 | `prefetch_bandwidth_limit` | positive number (bytes/sec) or size string (e.g. `"10 MiB/s"`), or `null` | `null` | Shared warm-body read budget for the whole application process, including all repositories and manual/Nix warming. `null` means unlimited globally. See [Bandwidth schedules](#bandwidth-schedules). |
 | `prefetch_bandwidth_timezone` | IANA timezone name | `UTC` | Timezone for schedule windows. Non-UTC zones require system timezone data; no Python timezone package is added. |
@@ -174,11 +174,19 @@ and adding a new one; there's no rename.
   final NAR content verification remains with the consuming Nix client.
   A catalog check without warming does not verify binary-cache signatures.
 
-- **apt**: the `InRelease` (or detached `Release`/`Release.gpg`) file is
-  checked with `gpgv` against `keyring_path`. `Packages.gz`'s checksum is
-  cross-verified against the (verified) Release file. apt's by-hash mode is
-  used automatically when the upstream advertises it, with a fallback to the
-  plain `Packages.gz` path when the by-hash object briefly 404s.
+- **apt**: `InRelease` is checked with `gpgv` against `keyring_path`.
+  Its SHA256 section selects the first advertised supported index:
+  `Packages.gz`, then `Packages.xz`, then uncompressed `Packages`. The selected
+  file's checksum is verified before decompression, including when signature
+  verification is disabled. Advertised by-hash URLs are used automatically;
+  a 404/410 falls back to the selected filename with the same required hash.
+  Invalid signatures or checksums do not trigger a format downgrade.
+  Without signature verification, missing `InRelease` permits unsigned `Release`;
+  if both metadata files return 404/410, legacy `Packages.gz` is fetched without
+  a Release checksum. Detached `Release.gpg` verification is not supported.
+  Conditional HEAD checks use `InRelease`; signed repositories still reverify
+  signatures every cycle. Unsigned repositories without `InRelease` fetch each
+  cycle rather than reusing validators from a different resource.
 - **pacman**: the detached `<repo>.db.tar.gz.sig` is checked with `gpgv`
   against `keyring_path`.
 - **dnf** (RPM-MD): `repomd.xml.asc` is checked with `gpgv` against

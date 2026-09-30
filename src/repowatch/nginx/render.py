@@ -441,6 +441,7 @@ def resolve_dedup_pairs(config: Config, rows: list[tuple[str, str, str]]) -> lis
     production, but not excluded by the schema either) is dropped ENTIRELY,
     not resolved by picking whichever row happened to come first: guessing
     could serve one suite's request with a different suite's bytes under it.
+    Keys that differ only in case are dropped for the same reason.
     Losing dedup for that one file is the safe outcome — its own repo route
     still serves it correctly, just without the cross-repo cache share.
     """
@@ -459,13 +460,22 @@ def resolve_dedup_pairs(config: Config, rows: list[tuple[str, str, str]]) -> lis
             continue
         targets.setdefault(duplicate_uri, set()).add(canonical_uri)
     conflicting = sum(1 for values in targets.values() if len(values) > 1)
-    if self_mapped or conflicting:
+    # nginx compares map keys case-insensitively (it lowercases them), so two
+    # URIs that differ only in case are "conflicting parameter" for nginx and
+    # would also answer each other's requests. Drop every such group.
+    by_lowered: dict[str, list[str]] = {}
+    for key in targets:
+        by_lowered.setdefault(key.lower(), []).append(key)
+    case_clashes = {key for keys in by_lowered.values() if len(keys) > 1 for key in keys}
+    if self_mapped or conflicting or case_clashes:
         logger.warning(
-            'nginx dedup: skipped %d self-mapped and %d conflicting duplicate-file '
-            'pairs (repositories sharing an nginx route collapse to the same local URI)',
-            self_mapped, conflicting,
+            'nginx dedup: skipped %d self-mapped, %d conflicting and %d case-colliding '
+            'duplicate-file pairs (repositories sharing an nginx route collapse to the '
+            'same local URI; nginx map keys are case-insensitive)',
+            self_mapped, conflicting, len(case_clashes),
         )
-    return [(key, next(iter(values))) for key, values in targets.items() if len(values) == 1]
+    return [(key, next(iter(values))) for key, values in targets.items()
+            if len(values) == 1 and key not in case_clashes]
 
 
 def render_dedup(config: Config, pairs: list[tuple[str, str]]) -> str:

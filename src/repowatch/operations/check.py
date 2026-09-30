@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import httpx
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from repowatch.cache.purge import purge_removed
 from repowatch.config.models import Config, RepoConfig
 from repowatch.errors import SignatureError
 from repowatch.notifications import emit, record_failure_and_maybe_notify, record_success_and_maybe_notify
 from repowatch.operations.replacements import refresh_replacements
+from repowatch.operations.slots import RepoSlots
 from repowatch.operations.warm import warm_cache
 from repowatch.parsers import PARSERS
 from repowatch.parsers.base import IndexHeadResult
@@ -55,7 +57,36 @@ async def _check_key_expiry(config: Config, repo: RepoConfig, store: ServiceStat
         await record_success_and_maybe_notify(config, store, repo.id, "key_expiry")
 
 
-async def check_repo(config: Config, repo: RepoConfig, store: ServiceState) -> None:
+@dataclass(frozen=True)
+class CacheWork:
+    """Cache operations decided by an index check and run in a later phase."""
+
+    warm: dict[str, str]
+    removed_filenames: dict[str, str]
+
+
+async def check_repo(config: Config, repo: RepoConfig, store: ServiceState,
+                     *, slots: RepoSlots | None = None) -> None:
+    """Check one repository, then update its cache.
+
+    With `slots` the two phases hold a slot only while they run, so a long
+    warm does not hold up index checks (see RepoSlots). Without it the phases
+    run unbounded, as direct callers and tests expect.
+    """
+    if slots is None:
+        work = await check_index(config, repo, store)
+        if work is not None:
+            await apply_cache_work(config, repo, store, work)
+        return
+    async with slots.check():
+        work = await check_index(config, repo, store)
+    if work is not None:
+        async with slots.warm():
+            await apply_cache_work(config, repo, store, work)
+
+
+async def check_index(config: Config, repo: RepoConfig, store: ServiceState) -> CacheWork | None:
+    """Fetch and record the index; return the cache work it calls for, if any."""
     await _check_key_expiry(config, repo, store)
 
     parser_cls = PARSERS[repo.type]
@@ -84,11 +115,10 @@ async def check_repo(config: Config, repo: RepoConfig, store: ServiceState) -> N
                 and (prev_etag is not None or prev_last_modified is not None)
                 and store.repositories.has_snapshot(repo.id)):
             store.repositories.touch_last_check(repo.id)
-            await refresh_replacements(config, repo, store)
             logger.debug(
                 "%s: index unchanged (ETag/Last-Modified), download skipped", repo.id
             )
-            return
+            return CacheWork({}, {}) if store.cache.get_pending_replacements(repo.id) else None
 
         try:
             snapshot = await parser.fetch(client)
@@ -105,7 +135,7 @@ async def check_repo(config: Config, repo: RepoConfig, store: ServiceState) -> N
             return
 
     # No condition on repo.verify_signature here: AptParser now
-    # cross-checks the SHA256 of Packages.gz against InRelease (by-hash, see
+    # cross-checks the SHA256 of the selected Packages index against InRelease (by-hash, see
     # parsers/apt.py), and DnfParser checks primary via repomd.xml's
     # checksum. Both can raise SignatureError even when
     # verify_signature=False — if the reset were gated on
@@ -127,24 +157,18 @@ async def check_repo(config: Config, repo: RepoConfig, store: ServiceState) -> N
             'added': len(diff.new_packages), 'removed': len(diff.removed_packages),
             'modified': len(diff.modified_packages), 'packages': len(snapshot.packages)})
 
-    await refresh_replacements(config, repo, store)
-
     if repo.type == 'nix':
         store.cache.update_nix_trust(repo.id, repo.verify_signature, repo.nix_public_keys, source=repo.upstream)
         # A missing binary or failed artifact needs a retry even if the source
         # catalog has not changed. Successful roots retain normal warm policy.
         warmed = {item['package_key']: item['status'] for item in store.cache.get_warmed_packages(repo.id)}
         retry = {key: filename for key, filename in snapshot.packages.items() if warmed.get(key) != 'ok'}
-        await warm_cache(config, repo, store, retry)
-        if diff.removed_packages and config.nginx.enable_purge:
-            from repowatch.cache.nix import purge
-            await purge(config, repo, store, diff.removed_filenames)
         logger.info('%s: Nix catalog checked (%d outputs, changed=%s)', repo.id, len(snapshot.packages), diff.changed)
-        return
+        return CacheWork(retry, diff.removed_filenames)
 
     if not diff.changed:
         logger.debug("%s: no changes (%d packages)", repo.id, len(snapshot.packages))
-        return
+        return CacheWork({}, {}) if store.cache.get_pending_replacements(repo.id) else None
 
     logger.info(
         "%s: changes — %d new, %d removed, %d modified",
@@ -154,12 +178,28 @@ async def check_repo(config: Config, repo: RepoConfig, store: ServiceState) -> N
         len(diff.modified_packages),
     )
 
-    if diff.new_packages:
-        new_packages = {key: snapshot.packages[key] for key in diff.new_packages}
-        await warm_cache(config, repo, store, new_packages)
+    return CacheWork(
+        {key: snapshot.packages[key] for key in diff.new_packages},
+        diff.removed_filenames,
+    )
 
-    if diff.removed_packages:
+
+async def apply_cache_work(config: Config, repo: RepoConfig, store: ServiceState,
+                           work: CacheWork) -> None:
+    """Retry replacements, warm new packages and purge removed ones."""
+    await refresh_replacements(config, repo, store)
+    if repo.type == 'nix':
+        await warm_cache(config, repo, store, work.warm)
+        if work.removed_filenames and config.nginx.enable_purge:
+            from repowatch.cache.nix import purge
+            await purge(config, repo, store, work.removed_filenames)
+        return
+
+    if work.warm:
+        await warm_cache(config, repo, store, work.warm)
+
+    if work.removed_filenames:
         # Active proxy_cache eviction — a
         # no-op unless nginx.enable_purge is set (see purge_removed), so
         # this doesn't change behavior for any config that hasn't opted in.
-        await purge_removed(config, repo, diff.removed_filenames)
+        await purge_removed(config, repo, work.removed_filenames)

@@ -91,7 +91,7 @@ def test_check_all_checks_due_repos_concurrently(tmp_path, monkeypatch):
     active = 0
     max_active = 0
 
-    async def fake_check_repo(cfg, repo, st):
+    async def fake_check_repo(cfg, repo, st, *, slots=None):
         nonlocal active, max_active
         active += 1
         max_active = max(max_active, active)
@@ -115,7 +115,7 @@ def test_check_all_skips_repos_not_due(tmp_path, monkeypatch):
 
     calls = []
 
-    async def fake_check_repo(cfg, repo, st):
+    async def fake_check_repo(cfg, repo, st, *, slots=None):
         calls.append(repo.id)
 
     monkeypatch.setattr("repowatch.runtime.scheduler.check_repo", fake_check_repo)
@@ -670,13 +670,13 @@ def test_run_forever_invokes_check_all_and_prune_all_on_its_own_timer(tmp_path, 
     check_all_calls = []
     prune_calls = []
 
-    async def fake_check_all(cfg, st):
+    def fake_reconcile(self, cfg):
         check_all_calls.append(1)
 
     async def fake_prune_all(cfg, st):
         prune_calls.append(1)
 
-    monkeypatch.setattr(runtime_scheduler, "check_all", fake_check_all)
+    monkeypatch.setattr(runtime_scheduler.RepoDispatcher, "reconcile", fake_reconcile)
     monkeypatch.setattr(runtime_scheduler, "prune_all", fake_prune_all)
     # Tiny tick/prune intervals so the loop fires several times fast,
     # instead of relying on the real 10s tick / 3600s prune interval or on
@@ -801,7 +801,7 @@ def test_scheduler_keeps_last_valid_config_after_bad_reload(tmp_path, monkeypatc
 
     async def run():
         stop = asyncio.Event()
-        async def check(config, state):
+        def reconcile(self, config):
             observed.append(config)
             if len(observed) == 1:
                 if broken == 'missing':
@@ -814,7 +814,7 @@ def test_scheduler_keeps_last_valid_config_after_bad_reload(tmp_path, monkeypatc
                 stop.set()
         async def prune(*args):
             pass
-        monkeypatch.setattr(runtime_scheduler, 'check_all', check)
+        monkeypatch.setattr(runtime_scheduler.RepoDispatcher, 'reconcile', reconcile)
         monkeypatch.setattr(runtime_scheduler, 'prune_all', prune)
         monkeypatch.setattr(runtime_scheduler, '_SCHEDULER_TICK_SECONDS', 0.001)
         await asyncio.wait_for(runtime_scheduler.run_forever(
@@ -831,7 +831,7 @@ def test_check_all_isolates_repo_operation_failures(tmp_path, monkeypatch):
         for name in ('bad', 'good')])
     store = ServiceState(tmp_path / 'state.db')
     completed = []
-    async def check(config, repo, store):
+    async def check(config, repo, store, *, slots=None):
         if repo.id == 'bad':
             raise RuntimeError('operation failure')
         completed.append(repo.id)
@@ -849,7 +849,7 @@ def test_check_all_database_failure_cancels_other_checks(tmp_path, monkeypatch):
     stopped = []
     async def run():
         started = asyncio.Event()
-        async def check(config, repo, store):
+        async def check(config, repo, store, *, slots=None):
             if repo.id == 'bad':
                 await started.wait()
                 raise sqlite3.OperationalError('database unavailable')

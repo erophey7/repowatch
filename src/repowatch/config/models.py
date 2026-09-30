@@ -365,10 +365,9 @@ class Config:
     # first full warm of a large repo (thousands of new packages),
     # warming one at a time sequentially would take hours
     prefetch_concurrency: int = 8
-    # how many repositories to check concurrently per scheduler tick
-    # (runtime.scheduler.check_all, asyncio.Semaphore) — repositories used to be
-    # checked strictly one at a time, so a slow/hung upstream for one repo
-    # delayed checking all the others in that tick
+    # Shared scheduler capacity (operations.slots.RepoSlots). Cache work cannot
+    # use the final quarter, rounded up; checks may wait for other checks.
+    # At 1, one check and one warm can overlap. Manual jobs/retention are separate.
     check_concurrency: int = 8
     # address of the nginx cache that a human actually browses to (for
     # "view files" links in the dashboard). Separate from cache_base_url,

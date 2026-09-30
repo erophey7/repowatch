@@ -14,6 +14,7 @@ from repowatch.config.load import load_config
 from repowatch.config.models import Config
 from repowatch.errors import ConfigError
 from repowatch.reporting.metrics import metrics_payload
+from repowatch.reporting.completeness import completeness_payload
 from repowatch.reporting.statistics import (
     paged_payload, requests_summary_payload, prefetch_efficiency_payload, stats_payload,
     orphaned_repos_payload, purge_orphaned_repos_payload,
@@ -281,6 +282,13 @@ def make_handler(
                 qs = parse_qs(parsed.query)
                 status, payload = stats_payload(
                     config_path, store, include_cache_dir=qs.get("cache_dir", ["0"])[0] == "1", current=self.current)
+                self._json(payload, status=status)
+                return
+
+            if parsed.path == "/api/storage/completeness":
+                status, payload = completeness_payload(
+                    config_path, store, current=self.current,
+                    include_usage=parse_qs(parsed.query).get("usage", ["0"])[0] == "1")
                 self._json(payload, status=status)
                 return
 

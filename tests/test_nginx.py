@@ -725,7 +725,7 @@ def test_resolve_dedup_pairs_drops_self_mapped_rows_sharing_one_nginx_route(capl
     # Both repos resolve to the identical /ubuntu/pool/main/a/a.deb — nothing
     # to redirect, and emitting it would rewrite a location to itself.
     assert pairs == []
-    assert 'skipped 1 self-mapped and 0 conflicting' in caplog.text
+    assert 'skipped 1 self-mapped, 0 conflicting and 0 case-colliding' in caplog.text
 
 
 def test_resolve_dedup_pairs_collapses_duplicate_keys_from_the_same_shared_route(caplog):
@@ -1263,3 +1263,24 @@ def test_prepared_cache_keys_keep_route_snapshot_and_alternate_basis(dedup, monk
     new_config = replace(c, nginx=replace(c.nginx, cache_key_version='v3'))
     assert routing.CacheKeyBuilder(new_config).for_repo(repo)('x').startswith('v3:')
     assert key('x').startswith('v2:')
+
+
+def test_dedup_pairs_drop_keys_that_differ_only_in_case(tmp_path):
+    """nginx lowercases map keys, so case-variant URIs are 'conflicting parameter'."""
+    import shutil
+    c = config([apt('a', 'http://a.test/debian'), apt('b', 'http://b.test/ubuntu'), apt('c', 'http://c.test/mint')])
+    rows = [('b', 'a', 'pool/main/x/Foo.deb'), ('b', 'a', 'pool/main/x/foo.deb'),
+            ('c', 'a', 'pool/main/x/Bar.deb')]
+    pairs = nginx_render.resolve_dedup_pairs(c, rows)
+    keys = [key for key, _ in pairs]
+    assert len({key.lower() for key in keys}) == len(keys)
+    assert not any(key.lower().endswith('/foo.deb') for key in keys)
+    assert any(key.endswith('/Bar.deb') for key in keys)  # a lone mixed-case key stays
+    binary = shutil.which('nginx')
+    if binary:
+        (tmp_path / 'dedup.map').write_text(nginx_render.render_dedup(c, pairs))
+        conf = tmp_path / 'nginx.conf'
+        conf.write_text(f'pid {tmp_path}/n.pid; error_log {tmp_path}/e.log;\nevents {{}}\n'
+                        f'http {{ map $uri $v {{ include {tmp_path}/dedup.map; }} }}\n')
+        subprocess.run([binary, '-p', str(tmp_path), '-c', str(conf), '-t'],
+                       check=True, capture_output=True)

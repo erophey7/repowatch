@@ -58,7 +58,7 @@ def test_apt_parser_parses_fixture(monkeypatch):
 def test_apt_index_url_matches_repo_layout():
     parser = AptParser(_repo())
     assert parser.index_url() == (
-        "https://example.org/debian/dists/bookworm/main/binary-amd64/Packages.gz"
+        "https://example.org/debian/dists/bookworm/InRelease"
     )
 
 
@@ -348,3 +348,197 @@ def test_break_detection_finds_separators_across_slice_boundaries(monkeypatch):
             data = b"Package: a\n" + b"x" * padding + separator + b"y" * padding + b"\n"
             assert apt_module._has_unusual_line_break(data), (separator, padding)
     assert not apt_module._has_unusual_line_break(b"Package: a\n" + b"\xe2\x80\x9d" * 20)
+
+
+def _inrelease(body: bytes) -> bytes:
+    return (b'-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\n'
+            + body + b'-----BEGIN PGP SIGNATURE-----\n')
+
+
+@pytest.mark.parametrize("filename", ["Packages.xz", "Packages"])
+@pytest.mark.parametrize("signed", [False, True])
+@pytest.mark.parametrize("by_hash", [False, True])
+def test_release_selects_available_encoding(monkeypatch, filename, signed, by_hash):
+    import lzma
+    raw = FIXTURE.read_bytes()
+    if filename.endswith('.xz'):
+        raw = lzma.compress(raw)
+    digest = hashlib.sha256(raw).hexdigest()
+    body = (f"Acquire-By-Hash: {'yes' if by_hash else 'no'}\nSHA256:\n"
+            f" {digest} {len(raw)} main/binary-amd64/{filename}\n").encode()
+    parser = AptParser(_repo(verify_signature=signed, keyring_path='/key' if signed else None))
+    monkeypatch.setattr(apt_module, 'verify_clearsigned', lambda *_: body)
+    calls = []
+
+    async def get(client, url):
+        calls.append(url)
+        if url.endswith('InRelease'):
+            return _inrelease(body)
+        assert url.endswith('/by-hash/SHA256/' + digest if by_hash else '/' + filename)
+        return raw
+
+    monkeypatch.setattr(parser, '_http_get', get)
+    assert asyncio.run(parser.fetch_packages(None)) == apt_module._parse_packages(FIXTURE.read_bytes())
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize('status', [404, 410, 403, 500])
+@pytest.mark.parametrize('tampered', [False, True])
+def test_xz_by_hash_fallback_is_same_representation(monkeypatch, status, tampered):
+    import lzma
+    raw = lzma.compress(FIXTURE.read_bytes())
+    digest = hashlib.sha256(raw).hexdigest()
+    body = f'Acquire-By-Hash: yes\nSHA256:\n {digest} {len(raw)} main/binary-amd64/Packages.xz\n'.encode()
+    parser = AptParser(_repo())
+    calls = []
+
+    async def get(client, url):
+        calls.append(url)
+        if url.endswith('InRelease'):
+            return _inrelease(body)
+        if '/by-hash/' in url:
+            httpx.Response(status, request=httpx.Request('GET', url)).raise_for_status()
+        assert url.endswith('/Packages.xz')
+        return raw + b'tampered' if tampered else raw
+
+    monkeypatch.setattr(parser, '_http_get', get)
+    if status not in (404, 410):
+        with pytest.raises(httpx.HTTPStatusError):
+            asyncio.run(parser.fetch_packages(None))
+        assert len(calls) == 2
+    elif tampered:
+        with pytest.raises(SignatureError, match='SHA256 does not match'):
+            asyncio.run(parser.fetch_packages(None))
+    else:
+        assert len(asyncio.run(parser.fetch_packages(None))) == 2
+
+
+@pytest.mark.parametrize('digest', ['invalid', '0' * 64])
+def test_invalid_preferred_encoding_does_not_downgrade(monkeypatch, digest):
+    body = (f'SHA256:\n {digest} 1 main/binary-amd64/Packages.gz\n'
+            f' {"1" * 64} 1 main/binary-amd64/Packages.xz\n').encode()
+    parser = AptParser(_repo())
+
+    async def get(client, url):
+        assert not url.endswith('.xz')
+        return _inrelease(body) if url.endswith('InRelease') else gzip.compress(FIXTURE.read_bytes())
+
+    monkeypatch.setattr(parser, '_http_get', get)
+    with pytest.raises(SignatureError, match='Invalid SHA256|SHA256 does not match'):
+        asyncio.run(parser.fetch_packages(None))
+
+
+def test_missing_supported_sha256_entry_is_not_unsigned_fallback(monkeypatch):
+    parser = AptParser(_repo())
+
+    async def get(client, url):
+        assert url.endswith('InRelease')
+        return _inrelease(b'SHA256:\n abc 1 other/binary-amd64/Packages.xz\n')
+
+    monkeypatch.setattr(parser, '_http_get', get)
+    with pytest.raises(SignatureError, match='No supported Packages'):
+        asyncio.run(parser.fetch_packages(None))
+
+
+@pytest.mark.parametrize('empty', [False, True])
+def test_unsigned_release_fallback_supports_xz(monkeypatch, empty):
+    import lzma
+    raw = lzma.compress(b'' if empty else FIXTURE.read_bytes())
+    digest = hashlib.sha256(raw).hexdigest()
+    parser = AptParser(_repo())
+
+    async def get(client, url):
+        if url.endswith('InRelease'):
+            httpx.Response(404, request=httpx.Request('GET', url)).raise_for_status()
+        if url.endswith('/Release'):
+            return f'SHA256:\n {digest} {len(raw)} main/binary-amd64/Packages.xz\n'.encode()
+        assert url.endswith('/Packages.xz')
+        return raw
+
+    monkeypatch.setattr(parser, '_http_get', get)
+    assert len(asyncio.run(parser.fetch_packages(None))) == (0 if empty else 2)
+
+
+@pytest.mark.parametrize('header', ['ETag', 'Last-Modified'])
+def test_release_head_does_not_reuse_package_validators(header):
+    value = '"same"' if header == 'ETag' else 'Tue, 29 Sep 2026 23:00:00 GMT'
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        assert request.url.path.endswith('/InRelease')
+        return httpx.Response(200, headers={header: value})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            parser = AptParser(_repo())
+            old = (value, None) if header == 'ETag' else (None, value)
+            first = await parser.check_index_changed(client, *old)
+            assert not first.unchanged
+            assert not any(h in requests[0].headers for h in ('If-None-Match', 'If-Modified-Since'))
+            second = await AptParser(_repo()).check_index_changed(client, first.etag, first.last_modified)
+            assert second.unchanged
+            conditional = 'If-None-Match' if header == 'ETag' else 'If-Modified-Since'
+            assert requests[1].headers[conditional] == value
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('signed', [False, True])
+def test_missing_inrelease_head_only_allows_unsigned_fallback(signed):
+    async def run():
+        parser = AptParser(_repo(verify_signature=signed, keyring_path='/key' if signed else None))
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(404))) as client:
+            if signed:
+                with pytest.raises(httpx.HTTPStatusError):
+                    await parser.check_index_changed(client, None, None)
+            else:
+                head = await parser.check_index_changed(client, None, None)
+                assert not head.unchanged and head.etag is None and head.last_modified is None
+
+    asyncio.run(run())
+
+
+def test_release_prefers_gzip_when_both_encodings_exist(monkeypatch):
+    raw = gzip.compress(FIXTURE.read_bytes())
+    digest = hashlib.sha256(raw).hexdigest()
+    parser = AptParser(_repo())
+
+    async def get(client, url):
+        if url.endswith('InRelease'):
+            return _inrelease((f'SHA256:\n {"1" * 64} 1 main/binary-amd64/Packages.xz\n'
+                    f' {digest} {len(raw)} main/binary-amd64/Packages.gz\n').encode())
+        assert url.endswith('/Packages.gz')
+        return raw
+
+    monkeypatch.setattr(parser, '_http_get', get)
+    assert len(asyncio.run(parser.fetch_packages(None))) == 2
+
+
+def test_invalid_xz_stream_is_not_treated_as_plain_packages(monkeypatch):
+    import lzma
+    raw = FIXTURE.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    parser = AptParser(_repo())
+
+    async def get(client, url):
+        if url.endswith('InRelease'):
+            return _inrelease(f'SHA256:\n {digest} {len(raw)} main/binary-amd64/Packages.xz\n'.encode())
+        return raw
+
+    monkeypatch.setattr(parser, '_http_get', get)
+    with pytest.raises(lzma.LZMAError):
+        asyncio.run(parser.fetch_packages(None))
+
+
+def test_release_head_conditional_304_preserves_scoped_validators():
+    def respond(request):
+        assert request.headers['If-None-Match'] == '"release"'
+        return httpx.Response(304)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            head = await AptParser(_repo()).check_index_changed(client, 'apt-inrelease:"release"', None)
+            assert head.unchanged and head.etag == 'apt-inrelease:"release"'
+
+    asyncio.run(run())

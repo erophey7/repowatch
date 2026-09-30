@@ -484,3 +484,33 @@ def test_bad_operational_config_is_unavailable_not_bad_headers(api, field, value
     response = client.get('/api/repos')
     assert response.status_code == 503
     assert response.json() == {'error': 'configuration unavailable'}
+
+
+def test_completeness_scan_is_admin_only(api, monkeypatch):
+    from repowatch.reporting import completeness
+    from repowatch.cache.probe import Inventory
+    client, path, store = api
+    raw = yaml.safe_load(path.read_text())
+    raw['status_server'] = {'guest_read_only': True}
+    raw['nginx'] = {'enable_cache_probe': True}
+    path.write_text(yaml.safe_dump(raw))
+    calls = []
+    async def scan(*args):
+        calls.append(1)
+        return Inventory([])
+    monkeypatch.setattr(completeness, '_inventory', scan)
+    for route in ['/api/storage/completeness', '/api/storage/completeness?usage=1']:
+        assert client.get(route).status_code == 401
+    assert calls == []
+    login(client)
+    for route in ['/api/storage/completeness', '/api/storage/completeness?usage=1']:
+        response = client.get(route)
+        assert response.status_code == 200
+        assert response.json()['items'][0]['reason'] == 'no_snapshot'
+        assert ('storage_usage' in response.json()) == ('usage=1' in route)
+    assert calls == [1, 1]
+    token = client.post('/api/tokens', json={'name': 'host'},
+                        headers={'X-CSRF-Token': client.get('/api/auth/session').json()['csrf_token']}).json()['token']
+    client.cookies.clear()
+    assert client.get('/api/storage/completeness', headers={'Authorization': 'Bearer ' + token}).status_code == 401
+    assert calls == [1, 1]

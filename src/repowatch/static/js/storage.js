@@ -261,3 +261,65 @@ document.getElementById('hide-token').addEventListener('click', () => {
   document.getElementById('token-secret').value = '';
   document.getElementById('token-secret-wrap').hidden = true;
 });
+
+function renderCompleteness(data) {
+  const rows = data.items.map(row => {
+    const percent = row.percent == null ? '—' : `${row.percent}%`;
+    const reason = {no_snapshot: 'No index snapshot yet', source_changed: 'Source changed; awaiting a new index',
+      incomplete_evidence: 'Unknown: incomplete scan, pending replacement or unresolved Nix closure'}[row.reason] || row.state;
+    return `<tr><td>${esc(row.repo_id)}</td><td>${row.total_packages ?? '—'}</td>` +
+      `<td>${row.cached_packages}</td><td>${row.missing_packages}</td><td>${row.unknown_packages}</td>` +
+      `<td>${percent}</td><td>${esc(reason)}</td></tr>`;
+  }).join('');
+  return `<p class="dim">Observation: ${esc(data.started_at)} — ${esc(data.finished_at)}. ` +
+    'Cache contents can change during and after the scan.</p>' +
+    (data.failed_leaves || data.unreadable_entries ? `<p class="form-msg error">Incomplete inventory: ` +
+      `${data.failed_leaves} directories failed, ${data.unreadable_entries} entries unreadable. ` +
+      'Unobserved packages may be unknown rather than missing.</p>' : '') +
+    (rows ? '<table><thead><tr><th>Repository</th><th>Catalog</th><th>Found</th><th>Missing</th>' +
+      '<th>Unknown</th><th>On disk</th><th>State</th></tr></thead><tbody>' + rows + '</tbody></table>' :
+      '<p class="dim">No repositories configured.</p>');
+}
+document.getElementById('scan-completeness-btn').addEventListener('click', async () => {
+  const button = document.getElementById('scan-completeness-btn');
+  const message = document.getElementById('completeness-msg');
+  const results = document.getElementById('completeness-results');
+  button.disabled = true;
+  message.className = 'form-msg';
+  message.textContent = 'Scanning the cache; large caches can take a while…';
+  results.textContent = '';
+  try {
+    const response = await fetch('/api/storage/completeness?usage=1');
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    results.innerHTML = renderCompleteness(data) + (data.storage_usage ? renderStorageUsage(data.storage_usage) : '');
+    message.textContent = 'Measurement complete. Run again to refresh.';
+  } catch (error) {
+    message.className = 'form-msg error';
+    message.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+});
+
+function renderStorageUsage(usage) {
+  const table = (rows, grouped) => '<table><thead><tr><th>' + (grouped ? 'Group' : 'Repository') +
+    '</th><th>Physical bytes</th><th>Available bytes</th></tr></thead><tbody>' + rows.map(row => {
+      const name = grouped ? (row.group == null ? '(ungrouped)' : row.group) : row.repo_id;
+      const note = row.reason ? ' — attribution unavailable' :
+        row.unknown_repositories ? ` — ${row.unknown_repositories} repository/ies unresolved` : '';
+      return `<tr><td>${esc(name)}${esc(note)}</td><td>${row.reason ? '—' : bytesWithExact(row.physical_bytes)}</td>` +
+        `<td>${row.reason ? '—' : bytesWithExact(row.available_bytes)}</td></tr>`;
+    }).join('') + '</tbody></table>';
+  return '<h3>Cache file sizes</h3><p class="dim">Physical bytes count each file once at its owner. ' +
+    'Available bytes count shared files for each using repository, once within each group. ' +
+    'Sizes include nginx headers; available bytes do not guarantee freshness or valid contents.</p>' +
+    `<p>Observed total: ${bytesWithExact(usage.total_bytes)}. Attributed: ${bytesWithExact(usage.attributed_bytes)}. ` +
+    `Unattributed: ${bytesWithExact(usage.unattributed_bytes)} (${usage.unattributed_files} files).</p>` +
+    (!usage.inventory_complete ? `<p class="form-msg error">Partial inventory: ${usage.failed_leaves} directories failed, ` +
+      `${usage.unreadable_sizes} sizes unreadable, ${usage.unreadable_keys} keys unreadable. ` +
+      'Only known bytes are shown; repository and group values may be undercounts.</p>' : '') +
+    table(usage.repositories, false) + '<h4>Groups</h4>' + table(usage.groups, true) +
+    '<p class="dim">Unattributed files include unknown keys, metadata and files outside known catalogs/warm history. ' +
+    'Available sizes overlap across repositories and groups; do not sum them as physical disk usage.</p>';
+}

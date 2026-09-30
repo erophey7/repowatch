@@ -49,8 +49,8 @@ Docker implicitly.
 ## Build inputs and runtime
 
 The context specification is `docker/context.json`. It includes `pyproject.toml`,
-`LICENSE`, the application's Python/HTML files, and the two explicit bootstrap
-inputs `docker/compose/init.py` and `docker/compose/config.example.yaml`.
+`LICENSE`, the application's Python, HTML, CSS and JavaScript files, and two
+explicit bootstrap inputs `docker/compose/init.py` and `docker/compose/config.example.yaml`.
 The generated ignore rules start by excluding everything, then allow exact source files and their ancestor
 directories. Unrelated YAML, keys, databases, tests, local environments and docs
 are excluded. Hidden source files/directories are excluded; source symlinks are

@@ -52,7 +52,7 @@ rest of repowatch runs normally):
   needs a usable Nix store/daemon. See [Nix repositories](docs/nix.md).
 - `gpg` — optional key-expiry warnings for GPG-signed repositories;
   signature verification itself only needs `gpgv`.
-- `gpgv` — signature verification for apt/pacman/RPM-MD/apt-rpm repositories
+- `gpgv` — signature verification for apt/pacman/RPM-MD/apt-rpm/Slackware repositories
   with `verify_signature: true`.
 - `openssl`, or `apk-tools >= 3.0` — signature verification for apk
   repositories with `verify_signature: true` (apk uses a different, non-GPG
@@ -125,7 +125,7 @@ different file, pass `-c`/`--config` before the subcommand, as above.
 ### Production (system install)
 
 ```bash
-make check                                    # environment diagnostics only
+sudo make check                               # environment diagnostics only
 sudo make install PREFIX=/usr/local
 sudoedit /etc/repowatch/config.yaml            # review the empty, full-feature seed
 sudo make activate                            # enables and starts services

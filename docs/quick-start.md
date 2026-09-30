@@ -135,8 +135,8 @@ Before activation, review:
 - nginx DNS resolvers, cache size (`100g`) and storage capacity. This size is a
   cache-manager target, not a hard disk quota or preallocated disk reservation.
 - Warming budget: 10 MiB/s per application process, four downloads per warm run,
-  four concurrent index checks, with a 15-minute default check interval. These
-  limits do not cap client downloads or metadata traffic.
+  four shared scheduler slots with capacity reserved for index checks, and a
+  15-minute default check interval. These limits do not cap client downloads or metadata traffic.
 - All nginx features and syslog tracking are enabled. Trusted signing keys,
   TLS certificates, webhook destinations and optional Nix are site-specific;
   configure those when needed rather than inserting placeholder credentials.
@@ -184,6 +184,16 @@ then refresh the client's package indexes and download a small package. Requests
 should appear in the dashboard when syslog tracking is running. A repeated
 cacheable GET can become a HIT; HEAD requests and mutable-index expiry are not
 proof that package bytes have been warmed.
+
+The repository's `unchanged` badge means no catalog change has been recorded.
+It can also appear before the first successful check or for a valid empty catalog.
+Distinguish these using `last_check` and package count: a successful empty index
+has a check timestamp and count `0`; a source that has never succeeded has no
+successful timestamp. `/healthz` does not flag that never-checked case as stale.
+
+To measure cached files and per-repository/group disk usage, open **Storage →
+Measure cache coverage and size**. This is an explicit scan and can take minutes;
+see [coverage and size semantics](access.md#physical-cache-completeness).
 
 For a cache 404, check the generated URL, configured repositories and nginx
 reconciliation logs. For a 502, check upstream reachability and DNS from nginx.

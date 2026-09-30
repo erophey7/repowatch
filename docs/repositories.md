@@ -130,6 +130,11 @@ entry for every additional component (`contrib`, `non-free`,
 `/debian` and `/debian-security`. For Debian 12, consistently substitute
 `bookworm` for `trixie`; do not silently change a client's release.
 
+APT index compression is selected automatically from the Release SHA256 entries:
+`Packages.gz`, `Packages.xz`, or uncompressed `Packages`, in that order. No
+compression setting is needed for Debian updates/security repositories that only
+publish xz indexes. An empty, correctly verified index is a valid empty catalog.
+
 For server-side APT signature verification, provision a trusted, readable
 Debian archive keyring and add these fields to **each** entry:
 

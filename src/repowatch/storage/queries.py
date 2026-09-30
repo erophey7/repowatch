@@ -12,6 +12,33 @@ class QueriesStore:
     def __init__(self, db: Database):
         self.db = db
 
+    def completeness_catalogs(self, repo_ids: list[str], *, include_warmed: bool = False) -> dict[str, dict]:
+        """Read catalog identities, packages and closure evidence in one short snapshot."""
+        result = {}
+        with self.db.connect() as conn:
+            conn.execute('BEGIN')
+            for repo_id in repo_ids:
+                state = conn.execute(
+                    'SELECT last_check, source_identity FROM repo_state WHERE repo_id=?',
+                    (repo_id,)).fetchone()
+                artifacts = {}
+                for key, filename in conn.execute(
+                        'SELECT package_key, filename FROM nix_artifacts WHERE repo_id=?', (repo_id,)):
+                    artifacts.setdefault(key, set()).add(filename)
+                result[repo_id] = dict(
+                    last_check=state[0] if state else None,
+                    source_identity=state[1] if state else None,
+                    packages=conn.execute(
+                        'SELECT package_key, filename FROM repo_packages WHERE repo_id=?', (repo_id,)).fetchall(),
+                    pending={key for key, in conn.execute(
+                        'SELECT package_key FROM pending_replacements WHERE repo_id=?', (repo_id,))},
+                    artifacts=artifacts,
+                    warmed={filename for filename, in conn.execute(
+                        'SELECT filename FROM warmed_packages WHERE repo_id=?', (repo_id,))}
+                    if include_warmed else set(),
+                )
+        return result
+
     def get_page(self, kind: str, repo_id: str | None = None, *,
                  q: str = "", limit: int = 100, cursor: str | None = None) -> dict:
         """Bounded keyset pagination; cursors are bound to resource and filter.

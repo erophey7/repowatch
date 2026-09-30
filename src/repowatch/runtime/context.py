@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from threading import Lock
 from repowatch.bandwidth import BandwidthBudget
 from repowatch.storage.cache import CacheStore
 from repowatch.storage.database import Database
@@ -22,3 +23,4 @@ class ServiceState:
         self.notifications = NotificationsStore(self.database)
         self.queries = QueriesStore(self.database)
         self.bandwidth = BandwidthBudget()
+        self.completeness_lock = Lock()

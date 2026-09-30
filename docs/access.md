@@ -25,7 +25,7 @@ different kinds of access, each with its own credential:
    [Guest read-only mode](#guest-read-only-mode) below.
 
 There's no framework underneath this — it's `http.server` plus a small
-amount of hand-written session/token/CSRF logic (`auth.py`, `access.py`).
+amount of hand-written session/token/CSRF logic (`auth.py`, `web/access.py`).
 This document describes the resulting behavior; see those two files for the
 implementation.
 
@@ -37,6 +37,8 @@ implementation.
 - [Reverse proxies and `trusted_proxies`](#reverse-proxies-and-trusted_proxies)
 - [`/metrics` and `/healthz`](#metrics-and-healthz)
 - [What's deliberately not there](#whats-deliberately-not-there)
+- [Physical cache completeness](#physical-cache-completeness)
+- [Repository and group cache sizes](#repository-and-group-cache-sizes)
 
 ## Admin login
 
@@ -263,8 +265,10 @@ suspicious input, not trusted data.
   target's token about metrics it has nothing to do with.
 - `GET /healthz` is completely open (a single `{"healthy": true/false}`,
   200/503) — it's meant for load balancers and process supervisors, and
-  reveals nothing beyond "is this repowatch instance keeping up with its
-  check schedule".
+  reports whether previously checked repository catalogs have become stale.
+  A repository with no successful check does not make it unhealthy. Verify
+  `last_check` and the package count when adding a source; a green health result
+  does not prove every configured upstream works or that packages are cached.
 
 ## What's deliberately not there
 
@@ -279,3 +283,114 @@ suspicious input, not trusted data.
   not a user database — this is a small self-hosted tool for a small
   operations team, not a multi-tenant service. If you need per-person
   audit trails for admin actions, that's out of scope today.
+
+## Physical cache completeness
+
+In the administrator dashboard, open **Storage → Measure cache coverage and size**.
+The button calls `GET /api/storage/completeness?usage=1`, using the same
+administrator session cookie. Omit `usage=1` for the coverage-only response. Guest access and host bearer tokens do not grant
+access to this scan. It is separate from the minimal `status.json` response and
+is never run by dashboard polling.
+
+Enable `nginx.enable_cache_probe` and apply the generated nginx configuration
+first. The measurement compares the configured repositories' current index
+entries with nginx's on-disk inventory. It includes packages outside warming
+whitelists and packages fetched by clients without a warm record. Deduplicated
+packages use the same accepted canonical rewrites as the nginx renderer; an old
+copy under an unused key or key version does not count. Results assume nginx is
+running the current generated routing/dedup configuration.
+
+A successful response contains `source: "cache_inventory"`, `started_at`,
+`finished_at`, `failed_leaves`, `unreadable_entries`, and `items`. Each item has:
+
+| Field | Meaning |
+|---|---|
+| `repo_id` | Configured repository id |
+| `total_packages` | Number of index entries, or `null` before the first snapshot |
+| `cached_packages` | Entries whose required cache files were observed |
+| `missing_packages` | Entries absent from an otherwise complete inventory |
+| `unknown_packages` | Entries without enough evidence to classify |
+| `percent` | `cached_packages / total_packages * 100`, rounded to two decimals; `null` when empty or uncertain |
+| `state` | `complete`, `partial`, `empty`, or `unknown` |
+| `last_check` | Catalog check time, or `null` |
+| `reason` | `no_snapshot`, `source_changed`, `incomplete_evidence`, or `null` |
+
+For example, a ten-package catalog with seven observed files and a complete scan
+reports `cached_packages: 7`, `missing_packages: 3`, `unknown_packages: 0`,
+`percent: 70`, and `state: "partial"`. If part of the scan failed, the three
+unobserved packages become unknown and `percent` becomes `null`. Known hits are
+still reported. An empty successfully checked catalog is `empty`, not 100%.
+
+For Nix, a root narinfo alone does not establish coverage. The scan uses the
+recorded closure artifact set, including metadata and NAR files. Undiscovered
+closures are unknown. Artifact history retains old encodings for purge, so missing
+recorded files conservatively produce unknown rather than proving the current
+closure incomplete. No Nix evaluation or upstream discovery runs during this scan.
+
+The endpoint returns **409** when probing is disabled, another completeness scan
+is active in the same process, or configuration/catalog snapshots changed during
+the scan; **502** means the inventory endpoint failed or returned invalid data.
+Retry after correcting the cause. Large scans can take minutes; configure any
+fronting proxy's response timeout accordingly. This measures file presence over
+a time interval, not an atomic snapshot, freshness, signature validity or a
+guarantee of offline operation. Cache files can expire or change afterwards.
+
+
+### Repository and group cache sizes
+
+The `usage=1` option adds `storage_usage` to the completeness response, using the
+same inventory and observation timestamps. It does not perform a second scan.
+Even with no repositories configured, this option scans existing cache files and
+reports them as unattributed. The coverage-only request still skips an empty
+configuration. The existing `GET /api/stats?cache_dir=1` and `repowatch stats
+--cache-dir` continue to provide overall cache-directory statistics.
+
+Two byte counts are shown for each repository and group:
+
+- **Physical bytes:** each observed cache file is assigned once to its direct
+  key's owner. Canonical dedup copies belong to their canonical repository.
+  Repositories sharing the same direct route use the alphabetically first
+  known repository id as the accounting owner. Group physical bytes are the
+  sum of their repository owners' bytes.
+- **Available bytes:** distinct observed keys referenced by current catalog
+  entries, after canonical rewrites. Each repository using a shared copy counts
+  it; each group counts it once across its members. These numbers overlap
+  between repositories and groups and must not be summed as physical usage.
+
+For example, repositories A and B in group G share a 100 MiB cache file owned by
+A. Their physical counts are 100 MiB and 0; their available counts are both
+100 MiB. Group G reports 100 MiB physical and 100 MiB available. If A and B are
+in different groups, both groups have 100 MiB available, while the physical
+counts still total 100 MiB.
+
+All sizes are cache-file lengths including nginx headers, not package payload
+sizes or filesystem allocated blocks (`du` may differ). Available bytes are file
+presence, not proof of freshness, integrity, a completed replacement or a complete
+Nix closure. Nix accounting includes known artifacts for current roots; historical
+encodings retained in artifact bookkeeping may also contribute.
+
+Physical attribution includes known old warmed files and copies under both dedup
+key bases. The files must actually appear in the inventory: bookkeeping alone
+adds no bytes. Files outside known catalogs/artifact/warm history, metadata,
+unknown keys and old key versions remain **unattributed**. Repositories without a
+snapshot or with an outdated source identity have unavailable attribution, not a
+claimed zero-byte cache. Group rows show the number of such repositories.
+
+`storage_usage` contains:
+
+| Field | Meaning |
+|---|---|
+| `total_bytes`, `file_count` | Known bytes and files observed across the scan |
+| `attributed_bytes` | Sum of repository physical bytes |
+| `unattributed_bytes`, `unattributed_files` | Observed files not assigned to a repository |
+| `unreadable_sizes`, `unreadable_keys`, `failed_leaves` | Gaps in the scan |
+| `inventory_complete` | Whether those gap counters are all zero; not a guarantee of atomicity or complete attribution |
+| `repositories` | Rows with `repo_id`, `group`, `physical_bytes`, `physical_files`, `available_bytes`, `available_files`, and nullable `reason` |
+| `groups` | Rows with nullable `group`, both byte/file counts, and `unknown_repositories` |
+
+Repository `reason` is `no_snapshot`, `source_changed`, or `null`; an ungrouped
+repository has `group: null`. The invariant is
+`sum(repository.physical_bytes) + unattributed_bytes == total_bytes`, including
+partial scans. Unreadable sizes contribute no guessed bytes; failed leaves are
+not counted. When scan gaps exist, the displayed byte totals are known subtotals
+and may be undercounts. A complete inventory can still contain unattributed files.

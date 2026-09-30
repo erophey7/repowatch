@@ -161,8 +161,8 @@ def find_orphaned_repos(config: Config, store: ServiceState) -> dict[str, dict[s
     pending_replacements/warmed_packages/prefetch_bans/nix_artifacts/
     nix_trust/failure_state) that no longer appear in config.repos —
     typically a repository removed from config.yaml, or left over from a
-    renamed id (see RepoConfig.id being immutable, "Что сделано" above:
-    a rename is a delete+add, not an update).
+    renamed id (RepoConfig.id is immutable: a rename is a delete+add,
+    not an update).
 
     request_events/host_tokens are deliberately excluded: the former has
     its own separate, already-implemented retention

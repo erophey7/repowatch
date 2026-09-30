@@ -981,3 +981,90 @@ test('empty repository list explains how administrators add the first source', a
     dom.window.close();
   }
 });
+
+test('completeness is explicit, escapes ids, distinguishes unknown and clears failed scans', async () => {
+  let scans = 0;
+  let fail = false;
+  const dom = new JSDOM(html, {
+    url: 'http://localhost/', runScripts: 'dangerously',
+    beforeParse(w) {
+      w.fetch = async raw => {
+        const url = new URL(raw, 'http://localhost');
+        let data = [];
+        if (url.pathname === '/api/auth/session') data = {role:'admin', csrf_token:'csrf'};
+        if (url.pathname === '/api/storage/completeness') {
+          assert.equal(url.searchParams.get('usage'), '1');
+          scans++;
+          await delay(15);
+          data = fail ? {error: 'Inventory unavailable'} : {
+            started_at:'start', finished_at:'end', failed_leaves:1, unreadable_entries:0,
+            items:[{repo_id:'<img src=x onerror=alert(1)>', total_packages:2, cached_packages:1,
+              missing_packages:0, unknown_packages:1, percent:null, state:'unknown', reason:'incomplete_evidence'}],
+          };
+          return {ok: !fail, json: async () => data};
+        }
+        return {ok:true, json:async () => data};
+      };
+    },
+  });
+  try {
+    await delay(30);
+    assert.equal(scans, 0);
+    const button = dom.window.document.getElementById('scan-completeness-btn');
+    const results = dom.window.document.getElementById('completeness-results');
+    button.click();
+    assert.equal(button.disabled, true);
+    button.click();
+    await delay(40);
+    assert.equal(scans, 1);
+    assert.equal(button.disabled, false);
+    assert.equal(results.querySelector('img'), null);
+    assert.match(results.textContent, /Unknown/);
+    assert.match(results.textContent, /Incomplete inventory/);
+    assert.doesNotMatch(results.textContent, /100%/);
+    fail = true;
+    button.click();
+    await delay(40);
+    assert.equal(results.textContent, '');
+    assert.match(dom.window.document.getElementById('completeness-msg').textContent, /Inventory unavailable/);
+    assert.equal(button.disabled, false);
+  } finally { dom.window.close(); }
+});
+
+
+test('storage sizes distinguish physical ownership, shared availability and incomplete totals', async () => {
+  const dom = new JSDOM(html, {
+    url:'http://localhost/', runScripts:'dangerously',
+    beforeParse(w) {
+      w.fetch = async raw => ({ok:true, json:async () =>
+        String(raw).includes('/auth/session') ? {role:'admin', csrf_token:'csrf'} : []});
+    },
+  });
+  try {
+    await delay(20);
+    const report = {
+      total_bytes:120, attributed_bytes:100, unattributed_bytes:20, unattributed_files:1,
+      inventory_complete:false, failed_leaves:1, unreadable_sizes:1, unreadable_keys:0,
+      repositories:[
+        {repo_id:'<img src=x>', physical_bytes:100, available_bytes:100, reason:null},
+        {repo_id:'b', physical_bytes:0, available_bytes:100, reason:null},
+        {repo_id:'new', physical_bytes:0, available_bytes:0, reason:'no_snapshot'},
+      ],
+      groups:[{group:'<script>bad</script>', physical_bytes:100, available_bytes:100, unknown_repositories:1},
+              {group:null, physical_bytes:0, available_bytes:0, unknown_repositories:0}],
+    };
+    const target = dom.window.document.getElementById('completeness-results');
+    target.innerHTML = dom.window.renderStorageUsage(report);
+    assert.equal(target.querySelector('img'), null);
+    assert.equal(target.querySelector('script'), null);
+    const rows = target.querySelectorAll('table')[0].querySelectorAll('tbody tr');
+    assert.match(rows[1].children[1].textContent, /^0 B/);
+    assert.match(rows[1].children[2].textContent, /^100 B/);
+    assert.equal(rows[2].children[1].textContent, '—');
+    assert.match(target.textContent, /Partial inventory/);
+    assert.match(target.textContent, /Unattributed: 20 B/);
+    assert.match(target.textContent, /repository\/ies unresolved/);
+    assert.match(target.textContent, /ungrouped/);
+    assert.match(target.textContent, /do not sum/);
+  } finally { dom.window.close(); }
+});
