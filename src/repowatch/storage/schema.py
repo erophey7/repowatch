@@ -239,6 +239,29 @@ def _migrate(conn: sqlite3.Connection) -> None:
         if "names_json" in existing:
             conn.execute("ALTER TABLE repo_state DROP COLUMN names_json")
 
+    _package_interest(conn)
+
+
+def _package_interest(conn: sqlite3.Connection) -> None:
+    """Seed durable demand once, using attributable successful client GETs only.
+
+    Old manual and automatic warming both used source='prefetch'; guessing
+    which was manual would subscribe entire previously mirrored catalogs.
+    Missing/expired history is deliberately not reconstructed from cache size.
+    """
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='package_interest'").fetchone():
+        return
+    conn.execute("CREATE TABLE package_interest (repo_id TEXT NOT NULL, source_identity TEXT NOT NULL, "
+                 "package_name TEXT NOT NULL, PRIMARY KEY (repo_id, source_identity, package_name))")
+    conn.execute(
+        "INSERT OR IGNORE INTO package_interest "
+        "SELECT p.repo_id, s.source_identity, p.package_name FROM repo_packages p "
+        "JOIN repo_state s ON s.repo_id=p.repo_id "
+        "WHERE p.package_name IS NOT NULL AND p.package_name != '' "
+        "AND s.source_identity IS NOT NULL AND s.source_identity != '' "
+        "AND EXISTS (SELECT 1 FROM request_events e WHERE e.package_repo_id=p.repo_id "
+        "AND e.package_key=p.package_key AND e.method='GET' AND e.status='200')")
+
 
 def _search_index(conn: sqlite3.Connection) -> bool:
     """Transactional derived index, rebuilt once for existing databases.

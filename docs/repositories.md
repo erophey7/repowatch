@@ -15,10 +15,10 @@ and client OS need not match.
 2. Choose **+ Add repository**. Select a type and enter the ID, upstream and
    architecture. Fill in the format-specific fields from the examples below.
 3. Choose a group for display, if useful. It does not change routing or security.
-4. Decide whether to enable **warm the cache (prefetch)**. It is selected in
-   the form by default. An empty warming whitelist allows **all** packages;
-   for a first experiment, uncheck prefetch or enter a small whitelist such as
-   `curl, wget`. Package names differ between distributions.
+4. Decide whether to enable **Automatically warm updates to used packages (prefetch)**.
+   It is selected by default. The initial check reads metadata without downloading
+   the catalog. Client downloads and manual warming establish demand; optional
+   warming lists restrict which demanded packages receive automatic updates.
 5. Save. The operation validates and persists the YAML. The daemon reloads it;
    automatic nginx reconciliation separately validates and applies routing.
 6. Check the next index result before pointing clients at the new route.
@@ -264,8 +264,9 @@ a download access list nor a complete inventory of nginx files. Clients can
 cache other packages, metadata is cached too, and UDP request logs can be lost.
 Use physical cache inventory when investigating disk usage.
 
-Enabling prefetch with an unrestricted whitelist can queue an entire initial
-catalog. Start with a few names, review bandwidth schedules, then expand.
+Enabling prefetch does not download the initial catalog. Download a package
+through nginx or select it for manual warming to track its name for future
+automatic updates. An empty whitelist does not subscribe the entire repository.
 Changing a whitelist alone does not replay all unchanged packages: use a manual
 warm action for packages already in the snapshot. Blacklists and exact bans
 still apply. [Warming policy](warming-policy.md) describes precedence and retries.

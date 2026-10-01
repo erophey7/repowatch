@@ -155,8 +155,8 @@ def test_valid_empty_gentoo_and_duplicate_slackware():
 
 
 @pytest.mark.parametrize('kind', ['gentoo', 'slackware'])
-def test_watcher_records_catalog_and_warms_via_cache(tmp_path, monkeypatch, kind):
-    import repowatch.operations.check as watcher
+def test_watcher_records_catalog_then_manual_warm_uses_cache(tmp_path, monkeypatch, kind):
+    from repowatch.operations.warm import warm_selected
     from repowatch.runtime.context import ServiceState
     r = repo(kind)
     c = Config(tmp_path / 'state.db', 300, 'http://cache', StatusServerConfig(), repos=[r])
@@ -174,6 +174,8 @@ def test_watcher_records_catalog_and_warms_via_cache(tmp_path, monkeypatch, kind
     asyncio.run(operations_check.check_repo(c, r, store))
     packages = store.repositories.get_packages(r.id)
     assert len(packages) == 3
+    assert paths == []  # First attachment reads metadata without a full warm.
+    asyncio.run(warm_selected(c, r, store, list(packages)))
     assert sorted(paths) == sorted(f'/{kind}/{kind}/{p}' for p in packages.values())
     assert all(p['status'] == 'ok' for p in store.cache.get_warmed_packages(r.id))
     asyncio.run(operations_check.check_repo(c, r, store))

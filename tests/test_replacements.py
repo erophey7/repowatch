@@ -86,7 +86,8 @@ def test_watcher_replacement_purges_before_warming_and_retries_on_unchanged_head
     config = Config(tmp_path / 'state', 300, 'http://cache.test', StatusServerConfig(), repos=[repo],
                     nginx=NginxConfig(enabled=True, enable_purge=True, enable_cache_probe=True))
     new_file = 'bar.rpm' if renamed else 'foo.rpm'
-    store.repositories.record_snapshot(snapshot('foo.rpm', digest(before)))
+    store.repositories.record_snapshot(snapshot('foo.rpm', digest(before)), source_identity=repo.catalog_identity())
+    store.cache.record_interest(repo.id, ['foo-1'], repo.catalog_identity())
     parser = operations_check.PARSERS['dnf']
     monkeypatch.setattr(parser, 'check_index_changed', AsyncMock(side_effect=[
         IndexHeadResult(False, 'new', None), IndexHeadResult(True, 'new', None)]))
@@ -161,6 +162,9 @@ def test_replacement_invalidates_without_overriding_warming_policy(tmp_path, mon
                       prefetch_whitelist=['bar*'] if policy == 'not-whitelisted' else [])
     config = Config(tmp_path / 'state', 300, 'http://cache.test', StatusServerConfig(), repos=[repo],
                     nginx=NginxConfig(enable_purge=True))
+    with store.database.connect() as conn:
+        conn.execute('UPDATE repo_state SET source_identity=? WHERE repo_id=?', (repo.catalog_identity(), repo.id))
+    store.cache.record_interest(repo.id, ['foo-1'], repo.catalog_identity())
     calls = []
     async def purge(config, repo, items):
         calls.extend(items.values())

@@ -27,7 +27,7 @@ class RepoConfig:
     type: str  # "pacman" | "apt" | "apk" | "dnf" | "apt-rpm" | "xbps" | "nix" | "gentoo" | "slackware"
     upstream: str
     arch: str
-    prefetch: bool = True
+    prefetch: bool = True  # update demanded names; never subscribe the whole catalog
     # fields specific to particular repo types
     repo_name: str | None = None       # pacman: core/extra/community
     distribution: str | None = None    # apt: bookworm/jammy/...
@@ -361,9 +361,8 @@ class Config:
     admin_password_hash: str | None = None
     syslog_listener: SyslogListenerConfig = field(default_factory=SyslogListenerConfig)
     nginx: NginxConfig = field(default_factory=NginxConfig)
-    # how many files to warm in parallel per warm_cache() run — on the
-    # first full warm of a large repo (thousands of new packages),
-    # warming one at a time sequentially would take hours
+    # Files warmed in parallel per operation, for updates to demanded names
+    # and explicit manual selections alike.
     prefetch_concurrency: int = 8
     # Shared scheduler capacity (operations.slots.RepoSlots). Cache work cannot
     # use the final quarter, rounded up; checks may wait for other checks.

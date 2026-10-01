@@ -1,5 +1,6 @@
 const fs = require('fs');
 const CACHE_DIR = __REPOWATCH_CACHE_DIR__;
+const DEDUP_GENERATION = __REPOWATCH_DEDUP_GENERATION__;
 const KEY_MARKER = '\nKEY: ';
 
 function cachePath(hash) {
@@ -18,6 +19,7 @@ function probe(r) {
         if (e.code !== 'ENOENT') { r.return(500, 'cache stat failed\n'); return; }
         result = {exists: false};
     }
+    result.generation = DEDUP_GENERATION;
     r.headersOut['Content-Type'] = 'application/json';
     r.return(200, JSON.stringify(result));
 }

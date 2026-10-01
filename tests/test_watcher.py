@@ -779,11 +779,15 @@ def test_first_failed_check_has_no_success_timestamp_and_remains_due(tmp_path, m
     assert store.repositories.get_status('r')['last_check'] is None
     assert store.repositories.get_repo_summaries()['r']['last_check'] is None
     assert _is_due(config, repo, store)
-    assert not _repo_staleness(config, store)
+    assert _repo_staleness(config, store) == [{
+        'repo_id': 'r', 'last_check': None, 'age_seconds': None,
+        'check_interval': 300, 'reason': 'never_checked',
+    }]
     monkeypatch.setitem(operations_check.PARSERS, 'pacman', _SucceedingParser)
     asyncio.run(check_repo(config, repo, store))
     assert store.repositories.get_status('r')['last_check']
     assert not _is_due(config, repo, store)
+    assert not _repo_staleness(config, store)
 
 
 @pytest.mark.parametrize('broken', ['check_interval: oops\n', 'check_concurrency: 0\n', 'invalid_utf8', 'missing'])

@@ -304,6 +304,9 @@ async def test_watcher_retries_missing_binary_without_catalog_change(tmp_path, m
         return httpx.Response(200,content=b'archive')
     client_factory(monkeypatch,handler)
     await operations_check.check_repo(c,c.repos[0],store)
+    assert store.cache.get_warmed_packages(c.repos[0].id) == []
+    keys = list(store.repositories.get_packages(c.repos[0].id))
+    await operations_warm.warm_selected(c, c.repos[0], store, keys)
     assert store.cache.get_warmed_packages(c.repos[0].id)[0]['status']=='failed'
     first=store.repositories.get_status(c.repos[0].id)['changed_at']
     missing=False
@@ -369,6 +372,8 @@ def test_real_nix_client_through_generated_nginx(tmp_path):
             except OSError:time.sleep(.02)
         store=ServiceState(c.state_db)
         asyncio.run(operations_check.check_repo(c,r,store))
+        assert store.cache.get_warmed_packages(r.id) == []
+        asyncio.run(operations_warm.warm_selected(c, r, store, list(store.repositories.get_packages(r.id))))
         warmed=store.cache.get_warmed_packages(r.id)
         assert len(warmed)==1 and warmed[0]['status']=='ok',warmed
         assert len(store.cache.get_nix_artifacts(r.id,warmed[0]['package_key']))==2

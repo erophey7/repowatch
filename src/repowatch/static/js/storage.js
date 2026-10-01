@@ -323,3 +323,82 @@ function renderStorageUsage(usage) {
     '<p class="dim">Unattributed files include unknown keys, metadata and files outside known catalogs/warm history. ' +
     'Available sizes overlap across repositories and groups; do not sum them as physical disk usage.</p>';
 }
+
+const dedupList = document.getElementById('dedup-list');
+const dedupActions = document.getElementById('dedup-actions');
+const dedupMsg = document.getElementById('dedup-msg');
+let dedupGeneration = null;
+function setDedupBusy(busy) {
+  document.getElementById('scan-dedup-btn').disabled = busy;
+  dedupActions.querySelectorAll('button').forEach(button => { button.disabled = busy; });
+  dedupList.querySelectorAll('input').forEach(input => { input.disabled = busy; });
+}
+async function scanForDedupCopies() {
+  setDedupBusy(true);
+  dedupGeneration = null;
+  dedupActions.hidden = true;
+  dedupList.hidden = true;
+  dedupMsg.className = 'form-msg';
+  dedupMsg.textContent = 'Scanning the cache for redundant copies…';
+  try {
+    const res = await fetch('/api/storage/dedup');
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    dedupGeneration = data.generation;
+    dedupList.innerHTML = data.candidates.map(row =>
+      `<label class="pick-row"><input type="checkbox" value="${esc(row.key)}" checked> ` +
+      `${esc(row.repo_id)} / ${esc(row.filename)} <span class="dim">` +
+      `(${row.bytes == null ? 'unknown size' : formatBytes(row.bytes)})</span></label>`).join('');
+    dedupList.hidden = false;
+    dedupActions.hidden = !data.candidates.length;
+    dedupMsg.textContent = `${data.total_candidates} redundant copies, ${formatBytes(data.total_bytes)} observed.` +
+      (data.truncated ? ' Showing the first 1000; scan again after removal to continue.' : '');
+  } catch (err) {
+    dedupMsg.className = 'form-msg error';
+    dedupMsg.textContent = err.message;
+  } finally { setDedupBusy(false); }
+}
+async function purgeDedupCopies() {
+  const keys = [...dedupList.querySelectorAll('input:checked')].map(input => input.value);
+  if (!keys.length) { dedupMsg.textContent = 'Nothing selected'; return; }
+  if (!dedupGeneration) { dedupMsg.textContent = 'Preview copies again before removal.'; return; }
+  setDedupBusy(true);
+  dedupMsg.className = 'form-msg';
+  let purged = 0, skipped = 0, errors = 0, bytes = 0;
+  let stopped = '';
+  try {
+    for (let offset = 0; offset < keys.length; offset += 256) {
+      dedupMsg.textContent = `Removing redundant copies… ${offset}/${keys.length} checked`;
+      const res = await fetch('/api/storage/dedup', {method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({generation: dedupGeneration, keys: keys.slice(offset, offset + 256)})});
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      for (const outcome of Object.values(data.results)) {
+        if (outcome === 'purged') purged++;
+        else if (outcome.startsWith('error')) errors++;
+        else skipped++;
+      }
+      bytes += data.observed_removed_bytes;
+      if (data.stopped) { stopped = data.stopped; break; }
+    }
+  } catch (err) { stopped = err.message; }
+  finally {
+    dedupGeneration = null;
+    dedupActions.hidden = true;
+    dedupList.hidden = true;
+    setDedupBusy(false);
+    dedupMsg.className = errors || stopped ? 'form-msg error' : 'form-msg ok';
+    dedupMsg.textContent = `Removed: ${purged}, skipped: ${skipped}, errors: ${errors}; ` +
+      `${formatBytes(bytes)} observed bytes removed.` + (stopped ? ` Stopped: ${stopped}.` : '') +
+      ' Preview again to refresh the list.';
+  }
+}
+document.getElementById('scan-dedup-btn').addEventListener('click', scanForDedupCopies);
+document.getElementById('dedup-purge-btn').addEventListener('click', purgeDedupCopies);
+document.getElementById('dedup-select-all-btn').addEventListener('click', () => {
+  dedupList.querySelectorAll('input').forEach(input => { input.checked = true; });
+});
+document.getElementById('dedup-clear-btn').addEventListener('click', () => {
+  dedupList.querySelectorAll('input').forEach(input => { input.checked = false; });
+});

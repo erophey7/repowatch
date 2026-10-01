@@ -170,8 +170,12 @@ async def warm(config, repo, store, packages: dict[str, str], force: bool) -> di
     async with httpx.AsyncClient() as client:
         cache_info_ok = None
         for key, filename in packages.items():
+            if not force and not store.automatic_warm_enabled(repo):
+                break
             if not policy.allows(key):
                 continue
+            if force:
+                store.cache.record_interest(repo.id, [key], repo.catalog_identity())
             ok, status = False, None
             try:
                 if cache_info_ok is None:
@@ -189,6 +193,8 @@ async def warm(config, repo, store, packages: dict[str, str], force: bool) -> di
                 async def download(artifact):
                     name = artifact['filename']
                     async with semaphore:
+                        if not force and not store.automatic_warm_enabled(repo):
+                            return False, None
                         result = await download_package(client, warm_url(config, repo, name), limiter,
                                                  expected_sha256=artifact.get('content_hash'),
                                                  expected_size=artifact.get('size'))
@@ -199,7 +205,7 @@ async def warm(config, repo, store, packages: dict[str, str], force: bool) -> di
                             from repowatch.cache.purge import purge_selected
                             purge_file = purge_selected_raw if config.nginx.enable_cache_probe else purge_selected
                             removed = await purge_file(config, repo, {name: name})
-                            if removed[name] in ('purged', 'not_cached'):
+                            if removed[name] in ('purged', 'not_cached') and (force or store.automatic_warm_enabled(repo)):
                                 result = await download_package(client, warm_url(config, repo, name), limiter,
                                                          expected_sha256=artifact.get('content_hash'),
                                                          expected_size=artifact.get('size'))
@@ -216,6 +222,8 @@ async def warm(config, repo, store, packages: dict[str, str], force: bool) -> di
                 import logging
                 signature_failed = signature_failed or isinstance(exc, SignatureError)
                 logging.getLogger(__name__).warning('%s: Nix warm failed for %s: %s', repo.id, key, exc)
+            if not force and not store.automatic_warm_enabled(repo):
+                break
             store.cache.record_warmed_package(repo.id, key, filename, ok, status, source='prefetch')
             outcomes[key] = ok
     if signature_failed:

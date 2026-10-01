@@ -61,7 +61,7 @@ class Database:
         with self.connect() as conn:
             tables = {
                 name: conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
-                for name in ("repo_packages", "repo_events", "request_events", "warmed_packages", "prefetch_bans")
+                for name in ("repo_packages", "repo_events", "request_events", "warmed_packages", "prefetch_bans", "package_interest")
             }
         return {
             "state_db_bytes": self.db_path.stat().st_size,

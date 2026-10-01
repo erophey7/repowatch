@@ -136,8 +136,8 @@ and adding a new one; there's no rename.
 | `type` | `pacman` \| `apt` \| `apk` \| `dnf` \| `apt-rpm` \| `xbps` \| `nix` \| `gentoo` \| `slackware` | — (required) | all | Selects the index parser. `dnf` covers any RPM-MD repository (Rocky, Fedora, openSUSE, …), not just Fedora/DNF-branded ones. `apt-rpm` is for ALT Linux-style apt-over-RPM repositories, not RPM-MD. `xbps` is Void Linux; it requires the system `zstd` binary (see the README) and does not support `verify_signature`. |
 | `upstream` | URL | — (required) | all | The real upstream mirror address. repowatch's own index checks go straight here; warm-up requests go through `cache_base_url` instead (see architecture note in the README). |
 | `arch` | string | — (required) | all | Target architecture (Nix uses `x86_64-linux` or `aarch64-linux`; otherwise `x86_64`, `amd64`, `i686`, `noarch`, …). One `RepoConfig` = one architecture; to mirror multiple architectures of the same repository, add multiple entries (see `group` below for grouping them visually). |
-| `prefetch` | bool | `true` | all | Whether repowatch actively warms new packages into the cache. Set `false` for repositories you only want indexed/tracked in `status.json` without eagerly pulling every new package (useful for very large or rarely-used repos). |
-| `prefetch_whitelist` | list of globs | `[]` | all | Warm only matching package names; empty allows all. See [warming lists](warming-policy.md). |
+| `prefetch` | bool | `true` | all | Automatically warm updates to demanded package names (observed client downloads or explicit manual warming). The first index does not download the catalog. `false` keeps index checks, cleanup, deduplication and ordinary client caching, but disables automatic package downloads. See [demand tracking](warming-policy.md#automatic-updates-and-demand). |
+| `prefetch_whitelist` | list of globs | `[]` | all | Restrict warming to matching package names; empty adds no restriction. This list does not subscribe names or trigger catalog downloads. See [warming lists](warming-policy.md). |
 | `prefetch_blacklist` | list of globs | `[]` | all | Exclude matching names, overriding the whitelist. Exact bans also win. Applies to automatic and manual warming; Nix filters roots, not their dependencies. |
 | `repo_name` | string | — (required for `pacman`) | pacman | e.g. `core`, `extra`, `community`. |
 | `distribution` | string | — (required for `apt`) | apt | e.g. `bookworm`, `jammy`, `noble-updates`. |
@@ -223,17 +223,16 @@ described above.
 An index-based repository with `verify_signature: true` and a missing/wrong keyring or
 key is not silently skipped — the check fails, the last good snapshot is
 kept, and the failure is counted for `notify_after_failures` (a webhook
-fires once the consecutive-failure threshold is reached). `/healthz`
-reflects it too, but indirectly and only in one specific case: it flags a
-repository whose *last known-good* check has gone stale relative to its
-`check_interval` — a repository that has NEVER had a single successful
-check (failing from the very first cycle) has no "last known-good"
-timestamp to compare against at all, and is therefore not reported as
-stale by `/healthz` (see `_repo_staleness()`'s own docstring: "not
-considered stale — that's an expected state, not a failure", the same rule
-that also covers a brand-new repository nobody's checked yet). For
-persistent from-the-start failures, `notify_after_failures` is the signal
-that actually fires — don't rely on `/healthz` alone to catch that case.
+fires once the consecutive-failure threshold is reached). `/healthz` returns
+503 until every configured repository has a successful check. After success,
+it tolerates transient failures until that last good check is older than three
+times the repository's effective `check_interval`. A successfully checked empty
+catalog is healthy. A valid installation with no configured repositories is also
+healthy. The status API's `stale` flag and Prometheus `repowatch_repo_stale` /
+`repowatch_healthy` use the same freshness rule; missing checks have no fabricated
+timestamp or age. Health measures catalog readiness, not process liveness or
+package availability. Use the failure notifications and logs to diagnose why a
+check fails, rather than restarting a healthy process because its upstream fails.
 
 For Nix, a successful catalog evaluation can coexist with failed binary
 signature checks during warming. Such failures mark the warm attempt as
@@ -397,6 +396,27 @@ shows an empty map, since it deliberately never opens the database. Index
 files (`Packages.gz`, `.db.tar.gz`, `repodata/*`, etc.) never participate —
 each repository's own index must always reflect its own real state.
 
+**Removing redundant physical copies.** Redirecting future requests does not
+remove files cached before a dedup mapping existed. With `nginx.enabled`,
+`enable_dedup`, `enable_purge` and `enable_cache_probe` enabled, the daemon runs
+a bounded cleanup after hourly retention. Each pass considers at most 256 keys,
+rotating through candidates between passes; the cursor resets on restart. It
+stops starting new candidates after 30 seconds (an in-flight probe or purge can
+extend that time). It uses point probes, without an automatic full cache scan.
+Large catalogs can therefore require many passes, including candidates that are
+not currently cached. Storage also provides an explicit preview and manual
+removal; see [redundant copies](access.md#redundant-dedup-copies).
+
+Cleanup derives obsolete keys from current catalogs and the accepted dedup map,
+checks that the canonical file exists, and removes only the obsolete key.
+Warmed records remain intact. Configuration/catalog changes, pending replacements,
+and an unapplied nginx generation defer deletion. Update and reconcile nginx
+before using this feature: old probe responses do not authorize cleanup.
+This is presence-based cleanup, not payload hash verification. Files may still
+be evicted by nginx or another operation between a probe and deletion; those
+operations are not a shared transaction. Historical upstreams, key versions,
+unknown files and Nix artifacts are outside this cleanup's scope.
+
 **Why `resolvers` is IPv4-only:** the generated config uses a genuinely
 *live* `resolver ... valid=300s ipv6=off;` directive together with a
 variable-based `proxy_pass` (`proxy_pass https://$some_var;`, not a literal
@@ -508,11 +528,13 @@ Unreadable files, invalid UTF-8, malformed YAML and invalid configuration values
 are reported as configuration errors. A running scheduler keeps its last valid
 configuration after a failed reload; startup still requires a valid file.
 Authenticated/read API configuration loading fails closed when the current file
-is unavailable. The existing `/healthz` exception described above is unchanged.
+is unavailable. `/healthz` also returns 503 when the current configuration cannot
+be loaded, since it cannot establish readiness for the configured repositories.
 
 ## Failed operations and cache observations
 
-Automatic warming runs for newly detected package keys. A failed initial attempt is
+For ordinary package formats, automatic warming runs for newly detected keys
+of demanded package names. A failed initial attempt is
 recorded, but an unchanged index does not schedule a retry of that new package;
 use manual warming to retry. Purge triggered by removed packages logs failures
 without maintaining a retry queue. Hourly warmed retention is a separate
@@ -549,7 +571,7 @@ The previous warmed record is removed because it does not confirm the new
 bytes. With `nginx.enable_purge`, the watcher invalidates the old and new
 filenames before warming the replacement. When dedup is enabled, recorded
 previous canonical locations are invalidated too; this can evict shared copies.
-Warming still respects `prefetch` and package bans. If warming is disabled,
+Warming still requires a demanded package name and respects `prefetch` and package bans. If warming is disabled,
 successful invalidation completes the operation without downloading a package.
 If a pending package disappears from the index, its stored purge targets are
 retained for cleanup, with no subsequent warming.

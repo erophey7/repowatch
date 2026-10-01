@@ -48,6 +48,19 @@
     <p id="completeness-msg" role="status" class="form-msg"></p>
     <div id="completeness-results"></div>
 
+    <h3>Redundant dedup copies</h3>
+    <p class="dim">Remove obsolete physical copies only when the current shared copy is
+      present. Cleanup also runs hourly in bounded batches. Requires dedup, purge and
+      cache probing. Warmed records are preserved.</p>
+    <button type="button" id="scan-dedup-btn">Preview redundant copies</button>
+    <div id="dedup-list" hidden></div>
+    <div id="dedup-actions" hidden>
+      <button type="button" id="dedup-select-all-btn">Select all</button>
+      <button type="button" id="dedup-clear-btn">Clear</button>
+      <button type="button" id="dedup-purge-btn">Remove selected copies</button>
+    </div>
+    <p id="dedup-msg" role="status" class="form-msg"></p>
+
     <h3>Orphaned repositories</h3>
     <p class="dim">SQL bookkeeping (snapshots, history, warmed/ban state, Nix artifacts,
       failure streaks) left over from a repository no longer in config.yaml — for example
@@ -176,13 +189,15 @@
 
     <div class="field checkbox">
       <input type="checkbox" id="f-prefetch" checked>
-      <label for="f-prefetch">warm the cache (prefetch)</label>
+      <label for="f-prefetch">Automatically warm updates to used packages (prefetch)</label>
     </div>
+
+    <p class="field-hint">Track packages downloaded by clients or selected for manual warming. Adding a repository does not download its catalog of packages.</p>
 
     <div class="field">
       <label for="f-prefetch-whitelist">Warming whitelist</label>
       <textarea id="f-prefetch-whitelist" rows="3" placeholder="linux-*"></textarea>
-      <span class="field-hint">One package-name glob per line. Empty allows all names.</span>
+      <span class="field-hint">One package-name glob per line. Filters warming; does not select packages to download. Empty adds no restriction.</span>
     </div>
     <div class="field">
       <label for="f-prefetch-blacklist">Warming blacklist</label>

@@ -157,12 +157,14 @@ async def check_index(config: Config, repo: RepoConfig, store: ServiceState) -> 
             'added': len(diff.new_packages), 'removed': len(diff.removed_packages),
             'modified': len(diff.modified_packages), 'packages': len(snapshot.packages)})
 
+    interested = store.cache.interested_keys(repo.id, repo.catalog_identity()) if repo.prefetch else set()
+
     if repo.type == 'nix':
         store.cache.update_nix_trust(repo.id, repo.verify_signature, repo.nix_public_keys, source=repo.upstream)
-        # A missing binary or failed artifact needs a retry even if the source
-        # catalog has not changed. Successful roots retain normal warm policy.
+        # Retry demanded roots with missing binaries or failed artifacts even
+        # on an unchanged catalog; never subscribe unrequested roots here.
         warmed = {item['package_key']: item['status'] for item in store.cache.get_warmed_packages(repo.id)}
-        retry = {key: filename for key, filename in snapshot.packages.items() if warmed.get(key) != 'ok'}
+        retry = {key: filename for key, filename in snapshot.packages.items() if key in interested and warmed.get(key) != 'ok'}
         logger.info('%s: Nix catalog checked (%d outputs, changed=%s)', repo.id, len(snapshot.packages), diff.changed)
         return CacheWork(retry, diff.removed_filenames)
 
@@ -179,7 +181,7 @@ async def check_index(config: Config, repo: RepoConfig, store: ServiceState) -> 
     )
 
     return CacheWork(
-        {key: snapshot.packages[key] for key in diff.new_packages},
+        {key: snapshot.packages[key] for key in diff.new_packages if key in interested},
         diff.removed_filenames,
     )
 

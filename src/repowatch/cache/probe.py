@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import httpx
 import logging
+import re
 from dataclasses import dataclass
 from repowatch.config.models import Config, RepoConfig
 from repowatch.parsers.base import USER_AGENT
@@ -42,6 +43,7 @@ class ProbeResult:
     exists: bool
     size: int | None = None
     mtime: str | None = None
+    generation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -85,8 +87,8 @@ async def probe(client: httpx.AsyncClient, base_url: str, key: str) -> ProbeResu
     resp.raise_for_status()
     data = resp.json()
     if not data.get("exists"):
-        return ProbeResult(exists=False)
-    return ProbeResult(exists=True, size=data.get("size"), mtime=data.get("mtime"))
+        return ProbeResult(exists=False, generation=data.get("generation"))
+    return ProbeResult(exists=True, size=data.get("size"), mtime=data.get("mtime"), generation=data.get("generation"))
 
 
 async def scan_leaf(client: httpx.AsyncClient, base_url: str, leaf: str) -> list[ScanEntry]:
@@ -209,7 +211,8 @@ async def cache_dir_size(base_url: str, *, concurrency: int = 8) -> dict:
     return result
 
 
-async def purge_raw(client: httpx.AsyncClient, base_url: str, key: str) -> str:
+async def purge_raw(client: httpx.AsyncClient, base_url: str, key: str,
+                    *, generation: str | None = None) -> str:
     """Evicts a cache entry by its exact literal key, independent of any
     current repo route (see nginx.render.render_purge()'s /purge-raw location,
     only emitted when both enable_purge and enable_cache_probe are on) —
@@ -233,9 +236,14 @@ async def purge_raw(client: httpx.AsyncClient, base_url: str, key: str) -> str:
     given, matching what a real client hitting nginx's raw variable needs
     byte-for-byte.
     """
+    suffix = ""
+    if generation is not None:
+        if not re.fullmatch(r"[0-9a-f]{64}", generation):
+            raise ValueError("Invalid cleanup generation")
+        suffix = "&cleanup_generation=" + generation
     try:
         resp = await client.get(
-            f"{base_url}/purge-raw?key={key}",
+            f"{base_url}/purge-raw?key={key}{suffix}",
             headers={"User-Agent": USER_AGENT}, timeout=30,
         )
     except httpx.RequestError as exc:

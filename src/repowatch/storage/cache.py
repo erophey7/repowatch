@@ -12,6 +12,34 @@ class CacheStore:
     def __init__(self, db: Database):
         self.db = db
 
+    def record_interest(self, repo_id: str, package_keys: list[str], source_identity: str) -> None:
+        """Remember explicit demand by catalog name, independently of warm retention."""
+        with self.db.connect() as conn:
+            conn.executemany(
+                "INSERT OR IGNORE INTO package_interest "
+                "SELECT p.repo_id, s.source_identity, p.package_name FROM repo_packages p "
+                "JOIN repo_state s ON s.repo_id=p.repo_id "
+                "WHERE p.repo_id=? AND p.package_key=? AND s.source_identity=? "
+                "AND p.package_name IS NOT NULL AND p.package_name != ''",
+                ((repo_id, key, source_identity) for key in package_keys))
+
+    def interested_keys(self, repo_id: str, source_identity: str) -> set[str]:
+        """Resolve current versions of demanded names only within the same source."""
+        with self.db.connect() as conn:
+            return {key for key, in conn.execute(
+                "SELECT p.package_key FROM repo_packages p JOIN package_interest i "
+                "ON i.repo_id=p.repo_id AND i.package_name=p.package_name "
+                "JOIN repo_state s ON s.repo_id=p.repo_id "
+                "WHERE p.repo_id=? AND i.source_identity=? AND s.source_identity=i.source_identity",
+                (repo_id, source_identity))}
+
+    def record_artifact_interest(self, repo_id: str, filename: str, source_identity: str) -> None:
+        """An observed NAR download subscribes its known roots, not unknown closures."""
+        with self.db.connect() as conn:
+            keys = [key for key, in conn.execute(
+                "SELECT package_key FROM nix_artifacts WHERE repo_id=? AND filename=?", (repo_id, filename))]
+        self.record_interest(repo_id, keys, source_identity)
+
     def update_nix_trust(self, repo_id: str, verify: bool, keys: list[str], *, source: str | None = None) -> None:
         """Recheck completed closures when signature policy changes."""
         policy = json.dumps([verify, sorted(set(keys)), source])
@@ -419,7 +447,7 @@ class CacheStore:
     # store reads/writes it too (get_pending_replacements/finish_replacement
     # above) — it's counted and deleted once, by RepositoriesStore (which
     # also writes it, from record_snapshot), not twice.
-    _REPO_TABLES = ('warmed_packages', 'prefetch_bans', 'nix_artifacts', 'nix_trust')
+    _REPO_TABLES = ('warmed_packages', 'prefetch_bans', 'nix_artifacts', 'nix_trust', 'package_interest')
 
     def get_repo_ids_with_data(self) -> set[str]:
         with self.db.connect() as conn:

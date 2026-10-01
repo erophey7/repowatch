@@ -71,7 +71,12 @@ can consume substantial bandwidth and cache space. `nix_timeout` defaults to
 600 seconds per CLI invocation; `nix_max_paths` defaults to 500000 catalog
 outputs and independently limits each dependency closure. Evaluation failure
 preserves the previous catalog. A valid output can lack a published binary;
-that is a failed warm, retried on later checks even if the catalog is unchanged.
+for a demanded root, that is a failed warm, retried on later checks even if
+the catalog is unchanged. Initial catalog evaluation does not warm every output.
+Client requests for known root narinfo or known closure artifacts, and manual
+warming, establish demand by attribute/output name; unrelated roots are never
+automatically selected. A metadata request expresses interest but does not
+establish that a complete closure is present.
 
 Warming follows `.narinfo` references and fetches every dependency's metadata
 and NAR through nginx, plus `nix-cache-info`. Shared HTTP artifacts are fetched

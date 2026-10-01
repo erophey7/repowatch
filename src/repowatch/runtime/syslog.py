@@ -277,10 +277,17 @@ def run_listener(config_path: str, initial_config: Config, store: ServiceState,
                     if parsed.path.startswith(prefix):
                         try:
                             store.cache.touch_nix_artifact(candidate.id, parsed.path[len(prefix):])
+                            if parsed.method == 'GET':
+                                store.cache.record_artifact_interest(candidate.id, parsed.path[len(prefix):], candidate.catalog_identity())
                         except Exception:
                             logger.exception('failed to refresh Nix artifact activity')
             for matched_repo_id, key in matches:
                 matched_repo = next((r for r in repos if r.id == matched_repo_id), None)
+                if matched_repo is not None and parsed.method == 'GET':
+                    try:
+                        store.cache.record_interest(matched_repo_id, [key], matched_repo.catalog_identity())
+                    except Exception:
+                        logger.exception('failed to record package interest from a real request')
                 if matched_repo is not None and matched_repo.type == 'nix':
                     # A narinfo GET cannot establish that every archive/reference
                     # was downloaded. Only closure warming records Nix success.

@@ -57,11 +57,11 @@ async def _warm_cache(
     force: bool = False,
     *, expected_hashes: dict[str, str] | None = None,
 ) -> dict[str, bool]:
-    """Hit the local cache for each new package — in parallel
-    (asyncio.Semaphore(config.prefetch_concurrency)), since on the first
-    full warm of repositories like arch-extra/debian the count of new
-    packages runs into the thousands, and sequential GETs one at a time
-    would take hours per cycle.
+    """Warm a caller-selected set through nginx with bounded parallelism.
+
+    Automatic callers select updates to demanded names before reaching this
+    transport. Explicit manual selections can also contain many packages;
+    the concurrency limit applies to both paths.
 
     The outcome of each attempt is written to ServiceState.warmed_packages
     (see web/handler.py: the dashboard shows exactly this, not the full list of
@@ -120,6 +120,8 @@ async def _warm_cache(
 
     if not tasks:
         return {}
+    if force:
+        store.cache.record_interest(repo.id, [key for key, _, _ in tasks], repo.catalog_identity())
 
     limiter = store.bandwidth.limiter(config, repo)
     semaphore = asyncio.Semaphore(config.prefetch_concurrency)
@@ -129,6 +131,8 @@ async def _warm_cache(
     async def _run(client: httpx.AsyncClient, task: tuple[str, str, str]) -> None:
         key, filename, url = task
         async with semaphore:
+            if not force and not store.automatic_warm_enabled(repo):
+                return
             digest = (expected_hashes or {}).get(key)
             if digest:
                 ok, http_status = await download_package(client, url, limiter, expected_sha256=digest)
@@ -145,6 +149,9 @@ async def _warm_cache(
         # download_package handles network failures. Bookkeeping failures in
         # _run still propagate through gather to the caller.
         await asyncio.gather(*(_run(client, task) for task in tasks))
+
+    if not outcomes:
+        return {}
 
     # "Repeated warm failures" (see notifications.py) is counted per
     # warm_cache RUN, not per package: at least one failure in this run

@@ -189,7 +189,8 @@ The repository's `unchanged` badge means no catalog change has been recorded.
 It can also appear before the first successful check or for a valid empty catalog.
 Distinguish these using `last_check` and package count: a successful empty index
 has a check timestamp and count `0`; a source that has never succeeded has no
-successful timestamp. `/healthz` does not flag that never-checked case as stale.
+successful timestamp. `/healthz` returns 503 for that never-checked case, and
+returns 200 only when all configured sources have recent successful checks.
 
 To measure cached files and per-repository/group disk usage, open **Storage →
 Measure cache coverage and size**. This is an explicit scan and can take minutes;

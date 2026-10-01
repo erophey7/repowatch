@@ -1068,3 +1068,41 @@ test('storage sizes distinguish physical ownership, shared availability and inco
     assert.match(target.textContent, /do not sum/);
   } finally { dom.window.close(); }
 });
+
+test('Storage previews redundant copies and preserves partial cleanup results', async () => {
+  const calls = [];
+  const dom = new JSDOM(html, {
+    url: 'http://localhost/', runScripts: 'dangerously',
+    beforeParse(w) {
+      w.fetch = async (raw, options = {}) => {
+        const url = new URL(raw, 'http://localhost');
+        let data = [];
+        if (url.pathname === '/api/auth/session') data = {role: 'admin', csrf_token: 'csrf'};
+        else if (url.pathname === '/api/storage/dedup') {
+          calls.push(options);
+          if (options.method === 'POST') data = {results: {old: 'purged'}, observed_removed_bytes: 1024, stopped: 'nginx generation changed'};
+          else data = {generation: 'generation', total_candidates: 1, total_bytes: 1024,
+            candidates: [{key: 'old', repo_id: '<unsafe>', filename: 'pkg.rpm', bytes: 1024}]};
+        } else if (url.pathname.endsWith('/summary')) data = {by_client_ip: [], by_path: [], by_repo: [], timeline: [], cache_hit_stats: []};
+        return {ok: true, json: async () => data};
+      };
+    }
+  });
+  try {
+    const doc = dom.window.document;
+    await delay(30);
+    assert.equal(calls.length, 0, 'preview is explicit, never part of polling');
+    doc.getElementById('scan-dedup-btn').click();
+    await delay(30);
+    assert.equal(doc.getElementById('dedup-list').querySelector('unsafe'), null);
+    assert.match(doc.getElementById('dedup-list').textContent, /<unsafe>/);
+    assert.equal(doc.getElementById('dedup-actions').hidden, false);
+    doc.getElementById('dedup-purge-btn').click();
+    await delay(30);
+    assert.deepEqual(JSON.parse(calls[1].body), {generation: 'generation', keys: ['old']});
+    assert.match(doc.getElementById('dedup-msg').textContent, /Removed: 1.*1.0 KiB.*nginx generation changed/);
+    assert.equal(doc.getElementById('dedup-actions').hidden, true);
+    assert.equal(doc.getElementById('scan-dedup-btn').disabled, false);
+    assert.equal(calls.length, 2, 'do not replace the summary with an automatic rescan');
+  } finally { dom.window.close(); }
+});

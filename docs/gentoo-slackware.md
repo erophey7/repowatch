@@ -16,8 +16,9 @@ requests go directly to upstream; package warming goes through nginx.
 
 Point `upstream` at the directory containing `Packages`. Select a binhost for
 your architecture, profile and CPU baseline; `arch` does not filter USE flags,
-resolve dependencies or select a compatible profile. Start with `prefetch: false`
-unless you intend to download the entire catalog on the first check.
+resolve dependencies or select a compatible profile. `prefetch: false` disables automatic package downloads. With `true`, repowatch
+warms updates only to demanded names; neither setting downloads the full catalog
+on the first check. Manual warming establishes demand for selected names.
 
 The parser reads the plain-text version-0 `Packages` index: a header followed
 by blank-line-separated records. `CPV` supplies the category/name and version;

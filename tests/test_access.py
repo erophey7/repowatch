@@ -53,7 +53,7 @@ def login(client):
 @pytest.mark.parametrize('path', ['/', '/dashboard', '/api/repos', '/api/config', '/api/requests',
     '/api/requests/summary', '/status/r/history', '/api/repos/r/packages', '/api/repos/r/warmed',
     '/api/repos/r/bans', '/api/tokens', '/api/auth/session', '/status.json', '/status/r.json',
-    '/api/prefetch-efficiency'])
+    '/api/prefetch-efficiency', '/api/storage/dedup'])
 def test_anonymous_routes_closed(api, path):
     client, _, _ = api
     response = client.get(path)
@@ -178,7 +178,8 @@ def test_v1_prefix_aliases_client_facing_status_api_only(api):
     ]:
         v1_response = client.get(versioned)
         plain_response = client.get(plain)
-        assert v1_response.status_code == plain_response.status_code == 200
+        expected_status = 503 if plain == '/healthz' else 200
+        assert v1_response.status_code == plain_response.status_code == expected_status
         assert v1_response.text == plain_response.text
 
 
@@ -337,7 +338,7 @@ def test_guest_reads_and_live_disable_without_password(api):
     assert client.get('/api/auth/session', headers=headers).json() == {'role': 'guest'}
     assert client.get('/metrics', headers=headers).status_code == 403
     assert client.get('/metrics').status_code == 200
-    for route in ['/api/tokens']:
+    for route in ['/api/tokens', '/api/storage/dedup']:
         assert client.get(route).status_code == 401
     with store.database.connect() as conn:
         assert conn.execute('SELECT count(*) FROM admin_sessions').fetchone()[0] == 0
@@ -352,7 +353,7 @@ def test_guest_reads_and_live_disable_without_password(api):
 
 @pytest.mark.parametrize('route', ['/api/auth/logout', '/api/config', '/api/tokens',
     '/api/tokens/test/revoke', '/api/repos', '/api/repos/r', '/api/repos/r/delete',
-    '/api/repos/r/warm', '/api/repos/r/warmed/remove', '/api/repos/r/bans', '/api/repos/r/bans/remove'])
+    '/api/storage/dedup', '/api/repos/r/warm', '/api/repos/r/warmed/remove', '/api/repos/r/bans', '/api/repos/r/bans/remove'])
 def test_guest_cannot_mutate_even_with_forged_csrf(api, route):
     client, path, _ = api
     raw = yaml.safe_load(path.read_text())
@@ -514,3 +515,38 @@ def test_completeness_scan_is_admin_only(api, monkeypatch):
     client.cookies.clear()
     assert client.get('/api/storage/completeness', headers={'Authorization': 'Bearer ' + token}).status_code == 401
     assert calls == [1, 1]
+
+
+def test_dedup_cleanup_post_requires_csrf(api):
+    client, _, _ = api
+    login(client)
+    assert client.post('/api/storage/dedup', json={'keys': ['x'], 'generation': 'old'}).status_code == 403
+
+
+@pytest.mark.parametrize("route", ["/healthz", "/api/v1/healthz"])
+def test_health_readiness_lifecycle_is_public_and_minimal(api, route):
+    from repowatch.models import RepoSnapshot
+
+    client, path, store = api
+    response = client.get(route)
+    assert response.status_code == 503
+    assert response.json() == {"healthy": False}
+    store.repositories.record_snapshot(RepoSnapshot(repo_id="r", packages={}))
+    response = client.get(route)
+    assert response.status_code == 200
+    assert response.json() == {"healthy": True}
+    raw = yaml.safe_load(path.read_text())
+    raw["repos"].append(dict(raw["repos"][0], id="new"))
+    path.write_text(yaml.safe_dump(raw))
+    response = client.get(route)
+    assert response.status_code == 503
+    assert response.json() == {"healthy": False}
+    raw["repos"] = []
+    path.write_text(yaml.safe_dump(raw))
+    response = client.get(route)
+    assert response.status_code == 200
+    assert response.json() == {"healthy": True}
+    path.write_text("invalid: [")
+    response = client.get(route)
+    assert response.status_code == 503
+    assert response.json() == {"healthy": False}

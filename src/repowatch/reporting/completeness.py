@@ -10,7 +10,7 @@ import httpx
 
 from repowatch.cache import probe
 from repowatch.config.models import Config
-from repowatch.nginx.render import resolve_dedup_pairs
+from repowatch.cache.dedup import dedup_keys
 from repowatch.routing import CacheKeyBuilder, package_path
 from repowatch.runtime.context import ServiceState
 from repowatch.reporting.storage_usage import storage_usage
@@ -18,24 +18,8 @@ from repowatch.web.access import load_request_config
 
 
 def _dedup_keys(config: Config, store: ServiceState, builder: CacheKeyBuilder) -> dict[str, str]:
-    """Resolve exactly the renderer's accepted rewrites, including chains and conflicts."""
-    if not config.nginx.enable_dedup:
-        return {}
-    rows = store.cache.find_duplicate_files()
-    rewrites = {source.lower(): target for source, target in resolve_dedup_pairs(config, rows)}
-    repos = {repo.id: repo for repo in config.repos}
-    bound = {repo.id: builder.for_repo(repo) for repo in config.repos}
-    targets = {package_path(repos[canonical], filename): bound[canonical](filename)
-               for _, canonical, filename in rows if canonical in repos}
-    keys = {}
-    for source, target in rewrites.items():
-        seen = {source}
-        while target.lower() in rewrites and target.lower() not in seen:
-            seen.add(target.lower())
-            target = rewrites[target.lower()]
-        # An empty key denotes an unresolved cycle, never a cache hit.
-        keys[source] = '' if target.lower() in seen else targets.get(target, '')
-    return keys
+    """Load duplicate identities once and resolve the renderer's accepted rewrites."""
+    return dedup_keys(config, store.cache.find_duplicate_files(), builder) if config.nginx.enable_dedup else {}
 
 
 def summarize(config: Config, catalogs: dict, inventory: probe.Inventory,

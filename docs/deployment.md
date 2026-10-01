@@ -142,7 +142,9 @@ every ten seconds. A long warm does not hold up that reload or the separate
 retention scheduler. Index checks and cache work share `check_concurrency`, with
 capacity reserved for checks; see the [configuration reference](configuration.md#top-level-fields).
 A repository's next check waits for its own previous check and cache work to finish.
-Editing its settings takes effect on the next operation; removing it cancels and
+Most setting edits take effect on the next operation. Disabling prefetch stops
+queued automatic downloads after the next scheduler reload; active transfers
+may finish. Removing a repository cancels and
 drains its active task. Ordinary interrupted warming is not a persistent retry queue.
 
 **`repowatch-status.service` + `repowatch-check.timer`** is the split
@@ -463,3 +465,9 @@ leaks into them, only into where `install` itself writes on the build host.
   see the "What's deliberately not there" section of
   [access.md](access.md) for the reasoning; put a reverse proxy or firewall
   in front if you need that.
+
+
+Disabling a repository's `prefetch` stops new queued automatic package downloads
+once the daemon reloads the edit (normally on the next ten-second tick). Active
+transfers may finish, and index checking and cleanup continue. Manual warming
+is independent. See [demand and update selection](warming-policy.md#automatic-updates-and-demand).

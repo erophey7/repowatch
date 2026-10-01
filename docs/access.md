@@ -263,12 +263,16 @@ suspicious input, not trusted data.
   tying it to the admin password or a host token would mean either sharing
   admin credentials with your monitoring stack or teaching every scraped
   target's token about metrics it has nothing to do with.
-- `GET /healthz` is completely open (a single `{"healthy": true/false}`,
-  200/503) — it's meant for load balancers and process supervisors, and
-  reports whether previously checked repository catalogs have become stale.
-  A repository with no successful check does not make it unhealthy. Verify
-  `last_check` and the package count when adding a source; a green health result
-  does not prove every configured upstream works or that packages are cached.
+- `GET /healthz` is completely open (only `{"healthy": true/false}`,
+  HTTP 200/503). It reports catalog readiness: every configured repository must
+  have a successful check no older than three times its effective check interval.
+  A newly added repository or one failing from its first check returns 503 until
+  it succeeds. A successful empty catalog is valid; an installation with no
+  configured repositories returns 200. An invalid current configuration returns
+  503, even if the scheduler continues with its last valid configuration.
+  `/api/v1/healthz` has the same contract. This is not a process-liveness probe:
+  restarting the service cannot repair an unavailable upstream. A green result
+  does not guarantee that packages are cached or that every download will succeed.
 
 ## What's deliberately not there
 
@@ -394,3 +398,36 @@ repository has `group: null`. The invariant is
 partial scans. Unreadable sizes contribute no guessed bytes; failed leaves are
 not counted. When scan gaps exist, the displayed byte totals are known subtotals
 and may be undercounts. A complete inventory can still contain unattributed files.
+
+
+### Redundant dedup copies
+
+Storage → **Preview redundant copies** scans the physical cache on demand and
+lists obsolete copies whose current canonical file is also present. It shows
+up to 1000 candidates and the observed byte total; unknown sizes contribute no
+bytes. Select copies and click **Remove selected copies**. The browser submits
+batches of at most 256 keys and keeps partial results if a batch stops. Scan
+again to refresh the list or continue beyond the preview limit.
+
+The administrator-only API is `GET /api/storage/dedup` for preview and
+`POST /api/storage/dedup` with the usual session cookie and CSRF token:
+
+```json
+{"generation": "<generation returned by preview>", "keys": ["<key returned by preview>"]}
+```
+
+A POST rederives candidates on the server; submitting an arbitrary key cannot
+turn this into a general purge endpoint. The response contains per-key `results`,
+`observed_removed_bytes`, and `stopped` (null if the batch finished). A skipped
+key no longer qualifies or lacks one of its copies. HTTP 409 means the evidence
+is stale, the features are disabled, or another cleanup/preview is running.
+A mid-batch change returns partial results with `stopped`; inspect this field
+even on HTTP 200. The byte count is the pre-purge observed file size, including
+nginx headers, not a filesystem allocation measurement.
+
+The same cleanup runs automatically after hourly retention when nginx, dedup,
+purge and cache probing are enabled. It retains current canonical keys and
+warmed bookkeeping. It does not implement warm-list enforcement: client-fetched
+packages outside the warm list are still valid cached packages. See
+[dedup cleanup limits](configuration.md) for the safety
+checks and scheduling limits.

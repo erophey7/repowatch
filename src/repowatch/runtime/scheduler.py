@@ -107,7 +107,8 @@ class RepoDispatcher:
     wait for repository tasks. New repositories are queued on the next tick. A repository never has two tasks at once.
     Removing a repository cancels its task; editing one lets the running
     task finish with the settings it started with, and the next task uses the
-    new ones (cancelling would lose the unwarmed remainder of a one-shot diff).
+    new ones. Disabling prefetch or changing the source also stops admission
+    of queued automatic downloads; in-flight transfers may finish.
     """
 
     def __init__(self, store: ServiceState) -> None:
@@ -121,6 +122,7 @@ class RepoDispatcher:
 
         Raises the SQLite error of a finished task, if any.
         """
+        self._store.automatic_warm_repos = {repo.id: repo for repo in config.repos}
         self._reap()
         if self._slots is None:
             self._slots = RepoSlots(config.check_concurrency)
@@ -163,6 +165,18 @@ def _reap_prune(task: asyncio.Task[None] | None) -> asyncio.Task[None] | None:
             task.result()
         return None
     return task
+
+
+async def _run_retention(config: Config, store: ServiceState, config_path: str) -> None:
+    """Run regular retention, then a bounded cleanup under freshly loaded settings."""
+    from repowatch.operations.dedup_cleanup import automatic_cleanup
+    await prune_all(config, store)
+    try:
+        current = load_config(config_path)
+    except ConfigError:
+        logger.warning("invalid configuration; deferring dedup cleanup")
+        return
+    await automatic_cleanup(current, store, config_path=config_path)
 
 
 async def run_forever(
@@ -211,7 +225,7 @@ async def run_forever(
 
             prune_task = _reap_prune(prune_task)
             if prune_task is None and time.monotonic() - last_prune >= _PRUNE_INTERVAL_SECONDS:
-                prune_task = asyncio.create_task(prune_all(config, store))
+                prune_task = asyncio.create_task(_run_retention(config, store, config_path))
                 last_prune = time.monotonic()
 
             await asyncio.sleep(_SCHEDULER_TICK_SECONDS)

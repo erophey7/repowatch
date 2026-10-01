@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import ipaddress
 import logging
 import re
@@ -53,6 +55,13 @@ def _path(value: str) -> str:
     return value
 
 
+def dedup_generation(config: Config, pairs: list[tuple[str, str]]) -> str:
+    """Identify the applied routing/key basis and accepted dedup rewrites."""
+    policy = (compute_routes(config), config.nginx.enable_dedup,
+              config.nginx.enable_purge, config.nginx.enable_cache_probe, sorted(pairs))
+    return hashlib.sha256(json.dumps(policy, sort_keys=True).encode()).hexdigest()
+
+
 def render(config: Config, *, cache_dir: str = '/var/cache/nginx/repowatch',
            access_log: str = '/var/log/nginx/repo-cache.access.log',
            purge_conf: str = '/etc/nginx/repowatch/purge.conf',
@@ -82,6 +91,10 @@ def render(config: Config, *, cache_dir: str = '/var/cache/nginx/repowatch',
         # why fixed defaults aren't safe once the map has real entries.
         max_size, bucket_size = _dedup_hash_sizes(dedup_pairs or [])
         lines += [f'map_hash_max_size {max_size};', f'map_hash_bucket_size {bucket_size};']
+    if settings.enable_purge and settings.enable_cache_probe:
+        generation = dedup_generation(config, dedup_pairs or [])
+        lines += ['map $arg_cleanup_generation $repowatch_cleanup_generation_valid {',
+                  '    default 0;', '    "" 1;', f'    "~^{generation}$" 1;', '}']
     if config.syslog_listener.enabled:
         # Distinguishes repowatch's OWN traffic (index checks + prefetch/
         # warm_cache — see parsers/base.py's USER_AGENT, already sent on
@@ -334,6 +347,7 @@ def render_purge(config: Config) -> str:
                 '    location = /purge-raw {',
                 '        allow 127.0.0.1;',
                 '        deny all;',
+                '        if ($repowatch_cleanup_generation_valid = 0) { return 409; }',
                 '        proxy_cache_purge repo_cache $arg_key;',
                 '    }',
             ]
@@ -344,7 +358,8 @@ def _js_string(value: str) -> str:
     return "'" + value.replace('\\', '\\\\').replace("'", "\\'") + "'"
 
 
-def render_probe_js(config: Config, *, cache_dir: str = '/var/cache/nginx/repowatch') -> str:
+def render_probe_js(config: Config, *, cache_dir: str = '/var/cache/nginx/repowatch',
+                    dedup_pairs: list[tuple[str, str]] | None = None) -> str:
     """njs script body for the /cache-probe and /cache-scan locations
     (see render_probe_conf()) — read-only cache
     introspection running inside the nginx worker itself (already `user
@@ -376,6 +391,7 @@ def render_probe_js(config: Config, *, cache_dir: str = '/var/cache/nginx/repowa
         return '\n'.join(lines) + '\n'
     script = Path(__file__).with_name("probe.js").read_text(encoding="utf-8")
     script = script.replace("__REPOWATCH_CACHE_DIR__", _js_string(cache_dir))
+    script = script.replace("__REPOWATCH_DEDUP_GENERATION__", _js_string(dedup_generation(config, dedup_pairs or [])))
     return "\n".join(lines) + "\n" + script
 
 

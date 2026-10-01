@@ -19,6 +19,7 @@ async def refresh_replacements(config: Config, repo: RepoConfig, store: ServiceS
         return
     from repowatch.warming_policy import WarmingPolicy
     policy = WarmingPolicy(repo, store)
+    interested = store.cache.interested_keys(repo.id, repo.catalog_identity())
     for item in pending:
         key = item['package_key']
         error = None
@@ -39,7 +40,7 @@ async def refresh_replacements(config: Config, repo: RepoConfig, store: ServiceS
                 if results[key] not in ('purged', 'not_cached'):
                     error = results[key]
                     break
-        if error is None and item['filename'] and repo.prefetch and policy.allows(key):
+        if error is None and item['filename'] and repo.prefetch and key in interested and policy.allows(key):
             warmed = await warm_cache(
                 config, repo, store, {key: item['filename']},
                 expected_hashes={key: item['content_hash']} if item['content_hash'] else None)

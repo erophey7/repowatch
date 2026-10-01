@@ -93,22 +93,28 @@ def repos_list_payload(config_path: str | Path, store: ServiceState, *, current:
 def _repo_staleness(
     config: Config, store: ServiceState, statuses: dict[str, dict] | None = None,
 ) -> list[dict]:
-    """List of repositories whose last check is older than
-    interval * _HEALTHZ_STALE_MULTIPLIER — shared by healthz_payload and
-    metrics_payload so the "suspiciously stale" threshold isn't duplicated.
-    A repository that has never been checked at all (just added / service
-    just started) is not considered stale — that's an expected state, not
-    a failure."""
+    """Repositories without a successful check or with an expired last check.
+
+    Shared by status, health and metrics. An empty successful catalog is fresh;
+    a missing timestamp cannot establish readiness, including during startup.
+    """
     now = datetime.now(timezone.utc)
     stale = []
     if statuses is None:
         statuses = store.repositories.get_repo_summaries()
     for repo in config.repos:
         status = statuses.get(repo.id)
+        interval = config.effective_check_interval(repo)
         if not status or not status.get("last_check"):
+            stale.append({
+                "repo_id": repo.id,
+                "last_check": None,
+                "age_seconds": None,
+                "check_interval": interval,
+                "reason": "never_checked",
+            })
             continue
         last_check = datetime.fromisoformat(status["last_check"])
-        interval = config.effective_check_interval(repo)
         age_seconds = (now - last_check).total_seconds()
         if age_seconds > interval * _HEALTHZ_STALE_MULTIPLIER:
             stale.append(
@@ -150,18 +156,16 @@ def status_payload(config_path: str | Path, store: ServiceState,
 
 
 def healthz_payload(config_path: str | Path, store: ServiceState, *, current: Config | None = None) -> tuple[int, dict]:
-    """200 if every repository has been checked recently relative to its own
-    check_interval; otherwise 503 with the list of stale ones.
+    """Report catalog readiness, not process liveness or package availability.
 
-    A broken config.yaml is not by itself considered an unhealthy state —
-    run_forever() keeps running on the last valid config in that case (see
-    operations/check.py), so here we simply can't check freshness and silently
-    answer ok.
+    Every configured repository needs a recent successful check. An invalid
+    current configuration prevents readiness evaluation even if the scheduler
+    continues using its last valid configuration. No configured repos is ready.
     """
     try:
         current = current if current is not None else load_config(config_path)
     except ConfigError:
-        return 200, {"ok": True, "warning": "config.yaml is currently invalid, check skipped"}
+        return 503, {"ok": False, "error": "config.yaml is currently invalid"}
 
     stale = _repo_staleness(current, store)
     if stale:

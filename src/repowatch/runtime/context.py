@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from threading import Lock
 from repowatch.bandwidth import BandwidthBudget
+from repowatch.config.models import RepoConfig
 from repowatch.storage.cache import CacheStore
 from repowatch.storage.database import Database
 from repowatch.storage.notifications import NotificationsStore
@@ -24,3 +25,12 @@ class ServiceState:
         self.queries = QueriesStore(self.database)
         self.bandwidth = BandwidthBudget()
         self.completeness_lock = Lock()
+        self.dedup_cleanup_lock = Lock()
+        self.dedup_cleanup_cursor = ""
+        self.automatic_warm_repos: dict[str, RepoConfig] | None = None
+
+    def automatic_warm_enabled(self, repo: RepoConfig) -> bool:
+        """Stop queued automatic downloads after the scheduler observes an opt-out."""
+        repos = self.automatic_warm_repos
+        current = repo if repos is None else repos.get(repo.id)
+        return bool(current and current.prefetch and current.catalog_identity() == repo.catalog_identity())

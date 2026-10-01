@@ -92,7 +92,7 @@ def metrics_payload(config_path: str | Path, store: ServiceState, *, current: Co
     lines.append(
         "# HELP repowatch_repo_key_expiring_soon Whether the soonest expiring key is within "
         "key_expiry_warning_days (1) or not (0) — absent (not 0) when there is no known expiry "
-        "to compare, same reasoning as repowatch_repo_stale."
+        "to compare."
     )
     lines.append("# TYPE repowatch_repo_key_expiring_soon gauge")
     for repo in current.repos:
@@ -107,8 +107,8 @@ def metrics_payload(config_path: str | Path, store: ServiceState, *, current: Co
     stale_ids = {item["repo_id"] for item in stale}
     lines.append(
         "# HELP repowatch_repo_stale Whether this repo's last check is older than "
-        f"{_HEALTHZ_STALE_MULTIPLIER}x its check_interval (1) or not (0) — a repo never "
-        "checked at all is not stale, see /healthz."
+        f"{_HEALTHZ_STALE_MULTIPLIER}x its check_interval or has never succeeded (1), "
+        "otherwise 0; see /healthz."
     )
     lines.append("# TYPE repowatch_repo_stale gauge")
     for repo in current.repos:

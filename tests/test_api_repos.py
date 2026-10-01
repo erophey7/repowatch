@@ -556,15 +556,19 @@ def test_remove_warmed_package_unknown_repo_404(tmp_path):
     assert status == 404
 
 
-def test_healthz_ok_when_never_checked(tmp_path):
-    """A fresh repository (never checked) is not considered stale — that's
-    the expected state right after startup/adding, not a failure."""
+def test_healthz_unready_when_never_checked(tmp_path):
     config_path, store = _setup(tmp_path)
-
     status, data = healthz_payload(config_path, store)
-
+    assert status == 503
+    assert data == {"ok": False, "stale_repos": [{
+        "repo_id": "alpine-test", "last_check": None, "age_seconds": None,
+        "check_interval": 300, "reason": "never_checked",
+    }]}
+    status, body = metrics_payload(config_path, store)
     assert status == 200
-    assert data == {"ok": True}
+    assert 'repowatch_repo_stale{repo_id="alpine-test"} 1' in body
+    assert "repowatch_healthy 0" in body
+    assert 'repowatch_repo_last_check_timestamp_seconds{' not in body
 
 
 def test_healthz_ok_right_after_check(tmp_path):
@@ -609,15 +613,14 @@ def test_healthz_ok_when_stale_but_within_threshold(tmp_path):
     assert data == {"ok": True}
 
 
-def test_healthz_ok_on_broken_config(tmp_path):
+def test_healthz_unready_on_broken_config(tmp_path):
     config_path, store = _setup(tmp_path)
     config_path.write_text("this is not valid yaml: [unclosed")
 
     status, data = healthz_payload(config_path, store)
 
-    assert status == 200
-    assert data["ok"] is True
-    assert "warning" in data
+    assert status == 503
+    assert data == {"ok": False, "error": "config.yaml is currently invalid"}
 
 
 def test_metrics_payload_includes_repo_gauges(tmp_path):

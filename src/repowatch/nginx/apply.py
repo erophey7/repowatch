@@ -103,7 +103,7 @@ def apply(config_path: str, policy_path: str, *, force: bool = False, use_system
         purge_candidate = render_purge(config)
         dedup_candidate = render_dedup(config, dedup_pairs)
         probe_conf_candidate = render_probe_conf(config)
-        probe_js_candidate = render_probe_js(config, cache_dir=policy['cache_dir'])
+        probe_js_candidate = render_probe_js(config, cache_dir=policy['cache_dir'], dedup_pairs=dedup_pairs)
         digest = hashlib.sha256((
             candidate + purge_candidate + dedup_candidate + probe_conf_candidate + probe_js_candidate
         ).encode()).hexdigest()

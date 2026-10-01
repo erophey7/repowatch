@@ -14,6 +14,7 @@ from repowatch.config.load import load_config
 from repowatch.config.models import Config
 from repowatch.errors import ConfigError
 from repowatch.reporting.metrics import metrics_payload
+from repowatch.web.dedup_cleanup import dedup_cleanup_payload
 from repowatch.reporting.completeness import completeness_payload
 from repowatch.reporting.statistics import (
     paged_payload, requests_summary_payload, prefetch_efficiency_payload, stats_payload,
@@ -292,6 +293,11 @@ def make_handler(
                 self._json(payload, status=status)
                 return
 
+            if parsed.path == "/api/storage/dedup":
+                status, payload = dedup_cleanup_payload(config_path, store, current=self.current)
+                self._json(payload, status=status)
+                return
+
             if parsed.path == "/api/storage/orphans":
                 status, payload = orphaned_repos_payload(config_path, store, current=self.current)
                 self._json(payload, status=status)
@@ -468,6 +474,11 @@ def make_handler(
                 and parts[4] == "remove"
             ):
                 status, payload = unban_package_payload(config_path, store, parts[2], password, body)
+                self._json(payload, status=status)
+                return
+
+            if parsed.path == "/api/storage/dedup":
+                status, payload = dedup_cleanup_payload(config_path, store, admin_session=password, body=body)
                 self._json(payload, status=status)
                 return
 

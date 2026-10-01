@@ -4,8 +4,8 @@ A lightweight, self-hosted "smart cache" for package repositories: Arch
 (pacman), Debian/Ubuntu (apt), Alpine (apk), Void (xbps), Gentoo binary packages, Slackware, Nix, and RPM-based
 distributions (RPM-MD: Rocky, Fedora, openSUSE, etc.). Unlike a plain caching proxy
 (apt-cacher-ng, pacoloco, and similar), repowatch actively watches upstream
-indexes on a schedule, can prefetch new packages ahead of any client
-request, and exposes machine-readable state ("what changed and when") over
+indexes on a schedule, can prefetch updates to packages already requested by clients or
+selected for manual warming, and exposes machine-readable state ("what changed and when") over
 HTTP as `status.json`, so agents on hosts (or any external system —
 Ansible, cron jobs, whatever) can decide for themselves whether an update
 is needed.
