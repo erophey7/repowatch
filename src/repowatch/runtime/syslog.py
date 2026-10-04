@@ -8,6 +8,7 @@ syslog_listener.enabled in config.yaml; the port is not opened by default."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Iterator
 import logging
 import re
 import socket
@@ -102,27 +103,63 @@ def match_repo_id(path: str, repos: list[RepoConfig]) -> str | None:
     return RepoMatcher(repos).match(path)
 
 
-def package_path_index(repo: RepoConfig, packages: dict[str, str]) -> dict[str, tuple[str, ...]]:
-    """Index complete local routes, preserving every owner of the same file.
+class PackagePathIndex(Mapping[str, tuple[str, ...]]):
+    """A route index sharing ordinary filename strings with the package catalog.
 
-    Owners are tuples: the collector stops tracking a tuple of strings, so a
-    catalog of hundreds of thousands of routes does not add a container per
-    route to every full garbage collection, which stops all threads."""
-    index: dict[str, list[str]] = {}
+    Only the prefix is stored once per repository. Exceptional URL spellings
+    retain the same urlsplit/unquote behavior as incoming syslog requests.
+    Values are tuples so the collector can stop tracking string-only owners.
+    """
+
+    def __init__(self, prefix: str):
+        """Keep one route prefix and separate normal and exceptional path maps."""
+        self.prefix = prefix
+        self.relative: dict[str, tuple[str, ...]] = {}
+        self.absolute: dict[str, tuple[str, ...]] = {}
+
+    def __getitem__(self, path: str) -> tuple[str, ...]:
+        """Look up a normalized full path, raising KeyError for an absent route."""
+        if path.startswith(self.prefix):
+            return self.relative[path[len(self.prefix):]]
+        return self.absolute[path]
+
+    def get(self, path: str, default=None):
+        """Look up a normalized route without exception overhead on a miss."""
+        # Misses are common across repository prefixes; avoid KeyError per packet.
+        if path.startswith(self.prefix):
+            return self.relative.get(path[len(self.prefix):], default)
+        return self.absolute.get(path, default)
+
+    def __iter__(self) -> Iterator[str]:
+        """Reconstruct full paths only when a caller enumerates the mapping."""
+        yield from (self.prefix + filename for filename in self.relative)
+        yield from self.absolute
+
+    def __len__(self) -> int:
+        """Count distinct normalized routes across both disjoint maps."""
+        return len(self.relative) + len(self.absolute)
+
+
+def package_path_index(repo: RepoConfig, packages: dict[str, str]) -> PackagePathIndex:
+    """Index every route owner without retaining a second complete path string."""
     prefix = package_prefix(repo) + "/"
+    index = PackagePathIndex(prefix)
+    ordinary_prefix = not prefix.startswith('//') and not any(c in prefix for c in '%?#\t\r\n')
     for key, filename in packages.items():
-        if filename:
-            path = prefix + filename
-            # Ordinary absolute paths need neither URL parsing nor decoding.
-            # Preserve urlsplit/unquote semantics for authorities, URL suffixes,
-            # percent escapes and characters stripped by the URL parser.
-            if path.startswith('//') or any(char in path for char in '%?#\t\r\n'):
-                path = unquote(urlsplit(path).path)
-            index.setdefault(path, []).append(key)
-    return {path: tuple(keys) for path, keys in index.items()}
+        if not filename:
+            continue
+        if (ordinary_prefix and not (prefix == '/' and filename.startswith('/'))
+                and not any(c in filename for c in '%?#\t\r\n')):
+            target, name = index.relative, filename
+        else:
+            path = unquote(urlsplit(prefix + filename).path)
+            target, name = ((index.relative, path[len(prefix):]) if path.startswith(prefix)
+                            else (index.absolute, path))
+        target[name] = target.get(name, ()) + (key,)
+    return index
 
 
-def match_all_package_keys(path: str, by_path: dict[str, dict[str, list[str]]]) -> list[tuple[str, str]]:
+def match_all_package_keys(path: str, by_path: dict[str, Mapping[str, tuple[str, ...]]]) -> list[tuple[str, str]]:
     """Match the actual route; shared pool URLs can have several catalog owners."""
     path = unquote(urlsplit(path).path)
     return [(repo_id, key) for repo_id, index in by_path.items() for key in index.get(path, ())]
@@ -132,7 +169,7 @@ def refresh_package_indexes(
     repos: list[RepoConfig],
     store: ServiceState,
     packages_by_repo: dict[str, dict[str, str]],
-    by_path: dict[str, dict[str, tuple[str, ...]]],
+    by_path: dict[str, Mapping[str, tuple[str, ...]]],
     last_revision: dict[str, tuple[int | None, str]],
 ) -> None:
     """Refresh changed generations/routes and discard removed repositories.
@@ -195,7 +232,7 @@ def run_listener(config_path: str, initial_config: Config, store: ServiceState,
     repos = initial_config.repos
     matcher = RepoMatcher(repos)
     packages_by_repo: dict[str, dict[str, str]] = {}
-    by_path: dict[str, dict[str, tuple[str, ...]]] = {}
+    by_path: dict[str, Mapping[str, tuple[str, ...]]] = {}
     last_revision: dict[str, tuple[int | None, str]] = {}
 
     refresh_package_indexes(repos, store, packages_by_repo, by_path, last_revision)

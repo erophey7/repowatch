@@ -36,6 +36,7 @@ class IndexParser(ABC):
     def __init__(self, repo: RepoConfig, timeout: int = 30):
         self.repo = repo
         self.timeout = timeout
+        self.signers: list[tuple[str, str]] = []
 
     @abstractmethod
     def index_url(self) -> str:
@@ -53,9 +54,11 @@ class IndexParser(ABC):
         """
 
     async def fetch(self, client: httpx.AsyncClient) -> RepoSnapshot:
+        self.signers = []
         packages = await self.fetch_packages(client)
         return RepoSnapshot(
             repo_id=self.repo.id,
+            signers=self.signers.copy(),
             packages={p.key: p.filename or "" for p in packages},
             names={p.key: p.name for p in packages},
             content_hashes={p.key: p.content_hash for p in packages if p.content_hash},

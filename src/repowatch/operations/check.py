@@ -17,41 +17,26 @@ from repowatch.operations.warm import warm_cache
 from repowatch.parsers import PARSERS
 from repowatch.parsers.base import IndexHeadResult
 from repowatch.runtime.context import ServiceState
-from repowatch.verification.gpg import soonest_key_expiry
+from repowatch.verification.gpg import KeyExpiry, signing_key_expiry
 
 logger = logging.getLogger(__name__)
 
 
-async def _check_key_expiry(config: Config, repo: RepoConfig, store: ServiceState) -> None:
-    """Trust state (GPG key expiry) — runs unconditionally at
-    the very start of every check cycle, independent of whether the index
-    itself turns out to be unchanged: a quiet repository that rarely
-    changes must still get its signing key's expiry reassessed on
-    schedule, not only when there happens to be a new snapshot to record.
-
-    apk is excluded — its embedded RSA keys (see verification/apk.py) have no
-    expiry concept at all, unlike apt/pacman/dnf/apt-rpm's GPG keys.
-    Notification reuses the same (repo_id, kind) consecutive-streak
-    mechanism as repeated warm/gpg-verification failures (kind=
-    "key_expiry") — "still within the warning window" behaves exactly like
-    "still failing" for that purpose: notify once when first crossed, once
-    more on recovery (renewed past the threshold), silent in between.
-    """
-    if repo.verify_signature and repo.type not in ("apk", "nix") and repo.keyring_path:
-        expires_at = await asyncio.to_thread(soonest_key_expiry, repo.keyring_path)
-    else:
-        expires_at = None
-    store.repositories.record_key_expiry(repo.id, expires_at)
-
-    if expires_at is None:
-        # Unknown expiry is not evidence of recovery. Preserve the streak
-        # until a known expiry outside the warning window is observed.
+async def _check_key_expiry(config: Config, repo: RepoConfig, store: ServiceState,
+                            signers: list[tuple[str, str]] | None = None) -> None:
+    """Diagnose actual signers after verification; unknown cannot signal recovery."""
+    expiry = KeyExpiry()
+    if repo.verify_signature and repo.type not in ("apk", "nix") and repo.keyring_path and signers:
+        expiry = await asyncio.to_thread(signing_key_expiry, repo.keyring_path, signers)
+    store.repositories.record_key_expiry(repo.id, expiry.expires_at, known=expiry.known)
+    if not expiry.known:
         return
-    remaining_days = (datetime.fromisoformat(expires_at) - datetime.now(timezone.utc)).days
-    if remaining_days < config.key_expiry_warning_days:
+    remaining_days = ((datetime.fromisoformat(expiry.expires_at) - datetime.now(timezone.utc)).days
+                      if expiry.expires_at else None)
+    if remaining_days is not None and remaining_days < config.key_expiry_warning_days:
         await record_failure_and_maybe_notify(
             config, store, repo.id, "key_expiry",
-            f"soonest key in keyring expires {expires_at} ({remaining_days} day(s) left)",
+            f"verified signing keys expire {expiry.expires_at} ({remaining_days} day(s) left)",
         )
     else:
         await record_success_and_maybe_notify(config, store, repo.id, "key_expiry")
@@ -133,6 +118,8 @@ async def check_index(config: Config, repo: RepoConfig, store: ServiceState) -> 
         except Exception:
             logger.exception("failed to fetch index for %s, skipping this cycle", repo.id)
             return
+
+    await _check_key_expiry(config, repo, store, snapshot.signers)
 
     # No condition on repo.verify_signature here: AptParser now
     # cross-checks the SHA256 of the selected Packages index against InRelease (by-hash, see

@@ -88,7 +88,7 @@ def test_signature_verified_before_metadata_parsing_or_primary_fetch(monkeypatch
     monkeypatch.setattr('repowatch.parsers.dnf.verify_detached', verify)
     snapshot, requested = fetch(DnfParser(repo(verify_signature=True, keyring_path='/test/keyring.gpg')))
     assert len(snapshot.packages) == 3
-    verify.assert_called_once_with(REPOMD, b'signature', '/test/keyring.gpg')
+    verify.assert_called_once_with(REPOMD, b'signature', '/test/keyring.gpg', signers=[])
     assert requested[1] == '/repo/repodata/repomd.xml.asc'
     verify.side_effect = SignatureError('bad signature')
     parser = DnfParser(repo(verify_signature=True, keyring_path='/test/keyring.gpg'))

@@ -96,6 +96,7 @@ def scheduled_limit(config, now: datetime | None = None) -> float | None:
 class _Request:
     repo_id: str
     remaining: float
+    fallback_limit: float | None = None
 
 
 class _Bucket:
@@ -130,7 +131,6 @@ class BandwidthBudget:
         self._buckets = {}
         self._config = None
         self._default_limit = default_limit
-        self._repo_limits = {}
         self._path = None
         self._stamp = None
         self._next_reload = 0.0
@@ -145,8 +145,7 @@ class BandwidthBudget:
         with self._lock:
             if self._config is None or self._path is None:
                 self._config = config
-            self._repo_limits[repo.id] = repo.prefetch_bandwidth_limit
-        return WarmBandwidthLimiter(self, repo.id)
+        return WarmBandwidthLimiter(self, repo.id, repo.prefetch_bandwidth_limit)
 
     def _refresh(self) -> None:
         from repowatch.errors import ConfigError
@@ -177,7 +176,13 @@ class BandwidthBudget:
         rates = {None: global_rate}
         repo_rates = {repo.id: repo.prefetch_bandwidth_limit for repo in config.repos} if config is not None else {}
         for request in self._requests:
-            rates[request.repo_id] = repo_rates.get(request.repo_id, self._repo_limits.get(request.repo_id))
+            rate = repo_rates.get(request.repo_id, request.fallback_limit)
+            previous = rates.get(request.repo_id)
+            # Removed repositories retain only live operations' fallback policy.
+            # Older/newer handles for the same id still share the stricter cap.
+            if previous is not None and (rate is None or previous < rate):
+                rate = previous
+            rates[request.repo_id] = rate
         for key, rate in rates.items():
             self._buckets.setdefault(key, _Bucket(now)).refill(rate, now)
         for _ in range(len(self._requests)):
@@ -199,13 +204,13 @@ class BandwidthBudget:
                 if now - self._buckets[key].updated > 60:
                     del self._buckets[key]
 
-    async def consume(self, repo_id: str, n_bytes: int) -> None:
+    async def consume(self, repo_id: str, n_bytes: int, *, fallback_limit: float | None = None) -> None:
         if n_bytes <= 0:
             return
         # Reload at most once per second, including during long-running warms.
         if self._path is not None and time.monotonic() >= self._next_reload:
             await asyncio.to_thread(self._refresh)
-        request = _Request(repo_id, n_bytes)
+        request = _Request(repo_id, n_bytes, fallback_limit)
         with self._lock:
             self._requests.append(request)
         try:
@@ -224,11 +229,12 @@ class BandwidthBudget:
 
 
 class WarmBandwidthLimiter:
-    def __init__(self, budget: BandwidthBudget, repo_id: str):
+    def __init__(self, budget: BandwidthBudget, repo_id: str, fallback_limit: float | None = None):
         self._budget, self._repo_id = budget, repo_id
+        self._fallback_limit = fallback_limit
 
     async def consume(self, n_bytes: int) -> None:
-        await self._budget.consume(self._repo_id, n_bytes)
+        await self._budget.consume(self._repo_id, n_bytes, fallback_limit=self._fallback_limit)
 
 
 class BandwidthLimiter(WarmBandwidthLimiter):

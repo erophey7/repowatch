@@ -17,15 +17,16 @@ from repowatch.web.access import load_admin_config, load_request_config
 
 async def _preview(config: Config, store: ServiceState, config_path: str | Path) -> dict:
     """Use one inventory to discover actual obsolete copies with present targets."""
-    plan = make_plan(config, store)
+    revisions = store.repositories.get_snapshot_revisions()
     async with httpx.AsyncClient() as client:
         version = await probe.probe(client, config.cache_base_url, 'repowatch-generation-check')
-    if version.generation != plan.generation:
-        raise CleanupChanged('nginx has not applied this dedup generation; retry after reconciliation.')
     inventory = await probe.full_inventory(config.cache_base_url)
     if inventory.failed_leaves or any(e.error or not e.key for e in inventory.entries):
         raise CleanupChanged('Cache inventory is incomplete; retry before selecting copies to remove.')
     present = {e.key: e for e in inventory.entries}
+    plan = make_plan(config, store, selected=set(present))
+    if version.generation != plan.generation or revisions != plan.revisions:
+        raise CleanupChanged('Catalog or nginx generation changed; retry the scan.')
     rows = []
     for key, row in plan.candidates.items():
         if key in present and row['canonical_key'] in present:
@@ -58,7 +59,7 @@ def dedup_cleanup_payload(config_path: str | Path, store: ServiceState, *,
     try:
         if body is None:
             return 200, asyncio.run(_preview(config, store, config_path))
-        plan = make_plan(config, store)
+        plan = make_plan(config, store, selected=set(keys))
         if plan.generation != body['generation']:
             raise CleanupChanged('Dedup routing changed since preview; scan again.')
         return 200, asyncio.run(remove_copies(plan, store, list(dict.fromkeys(keys)), config_path=config_path))

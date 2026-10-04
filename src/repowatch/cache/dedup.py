@@ -6,11 +6,13 @@ from repowatch.routing import CacheKeyBuilder, package_path
 
 
 def dedup_keys(config: Config, rows: list[tuple[str, str, str]],
-               builder: CacheKeyBuilder) -> dict[str, str]:
+               builder: CacheKeyBuilder, *, pairs: list[tuple[str, str]] | None = None) -> dict[str, str]:
     """Resolve chains and conflicts exactly as the nginx renderer does."""
     if not config.nginx.enable_dedup:
         return {}
-    rewrites = {source.lower(): target for source, target in resolve_dedup_pairs(config, rows)}
+    if pairs is None:
+        pairs = resolve_dedup_pairs(config, rows)
+    rewrites = {source.lower(): target for source, target in pairs}
     repos = {repo.id: repo for repo in config.repos}
     bound = {repo.id: builder.for_repo(repo) for repo in config.repos}
     targets = {package_path(repos[canonical], filename): bound[canonical](filename)

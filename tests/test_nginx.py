@@ -725,7 +725,7 @@ def test_resolve_dedup_pairs_drops_self_mapped_rows_sharing_one_nginx_route(capl
     # Both repos resolve to the identical /ubuntu/pool/main/a/a.deb — nothing
     # to redirect, and emitting it would rewrite a location to itself.
     assert pairs == []
-    assert 'skipped 1 self-mapped, 0 conflicting and 0 case-colliding' in caplog.text
+    assert 'self-mapped' not in caplog.text
 
 
 def test_resolve_dedup_pairs_collapses_duplicate_keys_from_the_same_shared_route(caplog):

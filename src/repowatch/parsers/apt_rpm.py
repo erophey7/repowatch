@@ -28,7 +28,8 @@ _INTS = {1003, 1006}
 _MAX_EXPANDED = 512 * 1024 * 1024
 
 
-def release_body(raw: bytes, keyring: str | None = None) -> bytes:
+def release_body(raw: bytes, keyring: str | None = None, *,
+                 signers: list[tuple[str, str]] | None = None) -> bytes:
     marker = b'-----BEGIN PGP SIGNATURE-----'
     body, sep, signature = raw.partition(marker)
     if keyring:
@@ -36,7 +37,7 @@ def release_body(raw: bytes, keyring: str | None = None) -> bytes:
             raise SignatureError('apt-rpm: release has no appended OpenPGP signature')
         # The exact bytes preceding the marker are signed, including the
         # final blank line. Do not strip/canonicalize the release payload.
-        verify_detached(body, sep + signature, keyring)
+        verify_detached(body, sep + signature, keyring, signers=signers)
     return body
 
 
@@ -181,7 +182,8 @@ class AptRpmParser(IndexParser):
     async def fetch_packages(self, client: httpx.AsyncClient) -> list[PackageRef]:
         release = await self._http_get(client, self.index_url())
         body = await asyncio.to_thread(release_body, release,
-                                       self.repo.keyring_path if self.repo.verify_signature else None)
+                                       self.repo.keyring_path if self.repo.verify_signature else None,
+                                       signers=self.signers)
         entries = checksums(body)
         base = 'base/pkglist.' + self.repo.component
         for suffix in ('.xz', '.bz2', '.gz', ''):

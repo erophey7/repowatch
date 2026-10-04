@@ -57,7 +57,7 @@ these cannot be made operational by a universal default.
 | `notify_webhook_url` | URL or `null` | `null` | Webhook for selected repository and warming events, with bounded retries (see [webhooks](webhooks.md)) — a generic JSON POST with a `text` field, the format Slack and Mattermost incoming webhooks read directly. **Discord's own webhook endpoint does not read `text` at all** (it expects `content`) — point this at Discord's separate Slack-compatible endpoint instead, `https://discord.com/api/webhooks/<id>/<token>/slack`, not the plain webhook URL Discord's UI gives you by default. Treat this as a secret (the URL itself is a bearer token): it is **not** exposed through `GET /api/config` or the dashboard, only editable by hand in `config.yaml`. |
 | `notify_events` | list of event names | `[repository.failing, repository.recovered]` | YAML-only selection of webhook events. Add `repository.changed`, `warm.started`, `warm.completed` to opt in; `[]` disables delivery. See [events and retry guarantees](webhooks.md). |
 | `notify_after_failures` | int | `3` | How many *consecutive* failures (per repository, per failure kind — signature verification or warm-up) before sending a notification. Fires once at the threshold and once on recovery, not on every failure. |
-| `key_expiry_warning_days` | int | `30` | Warning window before the earliest expiry in a GPG keyring, for repositories with `verify_signature: true`. Requires the full `gpg` binary; without it expiry is unknown, while `gpgv` verification continues normally. Exposed in the dashboard and the `repowatch_repo_key_expiring_soon` / `repowatch_repo_key_expires_at_timestamp_seconds` metrics. Webhook notification uses `kind="key_expiry"` and fires after `notify_after_failures` consecutive checks within the window (third by default), then once on recovery after a delivered warning. An unknown expiry does not clear the warning streak or send recovery; recovery requires a known expiry outside the window. Does not apply to apk, xbps, or nix. |
+| `key_expiry_warning_days` | int | `30` | Warning window for the actual verified GPG signing paths, for repositories with `verify_signature: true`. Each path expires at the earlier of its primary key and signing subkey; when multiple signatures are confirmed, the longest-lived path determines the warning. Unrelated keyring entries are ignored. Requires the full `gpg` binary; without it expiry is unknown, while `gpgv` verification continues normally. Exposed in the dashboard and the `repowatch_repo_key_expiring_soon` / `repowatch_repo_key_expires_at_timestamp_seconds` metrics. Webhook notification uses `kind="key_expiry"` and fires after `notify_after_failures` consecutive checks within the window (third by default), then once on recovery after a delivered warning. An unknown expiry does not clear the warning streak or send recovery; recovery requires a known expiry outside the window or a confirmed non-expiring signing path. The API exposes `key_expiry_known` alongside `key_expires_at`; known with a null date means non-expiring, shown as "Does not expire" in the dashboard. An unsuccessful index check clears the displayed expiry to unknown without clearing the notification streak. Does not apply to apk, xbps, or nix. |
 | `status_server` | mapping | — | See [`status_server`](#status_server). |
 | `syslog_listener` | mapping | — | See [`syslog_listener`](#syslog_listener). |
 | `nginx` | mapping | — | See [`nginx`](#nginx). |
@@ -399,12 +399,21 @@ each repository's own index must always reflect its own real state.
 **Removing redundant physical copies.** Redirecting future requests does not
 remove files cached before a dedup mapping existed. With `nginx.enabled`,
 `enable_dedup`, `enable_purge` and `enable_cache_probe` enabled, the daemon runs
-a bounded cleanup after hourly retention. Each pass considers at most 256 keys,
-rotating through candidates between passes; the cursor resets on restart. It
+a bounded cleanup after hourly retention. Each pass selects at most 256 keys.
+Up to half of the window prioritizes successfully warmed/observed packages;
+a rotating fallback covers the remaining candidates. Warm evidence affects order
+only: both physical files are still probed before deletion. The cursor resets
+on restart; a partial window resumes before selecting a new one. It
 stops starting new candidates after 30 seconds (an in-flight probe or purge can
 extend that time). It uses point probes, without an automatic full cache scan.
-Large catalogs can therefore require many passes, including candidates that are
-not currently cached. Storage also provides an explicit preview and manual
+The planner streams the full catalog twice to validate all owners of the selected
+keys, so the 256-key bound limits candidate memory and network work, not catalog
+rows read. Keys observed absent or successfully removed are skipped for up to six
+hours using an in-memory cache of at most 4096 keys; configuration/catalog changes
+invalidate that cache. A client can recreate a skipped key, so absence is never
+permanent. Large catalogs can still require many passes. Logs separate checked,
+source-missing, canonical-missing, eligible and purged counts, scanned catalog
+rows, observed bytes removed and any stop reason. Storage also provides an explicit preview and manual
 removal; see [redundant copies](access.md#redundant-dedup-copies).
 
 Cleanup derives obsolete keys from current catalogs and the accepted dedup map,

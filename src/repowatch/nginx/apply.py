@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import fcntl
-import hashlib
 import json
 import logging
 import os
@@ -13,6 +12,7 @@ from pathlib import Path
 from repowatch.config.load import load_config
 from repowatch.errors import ConfigError
 from repowatch.nginx.policy import _check_policy_owner
+from repowatch.nginx.reconcile import input_digest, matches, rendered_digest
 from repowatch.nginx.render import render, render_purge, render_probe_js, render_probe_conf, resolve_dedup_pairs, render_dedup
 from repowatch.storage.cache import CacheStore
 from repowatch.storage.database import Database
@@ -20,7 +20,7 @@ from repowatch.storage.database import Database
 def _write(path: Path, data: str) -> None:
     fd, temporary = tempfile.mkstemp(prefix='.' + path.name, dir=path.parent)
     try:
-        with os.fdopen(fd, 'w') as stream:
+        with os.fdopen(fd, 'w', errors='surrogateescape') as stream:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
@@ -80,6 +80,10 @@ def apply(config_path: str, policy_path: str, *, force: bool = False, use_system
                 f"nginx.cache_dir in config.yaml to the real path, or change the real one with "
                 f"CACHE_DIR=... make install && sudo make activate."
             )
+        outputs = [active, purge_path, dedup_path, probe_conf_path, probe_js_path]
+        inputs = input_digest(config, policy)
+        if not force and matches(status, inputs, outputs):
+            return False
         # find_duplicate_files() is a real query over repo_packages — only
         # run it when dedup is actually on, so leaving it off costs nothing
         # extra on every apply cycle (this timer runs every 15s). Computed
@@ -104,18 +108,28 @@ def apply(config_path: str, policy_path: str, *, force: bool = False, use_system
         dedup_candidate = render_dedup(config, dedup_pairs)
         probe_conf_candidate = render_probe_conf(config)
         probe_js_candidate = render_probe_js(config, cache_dir=policy['cache_dir'], dedup_pairs=dedup_pairs)
-        digest = hashlib.sha256((
-            candidate + purge_candidate + dedup_candidate + probe_conf_candidate + probe_js_candidate
-        ).encode()).hexdigest()
-        old = active.read_text() if active.exists() else None
-        old_purge = purge_path.read_text() if purge_path.exists() else None
-        old_dedup = dedup_path.read_text() if dedup_path.exists() else None
-        old_probe_conf = probe_conf_path.read_text() if probe_conf_path.exists() else None
-        old_probe_js = probe_js_path.read_text() if probe_js_path.exists() else None
+        digest = rendered_digest([
+            candidate, purge_candidate, dedup_candidate, probe_conf_candidate, probe_js_candidate,
+        ])
+        old = active.read_text(errors='surrogateescape') if active.exists() else None
+        old_purge = purge_path.read_text(errors='surrogateescape') if purge_path.exists() else None
+        old_dedup = dedup_path.read_text(errors='surrogateescape') if dedup_path.exists() else None
+        old_probe_conf = probe_conf_path.read_text(errors='surrogateescape') if probe_conf_path.exists() else None
+        old_probe_js = probe_js_path.read_text(errors='surrogateescape') if probe_js_path.exists() else None
         if (old == candidate and old_purge == purge_candidate and old_dedup == dedup_candidate
                 and old_probe_conf == probe_conf_candidate and old_probe_js == probe_js_candidate
                 and not force):
-            return False
+            # A changed input can render identical bytes. Remember the new input
+            # only if the previous transaction was successful; failed applies
+            # must retry validation/reload instead of hiding behind equal files.
+            try:
+                successful = json.loads(status.read_text()).get('ok') is True
+            except (OSError, ValueError, AttributeError):
+                successful = False
+            if successful:
+                stable = inputs if inputs == input_digest(config, policy) else None
+                _write(status, json.dumps({'ok': True, 'active': digest, 'inputs': stable}) + '\n')
+                return False
         nginx = policy['nginx_binary']
         command = [nginx, '-t', '-c', policy['nginx_conf']]
         files = [(purge_path, purge_candidate, old_purge),
@@ -166,5 +180,6 @@ def apply(config_path: str, policy_path: str, *, force: bool = False, use_system
             _write(previous_probe_conf, old_probe_conf)
         if old_probe_js is not None:
             _write(previous_probe_js, old_probe_js)
-        _write(status, json.dumps({'ok': True, 'active': digest}) + '\n')
+        stable = inputs if inputs == input_digest(config, policy) else None
+        _write(status, json.dumps({'ok': True, 'active': digest, 'inputs': stable}) + '\n')
         return True

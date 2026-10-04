@@ -180,10 +180,24 @@ The nginx `server` block itself is rendered once at `make activate` time
 (see above), from your `config.yaml`. But `config.yaml` can keep changing
 afterward — new repositories, changed `url_template`s, edited nginx
 settings — through the dashboard, without a redeploy. `repowatch-nginx.timer`
-(every 15s) re-renders the config from the current `config.yaml` and, only
-if the result actually differs from what's active, validates it with
-`nginx -t` and reloads. No-op ticks (the overwhelming majority) do nothing
-observable — no reload, no log noise.
+(every 15s) checks whether regeneration is needed. Unchanged ticks compare a
+fingerprint of the configuration, privileged policy, installed Python code and
+probe template, and catalog revisions when deduplication is enabled. They also
+hash all five managed output files, so missing or altered files trigger repair.
+Client request writes and successful checks of unchanged catalogs do not cause
+the expensive duplicate query or rendering to run again. Discovering or losing a
+package hash does invalidate the catalog revision, even without a version change.
+
+Changed inputs run the renderer; changed output is validated with `nginx -t` and
+reloaded transactionally. A failed apply cannot authorize the fast path, and a
+catalog change during rendering prevents caching that reconciliation result.
+The successful input fingerprint is kept in the root-owned `status.json`, so it
+survives separate timer invocations. `sudo repowatch nginx-apply --force` bypasses
+this optimization and repeats validation/reload. Use it after out-of-band database
+edits or changes to nginx configuration outside the five managed files. Normal
+no-op ticks do not reload nginx; the CLI and systemd may still log their outcome.
+Harmless dedup pairs mapping a URI to itself are debug messages; conflicting
+canonical targets and case-colliding paths remain warnings.
 
 This reconciliation runs as a **separate root-owned oneshot systemd unit**
 (`repowatch-nginx.service`, invoked by the timer), not as a `sudo` call from

@@ -2,15 +2,9 @@ function fmtTs(ts) {
   return ts ? ts.replace('T', ' ').replace(/\+00:00$/, ' UTC') : '—';
 }
 
-// Trust state: repo.key_expires_at/
-// key_expiring_soon come pre-computed from the last check cycle (see
-// api.repos_list_payload); this just renders them, no live gpg call from
-// the browser. '—' covers apk repos, repos without verify_signature, and
-// "unknown" (e.g. the full gpg binary isn't installed on the host) alike —
-// the dashboard can't tell those apart from key_expires_at alone, and
-// doesn't need to: none of them call for operator attention right now.
+// Signing-path diagnostics from the last check; no live GPG call in the browser.
 function fmtKeyExpiry(repo) {
-  if (!repo.key_expires_at) return '—';
+  if (!repo.key_expires_at) return repo.key_expiry_known ? 'Does not expire' : '—';
   const days = Math.floor((new Date(repo.key_expires_at) - Date.now()) / 86400000);
   const label = days < 0 ? `expired ${-days}d ago` : `expires in ${days}d`;
   if (!repo.key_expiring_soon) return `<span class="mono">${fmtTs(repo.key_expires_at)}</span>`;

@@ -591,3 +591,24 @@ def test_path_index_owners_are_not_tracked_by_the_collector():
     gc.collect()
     assert len(index) == 50 and all(isinstance(owners, tuple) for owners in index.values())
     assert not any(gc.is_tracked(owners) for owners in index.values())
+
+
+def test_compact_path_index_reuses_filename_and_releases_old_generation(tmp_path):
+    import weakref
+    import gc
+    from repowatch.runtime.syslog import refresh_package_indexes
+    from repowatch.models import RepoSnapshot
+    repo = _pacman_repo('r', 'core')
+    filename = ''.join(['unique-', 'filename.pkg'])
+    index = package_path_index(repo, {'p': filename})
+    assert next(iter(index.relative)) is filename
+    store = ServiceState(tmp_path / 'state.sqlite3')
+    packages, paths, revisions = {}, {}, {}
+    store.repositories.record_snapshot(RepoSnapshot('r', {'p': filename}))
+    refresh_package_indexes([repo], store, packages, paths, revisions)
+    old = weakref.ref(paths['r'])
+    store.repositories.record_snapshot(RepoSnapshot('r', {'q': 'q.pkg'}))
+    refresh_package_indexes([repo], store, packages, paths, revisions)
+    gc.collect()
+    assert old() is None
+    assert paths['r'] == {'/arch/core/os/x86_64/q.pkg': ('q',)}

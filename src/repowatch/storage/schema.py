@@ -44,9 +44,8 @@ CREATE TABLE IF NOT EXISTS repo_state (
     index_etag    TEXT,           -- index ETag from the previous check (for HEAD comparison)
     index_last_modified TEXT,     -- index Last-Modified from the previous check
     package_count INTEGER,
-    key_expires_at TEXT           -- soonest GPG key expiry in this repo's keyring, from the
-                                   -- last check cycle (see gpgverify.soonest_key_expiry); NULL
-                                   -- for apk repos, unsigned repos, or when unknown
+    key_expires_at TEXT,          -- lifetime of actual verified GPG signing paths
+    key_expiry_known INTEGER NOT NULL DEFAULT 0 -- known NULL means non-expiring
 );
 
 -- Current snapshot: the single source of truth for package data.
@@ -187,6 +186,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE repo_state ADD COLUMN package_count INTEGER")
     if "key_expires_at" not in existing:
         conn.execute("ALTER TABLE repo_state ADD COLUMN key_expires_at TEXT")
+
+    if "key_expiry_known" not in existing:
+        conn.execute("ALTER TABLE repo_state ADD COLUMN key_expiry_known INTEGER NOT NULL DEFAULT 0")
+        # Old values describe the whole keyring, not actual signing evidence.
+        conn.execute("UPDATE repo_state SET key_expires_at = NULL")
 
     if "snapshot_revision" not in existing:
         conn.execute("ALTER TABLE repo_state ADD COLUMN snapshot_revision INTEGER NOT NULL DEFAULT 0")

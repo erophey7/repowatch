@@ -65,15 +65,9 @@ def repos_list_payload(config_path: str | Path, store: ServiceState, *, current:
                 "check_interval": current.effective_check_interval(repo),
                 "last_check": status.get("last_check"),
                 "changed_at": status.get("changed_at"),
-                # Trust state — the soonest
-                # expiring key in this repo's keyring, from the last check
-                # cycle (see verification.gpg.soonest_key_expiry). None for apk
-                # repos, repos without verify_signature, or when unknown
-                # (e.g. the full `gpg` binary isn't installed). Computed
-                # once per check_interval by the watcher, not on this
-                # request — a live `gpg` call on every dashboard poll would
-                # be wasteful, see repowatch_repo_key_expires_at in metrics.
+                # Actual verified signing paths, computed by the watcher.
                 "key_expires_at": key_expires_at,
+                "key_expiry_known": status.get("key_expiry_known", False),
                 "key_expiring_soon": (
                     key_expires_at is not None
                     and datetime.fromisoformat(key_expires_at) - datetime.now(timezone.utc)

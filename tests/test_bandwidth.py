@@ -241,3 +241,66 @@ def test_oversized_warm_response_still_spends_consumed_bytes():
             assert await download_package(client,'http://cache.test/file',Limiter(),expected_size=1) == (False,200)
     asyncio.run(scenario())
     assert consumed == [9]
+
+
+def test_discarded_limiters_do_not_retain_historical_repo_ids(tmp_path):
+    import gc
+    import weakref
+
+    class RepoId(str):
+        pass
+
+    budget = BandwidthBudget()
+    current = config(tmp_path)
+    references = []
+    for number in range(500):
+        repository = repo(RepoId(f'removed-{number}'), limit=10)
+        references.append(weakref.ref(repository.id))
+        budget.limiter(current, repository)
+    del repository
+    gc.collect()
+    assert all(reference() is None for reference in references)
+
+
+def test_retained_handle_keeps_removed_repo_cap_and_observes_readdition(tmp_path):
+    async def scenario():
+        repository = repo(limit=10)
+        current = config(tmp_path, repos=[repository])
+        budget = BandwidthBudget()
+        handle = budget.limiter(current, repository)
+        # Removal happens before this handle submits its next chunk.
+        budget.limiter(replace(current, repos=[]), repo('other'))
+        task = asyncio.create_task(handle.consume(100000))
+        try:
+            await asyncio.sleep(0.08)
+            assert not task.done()
+            # Explicit null in a current config overrides the captured fallback.
+            budget.limiter(replace(current, repos=[repo()]), repo())
+            await asyncio.wait_for(task, 1)
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        assert not budget._requests
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('limits', [(10, 100), (100, 10), (None, 10), (10, None)])
+def test_removed_repo_handles_share_the_stricter_live_fallback(limits):
+    budget = BandwidthBudget()
+    requests = [_Request('removed', 1000, limit) for limit in limits]
+    budget._requests.extend(requests)
+    for tick in range(11):
+        budget._step(tick / 10)
+    assert sum(1000 - request.remaining for request in requests) == pytest.approx(10)
+
+
+def test_current_repo_policy_overrides_old_handles_fallbacks(tmp_path):
+    repository = repo(limit=100)
+    budget = BandwidthBudget()
+    budget.limiter(config(tmp_path, repos=[repository]), repository)
+    pending = _Request('r', 1000, 10)
+    budget._requests.append(pending)
+    for tick in range(11):
+        budget._step(tick / 10)
+    assert 1000 - pending.remaining == pytest.approx(100)

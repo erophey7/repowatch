@@ -418,8 +418,13 @@ The administrator-only API is `GET /api/storage/dedup` for preview and
 
 A POST rederives candidates on the server; submitting an arbitrary key cannot
 turn this into a general purge endpoint. The response contains per-key `results`,
-`observed_removed_bytes`, and `stopped` (null if the batch finished). A skipped
-key no longer qualifies or lacks one of its copies. HTTP 409 means the evidence
+`observed_removed_bytes`, and `stopped` (null if the batch finished). The `counts`
+object separates `examined`, `source_missing`, `canonical_missing`, `eligible`
+and `purged`; `eligible` counts pairs whose two copies were found before purge,
+not necessarily successful removals. `absent_keys` lists sources observed absent
+or successfully removed during this batch. These are observations, not permanent
+absence guarantees: concurrent clients can populate a key again. A skipped key
+no longer qualifies or lacks one of its copies. HTTP 409 means the evidence
 is stale, the features are disabled, or another cleanup/preview is running.
 A mid-batch change returns partial results with `stopped`; inspect this field
 even on HTTP 200. The byte count is the pre-purge observed file size, including

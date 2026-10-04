@@ -267,7 +267,7 @@ class DnfParser(IndexParser):
         raw = await self._http_get(client, self.index_url())
         if self.repo.verify_signature:
             signature = await self._http_get(client, self.index_url() + '.asc')
-            await asyncio.to_thread(verify_detached, raw, signature, self.repo.keyring_path)
+            await asyncio.to_thread(verify_detached, raw, signature, self.repo.keyring_path, signers=self.signers)
         metadata = await asyncio.to_thread(_parse_repomd, raw)
         primary = await self._http_get(client, self.repo.upstream.rstrip('/') + '/' + metadata.href)
         return await asyncio.to_thread(_checked_primary, primary, metadata, self.repo.arch)

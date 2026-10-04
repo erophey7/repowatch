@@ -77,7 +77,7 @@ def test_apt_parser_accepts_when_sha256_matches_verified_release(monkeypatch):
     # asyncio.to_thread (see AptParser._verified_expected_sha256)
     monkeypatch.setattr(
         "repowatch.parsers.apt.verify_clearsigned",
-        lambda data, keyring: release_body,
+        lambda data, keyring, **kwargs: release_body,
     )
 
     packages = asyncio.run(parser.fetch_packages(client=None))
@@ -96,7 +96,7 @@ def test_apt_parser_rejects_when_sha256_mismatches(monkeypatch):
     monkeypatch.setattr(parser, "_http_get", fake_http_get)
     monkeypatch.setattr(
         "repowatch.parsers.apt.verify_clearsigned",
-        lambda data, keyring: wrong_release_body,
+        lambda data, keyring, **kwargs: wrong_release_body,
     )
 
     with pytest.raises(SignatureError):
@@ -112,7 +112,7 @@ def test_apt_parser_propagates_signature_verification_failure(monkeypatch):
 
     monkeypatch.setattr(parser, "_http_get", fake_http_get)
 
-    def raise_error(data, keyring):
+    def raise_error(data, keyring, **kwargs):
         raise SignatureError("InRelease signature verification failed")
 
     monkeypatch.setattr("repowatch.parsers.apt.verify_clearsigned", raise_error)
@@ -130,7 +130,7 @@ def test_release_first_and_by_hash(monkeypatch, signed, by_hash):
             f" {digest} {len(raw)} main/binary-amd64/Packages.gz\n").encode()
     envelope = b"-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\n" + body + b"-----BEGIN PGP SIGNATURE-----"
     parser = AptParser(_repo(verify_signature=signed, keyring_path="/key" if signed else None))
-    monkeypatch.setattr("repowatch.parsers.apt.verify_clearsigned", lambda *_: body)
+    monkeypatch.setattr("repowatch.parsers.apt.verify_clearsigned", lambda *_, **kwargs: body)
     calls = []
     async def get(client, url):
         calls.append(url)
@@ -148,7 +148,7 @@ def test_by_hash_404_fallback_still_checks_same_hash(monkeypatch, tampered):
     digest = hashlib.sha256(raw).hexdigest()
     body = f"Acquire-By-Hash: yes\nSHA256:\n {digest} 1 main/binary-amd64/Packages.gz\n".encode()
     parser = AptParser(_repo(verify_signature=True, keyring_path="/key"))
-    monkeypatch.setattr("repowatch.parsers.apt.verify_clearsigned", lambda *_: body)
+    monkeypatch.setattr("repowatch.parsers.apt.verify_clearsigned", lambda *_, **kwargs: body)
     async def get(client, url):
         if "/by-hash/" in url:
             response = httpx.Response(404, request=httpx.Request("GET", url))
@@ -367,7 +367,7 @@ def test_release_selects_available_encoding(monkeypatch, filename, signed, by_ha
     body = (f"Acquire-By-Hash: {'yes' if by_hash else 'no'}\nSHA256:\n"
             f" {digest} {len(raw)} main/binary-amd64/{filename}\n").encode()
     parser = AptParser(_repo(verify_signature=signed, keyring_path='/key' if signed else None))
-    monkeypatch.setattr(apt_module, 'verify_clearsigned', lambda *_: body)
+    monkeypatch.setattr(apt_module, 'verify_clearsigned', lambda *_, **kwargs: body)
     calls = []
 
     async def get(client, url):

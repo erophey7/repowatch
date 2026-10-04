@@ -85,7 +85,7 @@ def test_pacman_parser_verifies_signature_when_enabled(monkeypatch):
     # verify_detached stays synchronous — called via asyncio.to_thread
     monkeypatch.setattr(
         "repowatch.parsers.pacman.verify_detached",
-        lambda data, sig, keyring: verify_calls.append((data, sig, keyring)),
+        lambda data, sig, keyring, **kwargs: verify_calls.append((data, sig, keyring)),
     )
 
     packages = asyncio.run(parser.fetch_packages(client=None))
@@ -106,7 +106,7 @@ def test_pacman_parser_propagates_signature_verification_failure(monkeypatch):
 
     monkeypatch.setattr(parser, "_http_get", fake_http_get)
 
-    def raise_error(data, sig, keyring):
+    def raise_error(data, sig, keyring, **kwargs):
         raise SignatureError("boom")
 
     monkeypatch.setattr("repowatch.parsers.pacman.verify_detached", raise_error)

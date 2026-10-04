@@ -76,6 +76,6 @@ class SlackwareParser(IndexParser):
             root = self.repo.upstream.rstrip('/')
             checksums = await self._http_get(client, root + '/CHECKSUMS.md5')
             signature = await self._http_get(client, root + '/CHECKSUMS.md5.asc')
-            await asyncio.to_thread(verify_detached, checksums, signature, self.repo.keyring_path)
+            await asyncio.to_thread(verify_detached, checksums, signature, self.repo.keyring_path, signers=self.signers)
             await asyncio.to_thread(_check_index, raw, checksums, self.index_path())
         return await asyncio.to_thread(_parse_packages, raw, self.repo.arch)

@@ -27,6 +27,10 @@ class ServiceState:
         self.completeness_lock = Lock()
         self.dedup_cleanup_lock = Lock()
         self.dedup_cleanup_cursor = ""
+        self.dedup_cleanup_priority_cursor = ""
+        self.dedup_cleanup_recent: dict[str, float] = {}
+        self.dedup_cleanup_evidence = None
+        self.dedup_cleanup_pending: tuple[str, str, list[str]] | None = None
         self.automatic_warm_repos: dict[str, RepoConfig] | None = None
 
     def automatic_warm_enabled(self, repo: RepoConfig) -> bool:

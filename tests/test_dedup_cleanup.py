@@ -188,3 +188,146 @@ def test_conditional_purge_keeps_literal_key_and_passes_generation():
             return await probe.purge_raw(client, 'http://localhost', 'v1:httpserver/pool/pkg', generation='a' * 64)
     assert asyncio.run(run()) == 'error (HTTP 409)'
     assert seen == ['http://localhost/purge-raw?key=v1:httpserver/pool/pkg&cleanup_generation=' + 'a' * 64]
+
+
+def test_streamed_windows_cover_all_candidates_and_preserve_targets(state, monkeypatch):
+    _, config, store = state
+    packages = {f'p{i}': f'p{i}.rpm' for i in range(31)}
+    hashes = {key: f'{i:064x}' for i, key in enumerate(packages)}
+    for repo in config.repos:
+        snapshot(config, store, repo.id, packages, hashes)
+    store.cache.record_warmed_package('b', 'p30', 'p30.rpm', True, 200)
+    expected = cleanup.make_plan(config, store).candidates
+    monkeypatch.setattr(store.queries, 'completeness_catalogs',
+                        lambda *args: pytest.fail('must stream catalog evidence'))
+    seen, cursor, priority = {}, '', ''
+    for _ in range(len(expected)):
+        plan = cleanup.make_plan(config, store, limit=5, after=cursor, priority_after=priority)
+        assert len(plan.candidates) <= 5
+        seen.update(plan.candidates)
+        cursor, priority = plan.cursor, plan.priority_cursor
+    assert seen == expected
+    assert cleanup.make_plan(config, store, selected=set(expected) | {'invented'}).candidates == expected
+
+
+def test_bounded_window_checks_blockers_outside_selection(state):
+    _, config, store = state
+    expected = cleanup.make_plan(config, store)
+    key = next(iter(expected.candidates))
+    # An outdated owner must block deletion even when the client requests only
+    # one otherwise plausible physical key.
+    with store.database.connect() as conn:
+        conn.execute("UPDATE repo_state SET source_identity='outdated'")
+    assert not cleanup.make_plan(config, store, selected={key}).candidates
+
+
+def test_planning_rejects_catalog_change_between_streams(state, monkeypatch):
+    _, config, store = state
+    original = store.queries.cleanup_rows
+    calls = 0
+    def rows(ids):
+        nonlocal calls
+        yield from original(ids)
+        calls += 1
+        if calls == 1:
+            snapshot(config, store, 'b', {'new': 'new.rpm'})
+    monkeypatch.setattr(store.queries, 'cleanup_rows', rows)
+    with pytest.raises(cleanup.CleanupChanged):
+        cleanup.make_plan(config, store, limit=1)
+
+
+def test_absent_keys_are_reconsidered_after_expiry(state, monkeypatch):
+    _, config, store = state
+    plan = cleanup.make_plan(config, store)
+    inspect, purge = mocks(monkeypatch, plan, exists=False)
+    asyncio.run(cleanup.automatic_cleanup(config, store))
+    first = inspect.await_count
+    assert first and len(store.dedup_cleanup_recent) == len(plan.candidates)
+    asyncio.run(cleanup.automatic_cleanup(config, store))
+    assert inspect.await_count == first
+    # A new client can populate a previously absent key during this interval.
+    # Once the bounded negative evidence expires the normal probe discovers it.
+    store.dedup_cleanup_recent = dict.fromkeys(store.dedup_cleanup_recent, 0)
+    inspect.return_value = probe.ProbeResult(True, 100, generation=plan.generation)
+    asyncio.run(cleanup.automatic_cleanup(config, store))
+    assert purge.await_count == len(plan.candidates)
+
+
+def test_time_budget_resumes_unprocessed_keys_before_next_window(state, monkeypatch):
+    _, config, store = state
+    plan = cleanup.make_plan(config, store)
+    keys = list(plan.candidates)
+    assert len(keys) > 1
+    calls = []
+    async def remove(plan, store, selected, **kwargs):
+        calls.append(selected)
+        done = selected[:1]
+        return dict(results=dict.fromkeys(done, 'skipped'), absent_keys=[],
+                    observed_removed_bytes=0, stopped='time budget reached' if len(selected) > 1 else None,
+                    counts=dict(examined=1, purged=0, eligible=0, source_missing=0, canonical_missing=1))
+    monkeypatch.setattr(cleanup, 'remove_copies', remove)
+    for _ in keys:
+        asyncio.run(cleanup.automatic_cleanup(config, store))
+    assert [call[0] for call in calls] == keys
+    assert store.dedup_cleanup_pending is None
+
+
+def test_progress_survives_catalog_change_but_negative_evidence_does_not(state, monkeypatch):
+    _, config, store = state
+    plan = cleanup.make_plan(config, store)
+    mocks(monkeypatch, plan, exists=False)
+    monkeypatch.setattr(cleanup, 'AUTOMATIC_BATCH', 1)
+    asyncio.run(cleanup.automatic_cleanup(config, store))
+    old_cursor = store.dedup_cleanup_cursor
+    store.dedup_cleanup_recent['sentinel'] = float('inf')
+    with store.database.connect() as conn:
+        conn.execute('UPDATE repo_state SET snapshot_revision=snapshot_revision+1')
+    asyncio.run(cleanup.automatic_cleanup(config, store))
+    assert 'sentinel' not in store.dedup_cleanup_recent
+    assert store.dedup_cleanup_cursor != old_cursor
+
+
+def test_cleanup_reports_missing_source_and_missing_canonical_separately(state, monkeypatch):
+    _, config, store = state
+    plan = cleanup.make_plan(config, store)
+    inspect, purge = mocks(monkeypatch, plan)
+    inspect.side_effect = [probe.ProbeResult(False, generation=plan.generation),
+                          probe.ProbeResult(True, 100, generation=plan.generation),
+                          probe.ProbeResult(True, 100, generation=plan.generation),
+                          probe.ProbeResult(False, generation=plan.generation)]
+    keys = list(plan.candidates)[:2]
+    result = asyncio.run(cleanup.remove_copies(plan, store, keys))
+    assert result['counts'] == dict(examined=2, source_missing=1, canonical_missing=1, eligible=0, purged=0)
+    assert result['absent_keys'] == keys[:1]
+    purge.assert_not_awaited()
+
+
+def test_priority_keeps_first_owner_attribution_for_shared_routes(tmp_path):
+    from test_completeness import setup
+    repos = [dict(id=name, type='apt', upstream='https://example.org/' + directory,
+                  arch='amd64', distribution='stable', component='main')
+             for name, directory in [('0', 'debian'), ('a', 'ubuntu'), ('b', 'ubuntu')]]
+    _, config, store = setup(tmp_path, repos, dedup=True)
+    for repo in config.repos:
+        snapshot(config, store, repo.id, {'p': 'pool/p.deb'}, {'p': 'a' * 64})
+    # The obsolete Ubuntu key has two owners; only the later one has a warm
+    # hint. Its display attribution must remain the first owner in either plan.
+    store.cache.record_warmed_package('b', 'p', 'pool/p.deb', True, 200)
+    expected = cleanup.make_plan(config, store).candidates
+    assert expected and {row['repo_id'] for row in expected.values()} == {'a'}
+    assert cleanup.make_plan(config, store, limit=2).candidates == expected
+
+
+def test_nix_artifact_protects_a_key_selected_from_another_repository(state):
+    from repowatch.config.models import RepoConfig
+    from repowatch.routing import CacheKeyBuilder
+    _, config, store = state
+    nix = RepoConfig('n', 'nix', 'https://b.example/repo', 'x86_64-linux',
+                     nix_source='https://example.org/nixpkgs.tar.gz')
+    config = replace(config, repos=[*config.repos, nix])
+    snapshot(config, store, 'n', {'root': 'root.narinfo'})
+    builder = CacheKeyBuilder(config)
+    artifact_key = builder.for_repo(nix)('pkg.rpm')
+    assert artifact_key in cleanup.make_plan(config, store).candidates
+    store.cache.record_nix_artifacts('n', 'root', [{'filename': 'pkg.rpm', 'content_hash': None, 'size': 10}])
+    assert artifact_key not in cleanup.make_plan(config, store, selected={artifact_key}).candidates

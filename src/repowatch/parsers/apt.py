@@ -75,7 +75,7 @@ class AptParser(IndexParser):
                     raise
         else:
             if repo.verify_signature:
-                release_body = await asyncio.to_thread(verify_clearsigned, release_raw, repo.keyring_path)
+                release_body = await asyncio.to_thread(verify_clearsigned, release_raw, repo.keyring_path, signers=self.signers)
             else:
                 release_body = _extract_clearsigned_body(release_raw)
         if release_body is not None:

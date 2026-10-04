@@ -17,7 +17,7 @@ async def purge_removed(
 ) -> None:
     """Purge removed package paths when enable_purge is on; otherwise do nothing.
 
-    Log HTTP statuses >= 400 and request failures without aborting other items.
+    Log unexpected HTTP statuses and request failures without aborting other items.
     Results are not returned to the watcher. Requests use the same bounded
     transport and User-Agent as manual purge, without bandwidth pacing.
     """
@@ -50,14 +50,12 @@ async def _purge_batch(config: Config, repo: RepoConfig, items: dict[str, str], 
         async with semaphore:
             try:
                 resp = await client.get(url, headers={"User-Agent": USER_AGENT}, timeout=30)
-                if log_failures and resp.status_code >= 400:
+                outcome = ("purged" if resp.status_code == 200 else
+                           "not_cached" if resp.status_code == 404 else
+                           f"error (HTTP {resp.status_code})")
+                results[key] = outcome
+                if log_failures and outcome not in ("purged", "not_cached"):
                     logger.warning("%s: purge failed (HTTP %s) for %s", repo.id, resp.status_code, filename)
-                if resp.status_code == 200:
-                    results[key] = "purged"
-                elif resp.status_code == 404:
-                    results[key] = "not_cached"
-                else:
-                    results[key] = f"error (HTTP {resp.status_code})"
             except httpx.RequestError as exc:
                 if log_failures:
                     logger.warning("%s: purge failed (%s) for %s", repo.id, exc, filename)

@@ -120,7 +120,7 @@ def test_slackware_signature_covers_exact_component_index(monkeypatch, mode):
     if mode == 'missing': checksums = checksums.replace(b'patches/', b'extra/')
     if mode == 'duplicate': checksums += checksums
     calls = []
-    def verify(data, signature, keyring):
+    def verify(data, signature, keyring, **kwargs):
         assert data == checksums and signature == b'signature' and keyring == '/keys.gpg'
         calls.append(data)
         if mode == 'bad-signature': raise SignatureError('invalid signature')

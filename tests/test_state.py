@@ -653,7 +653,7 @@ def test_repo_summaries_skip_history_and_keep_counts(tmp_path, monkeypatch):
         raise AssertionError('summary must not decode history JSON')
     monkeypatch.setattr('repowatch.storage.repositories.json.loads', unexpected_history)
     summaries = store.repositories.get_repo_summaries(include_warmed=True)
-    assert summaries['a'] == {key: full[key] for key in ('last_check', 'changed_at', 'package_count')} | {'warmed_count': 1, 'key_expires_at': None}
+    assert summaries['a'] == {key: full[key] for key in ('last_check', 'changed_at', 'package_count')} | {'warmed_count': 1, 'key_expires_at': None, 'key_expiry_known': False}
     assert summaries['b']['package_count'] == summaries['b']['warmed_count'] == 0
     assert summaries['orphan'] == {'warmed_count': 1}
     assert 'warmed_count' not in store.repositories.get_repo_summaries()['a']
@@ -892,3 +892,19 @@ def test_notifications_store_orphan_helpers(tmp_path):
     assert store.notifications.get_repo_ids_with_data() == set()
     assert store.notifications.count_repo_rows("r") == 0
     assert store.requests.get_request_hit_stats() == {}
+
+
+def test_key_expiry_migration_discards_old_keyring_wide_diagnostic(tmp_path):
+    import sqlite3
+    path = tmp_path / 'old.sqlite3'
+    with sqlite3.connect(path) as conn:
+        conn.execute('CREATE TABLE repo_state (repo_id TEXT PRIMARY KEY, last_check TEXT NOT NULL, '
+                     'changed_at TEXT, key_expires_at TEXT)')
+        conn.execute("INSERT INTO repo_state VALUES ('r', '2026-01-01', NULL, '2026-02-01')")
+    store = ServiceState(path)
+    summary = store.repositories.get_repo_summaries()['r']
+    assert summary['last_check'] == '2026-01-01'
+    assert summary['key_expires_at'] is None and summary['key_expiry_known'] is False
+    store.repositories.record_key_expiry('r', None, known=True)
+    reopened = ServiceState(path).repositories.get_repo_summaries()['r']
+    assert reopened['key_expiry_known'] and reopened['key_expires_at'] is None

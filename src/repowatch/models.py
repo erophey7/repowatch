@@ -20,6 +20,8 @@ class RepoSnapshot:
     # was known from the index (cross-repo dedup) — missing keys
     # simply aren't candidates for dedup, not an error.
     content_hashes: dict[str, str] = field(default_factory=dict)
+    # Actual GPG signing and primary fingerprints, diagnostic evidence only.
+    signers: list[tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass

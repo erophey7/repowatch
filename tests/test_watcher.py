@@ -13,6 +13,7 @@ from repowatch.config.models import RepoConfig
 from repowatch.config.models import StatusServerConfig
 from repowatch.config.models import SyslogListenerConfig
 from repowatch.errors import SignatureError
+from repowatch.verification.gpg import KeyExpiry
 from repowatch.parsers.base import IndexHeadResult
 from repowatch.models import RepoSnapshot
 from repowatch.runtime.context import ServiceState
@@ -148,7 +149,7 @@ class _SucceedingParser:
 
     async def fetch(self, client):
         from repowatch.models import RepoSnapshot
-        return RepoSnapshot(repo_id=self.repo.id, packages={})
+        return RepoSnapshot(repo_id=self.repo.id, packages={}, signers=[("signer", "primary")])
 
 
 def test_check_repo_records_gpg_failure_on_signature_error(tmp_path, monkeypatch):
@@ -200,7 +201,7 @@ def test_check_repo_success_without_prior_gpg_failure_creates_no_failure_row(tmp
 
 def test_check_repo_skips_key_expiry_check_for_apk(tmp_path, monkeypatch):
     """apk's embedded RSA keys have no expiry concept (see apkverify.py) —
-    soonest_key_expiry must not even be called for an apk repo, regardless
+    signing_key_expiry must not even be called for an apk repo, regardless
     of verify_signature."""
     store = ServiceState(tmp_path / "state.sqlite3")
     repo = RepoConfig(
@@ -210,9 +211,9 @@ def test_check_repo_skips_key_expiry_check_for_apk(tmp_path, monkeypatch):
     config = _config(repos=[repo])
     monkeypatch.setitem(operations_check.PARSERS, "apk", _SucceedingParser)
 
-    def _boom(keyring_path):
-        raise AssertionError("soonest_key_expiry must not be called for apk")
-    monkeypatch.setattr(operations_check, "soonest_key_expiry", _boom)
+    def _boom(*args):
+        raise AssertionError("signing_key_expiry must not be called for apk")
+    monkeypatch.setattr(operations_check, "signing_key_expiry", _boom)
 
     asyncio.run(check_repo(config, repo, store))
 
@@ -229,7 +230,7 @@ def test_check_repo_records_key_expiry_from_keyring(tmp_path, monkeypatch):
     monkeypatch.setitem(operations_check.PARSERS, "pacman", _SucceedingParser)
 
     far_future = (datetime.now(timezone.utc) + timedelta(days=200)).isoformat(timespec="seconds")
-    monkeypatch.setattr(operations_check, "soonest_key_expiry", lambda keyring_path: far_future)
+    monkeypatch.setattr(operations_check, "signing_key_expiry", lambda *args: KeyExpiry(True, far_future))
 
     asyncio.run(check_repo(config, repo, store))
 
@@ -248,14 +249,14 @@ def test_check_repo_notifies_key_expiry_warning_and_recovery(tmp_path, monkeypat
     monkeypatch.setitem(operations_check.PARSERS, "pacman", _SucceedingParser)
 
     soon = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat(timespec="seconds")
-    monkeypatch.setattr(operations_check, "soonest_key_expiry", lambda keyring_path: soon)
+    monkeypatch.setattr(operations_check, "signing_key_expiry", lambda *args: KeyExpiry(True, soon))
 
     asyncio.run(check_repo(config, repo, store))
     # inside the warning window — a "key_expiry" streak was started
     assert store.notifications.bump_failure("r", "key_expiry", "peek") == (2, False)
 
     far_future = (datetime.now(timezone.utc) + timedelta(days=200)).isoformat(timespec="seconds")
-    monkeypatch.setattr(operations_check, "soonest_key_expiry", lambda keyring_path: far_future)
+    monkeypatch.setattr(operations_check, "signing_key_expiry", lambda *args: KeyExpiry(True, far_future))
     asyncio.run(check_repo(config, repo, store))
     # renewed past the threshold — the streak is fully reset
     assert store.notifications.bump_failure("r", "key_expiry", "peek") == (1, False)
@@ -741,7 +742,7 @@ def test_signed_unchanged_indexes_are_reverified_after_trust_changes(tmp_path, m
         with monkeypatch.context() as patcher:
             patcher.setattr(parser, 'check_index_changed', AsyncMock(return_value=IndexHeadResult(True, 'same', None)))
             patcher.setattr(parser, 'fetch', fetch)
-            patcher.setattr(operations_check, 'soonest_key_expiry', lambda _: None)
+            patcher.setattr(operations_check, 'signing_key_expiry', lambda *args: KeyExpiry())
             asyncio.run(check_repo(_config(repos=[repo]), repo, store))
         assert fetch.await_count == 1
         assert store.repositories.get_status('r')['last_check'] == before
@@ -758,14 +759,14 @@ def test_unknown_key_expiry_does_not_report_recovery(tmp_path, monkeypatch):
     store.notifications.mark_failure_notified('r', 'key_expiry')
     sent = AsyncMock(return_value=True)
     monkeypatch.setattr('repowatch.notifications._send', sent)
-    monkeypatch.setattr(operations_check, 'soonest_key_expiry', lambda _: None)
+    monkeypatch.setattr(operations_check, 'signing_key_expiry', lambda *args: KeyExpiry())
     config = _config(repos=[repo], notify_webhook_url='https://example.org/webhook')
-    asyncio.run(operations_check._check_key_expiry(config, repo, store))
+    asyncio.run(operations_check._check_key_expiry(config, repo, store, [("signer", "primary")]))
     sent.assert_not_called()
     assert store.notifications.bump_failure('r', 'key_expiry', 'peek') == (2, True)
     future = (datetime.now(timezone.utc) + timedelta(days=200)).isoformat()
-    monkeypatch.setattr(operations_check, 'soonest_key_expiry', lambda _: future)
-    asyncio.run(operations_check._check_key_expiry(config, repo, store))
+    monkeypatch.setattr(operations_check, 'signing_key_expiry', lambda *args: KeyExpiry(True, future))
+    asyncio.run(operations_check._check_key_expiry(config, repo, store, [("signer", "primary")]))
     assert sent.call_args.args[1]['status'] == 'recovered'
 
 
@@ -901,3 +902,29 @@ def test_retention_uses_raw_purge_and_keeps_concurrently_refreshed_record(tmp_pa
     monkeypatch.setattr(operations_cleanup.cache_probe, 'purge_selected_raw', purge)
     asyncio.run(prune_all(config, store))
     assert {k: v[0] for k, v in store.cache.get_warmed_records('r', ['a']).items()} == {'a': 'a.apk'}
+
+
+def test_known_non_expiring_signer_clears_expiry_warning(tmp_path, monkeypatch):
+    store = ServiceState(tmp_path / 'state.sqlite3')
+    repo = RepoConfig('r', 'pacman', 'https://example.org', 'x86_64',
+                      repo_name='core', verify_signature=True, keyring_path='/keys')
+    store.notifications.bump_failure('r', 'key_expiry', 'old key')
+    monkeypatch.setattr(operations_check, 'signing_key_expiry', lambda *args: KeyExpiry(True))
+    asyncio.run(operations_check._check_key_expiry(_config(repos=[repo]), repo, store, [('s', 'p')]))
+    summary = store.repositories.get_repo_summaries()['r']
+    assert summary['key_expiry_known'] and summary['key_expires_at'] is None
+    assert store.notifications.bump_failure('r', 'key_expiry', 'peek') == (1, False)
+
+
+def test_failed_verification_cannot_reuse_previous_expiry_evidence(tmp_path, monkeypatch):
+    store = ServiceState(tmp_path / 'state.sqlite3')
+    repo = RepoConfig('r', 'pacman', 'https://example.org', 'x86_64',
+                      repo_name='core', verify_signature=True, keyring_path='/keys')
+    store.repositories.record_key_expiry('r', '2030-01-01T00:00:00+00:00')
+    store.notifications.bump_failure('r', 'key_expiry', 'expiring')
+    monkeypatch.setitem(operations_check.PARSERS, 'pacman', _SignatureErrorParser)
+    monkeypatch.setattr(operations_check, 'signing_key_expiry', lambda *args: pytest.fail('no verified signer'))
+    asyncio.run(check_repo(_config(repos=[repo]), repo, store))
+    summary = store.repositories.get_repo_summaries()['r']
+    assert not summary['key_expiry_known'] and summary['key_expires_at'] is None
+    assert store.notifications.bump_failure('r', 'key_expiry', 'peek') == (2, False)

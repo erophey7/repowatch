@@ -1106,3 +1106,15 @@ test('Storage previews redundant copies and preserves partial cleanup results', 
     assert.equal(calls.length, 2, 'do not replace the summary with an automatic rescan');
   } finally { dom.window.close(); }
 });
+
+test('signing expiry distinguishes unknown metadata from a non-expiring verified key', () => {
+  const vm = require('node:vm');
+  const context = vm.createContext({});
+  // These formatting functions do not require the rest of the dashboard DOM.
+  const source = fs.readFileSync(path.join(staticDir, 'js/repositories.js'), 'utf8');
+  vm.runInContext(source.slice(0, source.indexOf('let lastRepos')), context);
+  assert.equal(context.fmtKeyExpiry({key_expires_at: null, key_expiry_known: false}), '—');
+  assert.equal(context.fmtKeyExpiry({key_expires_at: null, key_expiry_known: true}), 'Does not expire');
+  assert.match(context.fmtKeyExpiry({key_expires_at: '2000-01-01T00:00:00+00:00',
+    key_expiry_known: true, key_expiring_soon: true}), /expired/);
+});

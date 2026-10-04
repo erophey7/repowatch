@@ -39,6 +39,26 @@ class QueriesStore:
                 )
         return result
 
+    def cleanup_rows(self, repo_ids: list[str]):
+        """Stream cleanup evidence in one read snapshot; never keep a catalog list."""
+        with self.db.connect() as conn:
+            conn.execute('BEGIN')
+            for repo_id in repo_ids:
+                state = conn.execute(
+                    'SELECT last_check, source_identity FROM repo_state WHERE repo_id=?',
+                    (repo_id,)).fetchone() or (None, None)
+                rows = conn.execute(
+                    "SELECT p.package_key, p.filename, EXISTS(SELECT 1 FROM pending_replacements r "
+                    "WHERE r.repo_id=p.repo_id AND r.package_key=p.package_key), "
+                    "EXISTS(SELECT 1 FROM warmed_packages w WHERE w.repo_id=p.repo_id "
+                    "AND w.package_key=p.package_key AND w.status='ok'), 0 "
+                    "FROM repo_packages p WHERE p.repo_id=? UNION ALL "
+                    "SELECT a.package_key,a.filename,0,0,1 FROM nix_artifacts a "
+                    "JOIN repo_packages p ON p.repo_id=a.repo_id AND p.package_key=a.package_key "
+                    "WHERE a.repo_id=?", (repo_id, repo_id))
+                for key, filename, pending, warmed, artifact in rows:
+                    yield repo_id, key, filename, state, bool(pending), bool(warmed), bool(artifact)
+
     def get_page(self, kind: str, repo_id: str | None = None, *,
                  q: str = "", limit: int = 100, cursor: str | None = None) -> dict:
         """Bounded keyset pagination; cursors are bound to resource and filter.

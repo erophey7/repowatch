@@ -49,6 +49,12 @@ class RepositoriesStore:
                     and previous[key][1] != snapshot.content_hashes[key])
             }
             changed = bool(new_keys or removed_keys or modified_keys)
+            # Hash discovery/loss changes dedup routing even without a package
+            # version change. Keep the user-facing diff semantics unchanged.
+            catalog_changed = changed or any(
+                previous[key][1] != snapshot.content_hashes.get(key)
+                for key in set(previous) & set(snapshot.packages)
+            )
             for key in sorted(modified_keys):
                 old_filename, old_hash = previous[key]
                 pending = conn.execute(
@@ -101,7 +107,7 @@ class RepositoriesStore:
                     len(snapshot.packages),
                     source_identity,
                     changed,
-                    int(changed),
+                    int(catalog_changed),
                 ),
             )
 
@@ -171,25 +177,17 @@ class RepositoriesStore:
             return dict(conn.execute("SELECT repo_id, snapshot_revision FROM repo_state"))
 
 
-    def record_key_expiry(self, repo_id: str, expires_at: str | None) -> None:
-        """Soonest GPG key expiry for this repo's keyring, from the current
-        check cycle (see verification.gpg.soonest_key_expiry, operations.check.check_repo).
-        An upsert, not a plain UPDATE — this can run before the first
-        record_snapshot()/touch_last_check() of a brand-new repository ever
-        creates its repo_state row (the key-expiry check runs unconditionally
-        at the top of every cycle, independent of whether the index itself
-        changed, so a quiet repository that rarely changes still gets its
-        key checked on schedule). An empty internal timestamp means no successful
-        check yet, preserving the existing NOT NULL schema. Public readers
-        expose it as None. Only a successful index check supplies a date."""
+    def record_key_expiry(self, repo_id: str, expires_at: str | None, *, known: bool | None = None) -> None:
+        """Store signing-path diagnostics without inventing a successful index check."""
+        if known is None:
+            known = expires_at is not None
         with self.db.connect() as conn:
             conn.execute(
-                """
-                INSERT INTO repo_state (repo_id, last_check, key_expires_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(repo_id) DO UPDATE SET key_expires_at = excluded.key_expires_at
-                """,
-                (repo_id, "", expires_at),
+                """INSERT INTO repo_state (repo_id, last_check, key_expires_at, key_expiry_known)
+                VALUES (?, '', ?, ?)
+                ON CONFLICT(repo_id) DO UPDATE SET key_expires_at = excluded.key_expires_at,
+                    key_expiry_known = excluded.key_expiry_known""",
+                (repo_id, expires_at, known),
             )
 
 
@@ -213,11 +211,11 @@ class RepositoriesStore:
         """
         with self.db.connect() as conn:
             rows = conn.execute(
-                "SELECT repo_id, last_check, changed_at, package_count, key_expires_at FROM repo_state"
+                "SELECT repo_id, last_check, changed_at, package_count, key_expires_at, key_expiry_known FROM repo_state"
             ).fetchall()
             warmed = dict(conn.execute("SELECT repo_id, COUNT(*) FROM warmed_packages GROUP BY repo_id")) if include_warmed else {}
         result = {row[0]: {"last_check": row[1] or None, "changed_at": row[2], "package_count": row[3],
-                            "key_expires_at": row[4]} for row in rows}
+                            "key_expires_at": row[4], "key_expiry_known": bool(row[5])} for row in rows}
         if include_warmed:
             # Keep the count even for orphaned warmed rows without repo_state:
             # a per-repo count shouldn't require a snapshot to exist either.

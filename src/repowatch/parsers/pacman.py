@@ -225,7 +225,7 @@ class PacmanParser(IndexParser):
             sig = await self._http_get(client, url + ".sig")
             # gpgv verification is blocking, run it in a separate
             # thread so it doesn't stall every other concurrently checked repo
-            await asyncio.to_thread(verify_detached, raw, sig, repo.keyring_path)
+            await asyncio.to_thread(verify_detached, raw, sig, repo.keyring_path, signers=self.signers)
             logger.debug("%s: signature %s.sig verified", repo.id, repo.repo_name)
 
         return await asyncio.to_thread(_parse_db_tar_gz, raw)

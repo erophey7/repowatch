@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
 from repowatch.errors import SignatureError
 from repowatch.processes import run
@@ -13,17 +14,17 @@ from repowatch.processes import run
 logger = logging.getLogger(__name__)
 
 
-def verify_detached(data: bytes, signature: bytes, keyring_path: str) -> None:
+def verify_detached(data: bytes, signature: bytes, keyring_path: str, *, signers: list[tuple[str, str]] | None = None) -> None:
     """Verify a detached signature (pacman: <repo>.db.tar.gz + .sig)."""
     with tempfile.TemporaryDirectory() as tmp:
         data_path = Path(tmp) / "data"
         sig_path = Path(tmp) / "data.sig"
         data_path.write_bytes(data)
         sig_path.write_bytes(signature)
-        _run_gpgv(keyring_path, sig_path, data_path)
+        _run_gpgv(keyring_path, sig_path, data_path, signers)
 
 
-def verify_clearsigned(data: bytes, keyring_path: str) -> bytes:
+def verify_clearsigned(data: bytes, keyring_path: str, *, signers: list[tuple[str, str]] | None = None) -> bytes:
     """Verify a clearsigned file (apt InRelease — the signature is embedded
     directly in the file, no separate .sig). Returns the verified message
     body (without the PGP envelope) — gpgv doesn't hand that back itself, so
@@ -32,11 +33,12 @@ def verify_clearsigned(data: bytes, keyring_path: str) -> bytes:
     with tempfile.TemporaryDirectory() as tmp:
         data_path = Path(tmp) / "InRelease"
         data_path.write_bytes(data)
-        _run_gpgv(keyring_path, data_path, None)
+        _run_gpgv(keyring_path, data_path, None, signers)
     return _extract_clearsigned_body(data)
 
 
-def _run_gpgv(keyring_path: str, sig_path: Path, data_path: Path | None) -> None:
+def _run_gpgv(keyring_path: str, sig_path: Path, data_path: Path | None,
+              signers: list[tuple[str, str]] | None = None) -> None:
     # --status-fd 1 — a machine-readable status instead of parsing
     # localizable human text. Real indexes (e.g. Debian's InRelease) are
     # often signed by SEVERAL keys at once (gradual key rotation) — gpgv
@@ -65,6 +67,14 @@ def _run_gpgv(keyring_path: str, sig_path: Path, data_path: Path | None) -> None
             f"gpgv: no signature was confirmed by a key in the keyring "
             f"(exit code {result.returncode}): {result.stderr.strip()}"
         )
+
+    if signers is not None:
+        for line in status_lines:
+            fields = line.split()
+            if len(fields) >= 11 and fields[:2] == ["[GNUPG:]", "VALIDSIG"]:
+                # VALIDSIG's expiration field belongs to the signature, not
+                # the key. Retain fingerprints and read key metadata separately.
+                signers.append((fields[2], fields[11] if len(fields) >= 12 else fields[2]))
 
 
 def _extract_clearsigned_body(data: bytes) -> bytes:
@@ -96,61 +106,77 @@ def _extract_clearsigned_body(data: bytes) -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-def soonest_key_expiry(keyring_path: str) -> str | None:
-    """The nearest expiration date among the public keys in an exported
-    keyring (the same file already used with `gpgv --keyring`), as an
-    ISO 8601 UTC string — or None if no key in it has an expiry, the
-    keyring has no keys, or the check couldn't be performed at all.
+@dataclass(frozen=True)
+class KeyExpiry:
+    """Unknown metadata differs from a verified path with no expiration."""
 
-    Requires the full `gpg` binary, not just `gpgv` — gpgv only verifies
-    signatures, it has no key-listing capability. This is strictly a
-    diagnostic feature ("trust state", key expiry warnings): unlike
-    everywhere else in this module, failure here is never raised, only
-    logged and treated as "unknown" — a host with `gpgv` but not the full
-    `gpg` package must not lose the ability to VERIFY signatures just
-    because it can't also report on key freshness.
+    known: bool = False
+    expires_at: str | None = None
 
-    Imports the keyring into a throwaway GNUPGHOME rather than pointing
-    `gpg --keyring` directly at the file: modern GnuPG (2.4+) can default to
-    its "keyboxd" backend, which silently IGNORES an explicit --keyring
-    argument for a legacy-format file ("Specified keyrings are ignored due
-    to option 'use-keyboxd'") — found by hand, not documented behavior a
-    caller should have to know about. --import always works regardless of
-    which backend the local gpg build defaults to.
+
+def signing_key_expiry(keyring_path: str, signers: list[tuple[str, str]]) -> KeyExpiry:
+    """Report the usable lifetime of the actual verified signing paths.
+
+    Each path ends when either its primary key or signing subkey expires.
+    Multiple confirmed signatures are alternatives, so the longest-lived path
+    determines the warning. Unrelated keys never affect the result. This is
+    diagnostic only: missing gpg or unreadable metadata cannot reject an index.
     """
-    if shutil.which("gpg") is None:
-        return None
+    if not signers or shutil.which("gpg") is None:
+        return KeyExpiry()
     try:
         with tempfile.TemporaryDirectory(prefix="repowatch-gpg-home-") as home:
-            os.chmod(home, 0o700)
-            env = {**os.environ, "GNUPGHOME": home}
-            run(
-                ["gpg", "--batch", "--yes", "--import", keyring_path],
-                text=True, timeout=10, env=env,
-            )
             result = run(
-                ["gpg", "--batch", "--with-colons", "--list-keys"],
-                text=True, timeout=10, env=env,
+                ["gpg", "--batch", "--no-options", "--no-autostart",
+                 "--with-colons", "--with-fingerprint", "--with-subkey-fingerprint",
+                 "--import-options", "show-only", "--import", keyring_path],
+                text=True, timeout=10, env={**os.environ, "GNUPGHOME": home},
             )
     except (OSError, subprocess.SubprocessError):
-        logger.warning("could not run gpg to check key expiry for %s", keyring_path, exc_info=True)
-        return None
-    if result.returncode != 0:
-        logger.warning("gpg --list-keys failed for %s: %s", keyring_path, result.stderr.strip())
-        return None
+        logger.warning("could not read signing key expiry for %s", keyring_path, exc_info=True)
+        return KeyExpiry()
+    if result.returncode:
+        logger.warning("gpg key inspection failed for %s: %s", keyring_path, result.stderr.strip())
+        return KeyExpiry()
+    return _signing_expiry(result.stdout, signers)
 
-    soonest: datetime | None = None
-    for line in result.stdout.splitlines():
+
+def _signing_expiry(listing: str, signers: list[tuple[str, str]]) -> KeyExpiry:
+    """Join GnuPG pub/sub/fpr records to VALIDSIG fingerprints."""
+    keys: dict[str, tuple[str, datetime | None, bool]] = {}
+    primary = ""
+    pending = None
+    for line in listing.splitlines():
         fields = line.split(":")
-        if fields[0] != "pub" or len(fields) < 7 or not fields[6]:
+        if fields[0] in ("pub", "sub"):
+            if fields[0] == "pub":
+                primary = ""
+            pending = fields
+        elif fields[0] == "fpr" and len(fields) > 9 and pending is not None:
+            fingerprint = fields[9]
+            if pending[0] == "pub":
+                primary = fingerprint
+            try:
+                expiry = datetime.fromtimestamp(int(pending[6]), timezone.utc) if pending[6] else None
+                valid = pending[1] not in ("r", "d", "i") and bool(primary)
+            except (IndexError, ValueError, OverflowError, OSError):
+                expiry, valid = None, False
+            keys[fingerprint] = (primary, expiry, valid)
+            pending = None
+    deadlines = []
+    unknown = False
+    for fingerprint, primary in set(signers):
+        path = (keys.get(fingerprint), keys.get(primary))
+        if any(key is None or not key[2] or key[0] != primary for key in path):
+            unknown = True
             continue
-        try:
-            expires = datetime.fromtimestamp(int(fields[6]), tz=timezone.utc)
-        except (ValueError, OSError):
-            continue
-        if soonest is None or expires < soonest:
-            soonest = expires
-    return soonest.isoformat(timespec="seconds") if soonest else None
+        dates = [key[1] for key in path if key[1] is not None]
+        if not dates:
+            return KeyExpiry(True)
+        deadlines.append(min(dates))
+    if unknown or not deadlines:
+        return KeyExpiry()
+    return KeyExpiry(True, max(deadlines).isoformat(timespec="seconds"))
 
 
 def find_sha256_in_release(release_body: bytes, target_path: str) -> str:

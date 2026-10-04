@@ -784,6 +784,6 @@ def test_purge_batch_preserves_manual_results_and_automatic_logging(status, capl
         assert not caplog.records
         assert asyncio.run(purge_removed(_purge_config(), repo, {'p': 'p.pkg'})) is None
     assert len(requests) == 2  # Redirects must not introduce upstream requests.
-    assert len(caplog.records) == int(status >= 400)
-    if status >= 400:
+    assert len(caplog.records) == int(status not in (200, 404))
+    if status not in (200, 404):
         assert f'purge failed (HTTP {status}) for p.pkg' in caplog.text

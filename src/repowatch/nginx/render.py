@@ -483,12 +483,12 @@ def resolve_dedup_pairs(config: Config, rows: list[tuple[str, str, str]]) -> lis
     for key in targets:
         by_lowered.setdefault(key.lower(), []).append(key)
     case_clashes = {key for keys in by_lowered.values() if len(keys) > 1 for key in keys}
-    if self_mapped or conflicting or case_clashes:
+    if self_mapped:
+        logger.debug('nginx dedup: skipped %d self-mapped duplicate-file pairs', self_mapped)
+    if conflicting or case_clashes:
         logger.warning(
-            'nginx dedup: skipped %d self-mapped, %d conflicting and %d case-colliding '
-            'duplicate-file pairs (repositories sharing an nginx route collapse to the '
-            'same local URI; nginx map keys are case-insensitive)',
-            self_mapped, conflicting, len(case_clashes),
+            'nginx dedup: skipped %d conflicting and %d case-colliding duplicate-file pairs',
+            conflicting, len(case_clashes),
         )
     return [(key, next(iter(values))) for key, values in targets.items()
             if len(values) == 1 and key not in case_clashes]
