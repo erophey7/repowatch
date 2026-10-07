@@ -4,7 +4,34 @@ from __future__ import annotations
 
 import base64
 import json
+import sqlite3
+from contextlib import contextmanager
+from typing import Iterator
 from repowatch.storage.database import Database
+
+class _CatalogRows:
+    """Reiterate SQLite rows without retaining the full package catalog."""
+
+    def __init__(self, connection: sqlite3.Connection, repo_id: str, *, warmed: bool = False):
+        self.connection = connection
+        self.repo_id = repo_id
+        self.warmed = warmed
+
+    def __iter__(self) -> Iterator:
+        query = ('SELECT filename FROM warmed_packages WHERE repo_id=?' if self.warmed else
+                 'SELECT package_key, filename FROM repo_packages WHERE repo_id=?')
+        cursor = self.connection.execute(query, (self.repo_id,))
+        try:
+            for row in cursor:
+                yield row[0] if self.warmed else row
+        finally:
+            cursor.close()
+
+    def __len__(self) -> int:
+        table = 'warmed_packages' if self.warmed else 'repo_packages'
+        return self.connection.execute(
+            f'SELECT COUNT(*) FROM {table} WHERE repo_id=?', (self.repo_id,)).fetchone()[0]
+
 
 class QueriesStore:
     """SQL operations for queries; the caller supplies the shared database."""
@@ -12,11 +39,17 @@ class QueriesStore:
     def __init__(self, db: Database):
         self.db = db
 
-    def completeness_catalogs(self, repo_ids: list[str], *, include_warmed: bool = False) -> dict[str, dict]:
-        """Read catalog identities, packages and closure evidence in one short snapshot."""
-        result = {}
+    @contextmanager
+    def catalog_snapshot(self, repo_ids: list[str], *, include_warmed: bool = False):
+        """Expose repeatable package iterators within one caller-owned read snapshot.
+
+        Consume all iterators before leaving the context. No network operation
+        belongs inside this context: a slow inventory must not pin the WAL.
+        Pending replacements and Nix closure evidence remain explicit collections.
+        """
         with self.db.connect() as conn:
             conn.execute('BEGIN')
+            result = {}
             for repo_id in repo_ids:
                 state = conn.execute(
                     'SELECT last_check, source_identity FROM repo_state WHERE repo_id=?',
@@ -28,16 +61,20 @@ class QueriesStore:
                 result[repo_id] = dict(
                     last_check=state[0] if state else None,
                     source_identity=state[1] if state else None,
-                    packages=conn.execute(
-                        'SELECT package_key, filename FROM repo_packages WHERE repo_id=?', (repo_id,)).fetchall(),
+                    packages=_CatalogRows(conn, repo_id),
                     pending={key for key, in conn.execute(
                         'SELECT package_key FROM pending_replacements WHERE repo_id=?', (repo_id,))},
                     artifacts=artifacts,
-                    warmed={filename for filename, in conn.execute(
-                        'SELECT filename FROM warmed_packages WHERE repo_id=?', (repo_id,))}
-                    if include_warmed else set(),
+                    warmed=_CatalogRows(conn, repo_id, warmed=True) if include_warmed else (),
                 )
-        return result
+            yield result
+
+    def completeness_catalogs(self, repo_ids: list[str], *, include_warmed: bool = False) -> dict[str, dict]:
+        """Materialize catalog evidence for callers that need an independent snapshot."""
+        with self.catalog_snapshot(repo_ids, include_warmed=include_warmed) as catalogs:
+            return {repo_id: dict(catalog, packages=list(catalog['packages']),
+                                  warmed=set(catalog['warmed']))
+                    for repo_id, catalog in catalogs.items()}
 
     def cleanup_rows(self, repo_ids: list[str]):
         """Stream cleanup evidence in one read snapshot; never keep a catalog list."""

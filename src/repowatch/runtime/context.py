@@ -25,7 +25,8 @@ class ServiceState:
         self.queries = QueriesStore(self.database)
         self.bandwidth = BandwidthBudget()
         self.completeness_lock = Lock()
-        self.dedup_cleanup_lock = Lock()
+        # Full inventory reports and dedup maintenance share one admission gate.
+        self.dedup_cleanup_lock = self.completeness_lock
         self.dedup_cleanup_cursor = ""
         self.dedup_cleanup_priority_cursor = ""
         self.dedup_cleanup_recent: dict[str, float] = {}

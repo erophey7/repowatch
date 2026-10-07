@@ -170,7 +170,7 @@ def render(config: Config, *, cache_dir: str = '/var/cache/nginx/repowatch',
     for number, (local, (scheme, host, remote, ttl)) in enumerate(sorted(routes.items())):
         # All mutable metadata (including signatures and apt translations) get short TTL.
         patterns = (r'[^/]+\.(db|files)(\.tar\.(gz|xz|zst))?(\.sig)?$',
-                    r'dists/', r'APKINDEX\.tar\.gz$', r'repodata/', r'base/', r'[^/]+-repodata$',
+                    r'dists/(?!.*\.(?:deb|udeb|ddeb)$)', r'APKINDEX\.tar\.gz$', r'repodata/', r'base/', r'[^/]+-repodata$',
                     r'(nix-cache-info|[^/]+\.narinfo)$', r'Packages(\.gz)?$',
                     r'(.*\/)?(PACKAGES\.TXT|CHECKSUMS\.md5|FILELIST\.TXT|ChangeLog\.txt|MANIFEST|GPG-KEY)(\.(gz|bz2))?(\.asc)?$')
         kind = kinds[local]
@@ -182,7 +182,7 @@ def render(config: Config, *, cache_dir: str = '/var/cache/nginx/repowatch',
                 # Dedup only ever applies to package files, never index
                 # files — each repo's own index must always reflect ITS
                 # OWN real state. $repowatch_canonical_uri is another
-                # repo's local URI for the SAME (filename, content_hash);
+                # repo's local URI for the SAME content hash;
                 # `rewrite ... last` re-dispatches to THAT repo's own
                 # location block, so whatever it does (TTL, upstream,
                 # revalidate) applies unchanged. The cache key override
@@ -426,7 +426,7 @@ def _map_literal(value: str) -> str:
     return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
 
 
-def resolve_dedup_pairs(config: Config, rows: list[tuple[str, str, str]]) -> list[tuple[str, str]]:
+def resolve_dedup_pairs(config: Config, rows: list[tuple[str, str, str, str]]) -> list[tuple[str, str]]:
     """Turns ServiceState.cache.find_duplicate_files() rows (repo ids + filename)
     into (duplicate_local_uri, canonical_local_uri) pairs, reusing
     routing.package_path — the same function that builds warm/purge URLs —
@@ -453,7 +453,7 @@ def resolve_dedup_pairs(config: Config, rows: list[tuple[str, str, str]]) -> lis
     render_dedup(), so the pairs it receives are already a valid map: unique
     keys, no self-mappings. A key that gets proposed two DIFFERENT canonical
     targets (both real /ubuntu/pool/... rows collapsing to it, but from two
-    (filename, content_hash) groups that disagree — not observed on
+    content hash groups that disagree — not observed on
     production, but not excluded by the schema either) is dropped ENTIRELY,
     not resolved by picking whichever row happened to come first: guessing
     could serve one suite's request with a different suite's bytes under it.
@@ -464,13 +464,14 @@ def resolve_dedup_pairs(config: Config, rows: list[tuple[str, str, str]]) -> lis
     by_id = {repo.id: repo for repo in config.repos}
     targets: dict[str, set[str]] = {}
     self_mapped = 0
-    for duplicate_id, canonical_id, filename in rows:
+    for duplicate_id, canonical_id, filename, canonical_filename in rows:
         duplicate_repo = by_id.get(duplicate_id)
         canonical_repo = by_id.get(canonical_id)
-        if duplicate_repo is None or canonical_repo is None:
+        if (duplicate_repo is None or canonical_repo is None
+                or duplicate_repo.type == 'nix' or canonical_repo.type == 'nix'):
             continue
         duplicate_uri = package_path(duplicate_repo, filename)
-        canonical_uri = package_path(canonical_repo, filename)
+        canonical_uri = package_path(canonical_repo, canonical_filename)
         if duplicate_uri == canonical_uri:
             self_mapped += 1
             continue

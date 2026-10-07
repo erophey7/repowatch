@@ -331,7 +331,7 @@ closures are unknown. Artifact history retains old encodings for purge, so missi
 recorded files conservatively produce unknown rather than proving the current
 closure incomplete. No Nix evaluation or upstream discovery runs during this scan.
 
-The endpoint returns **409** when probing is disabled, another completeness scan
+The endpoint returns **409** when probing is disabled, another completeness scan or dedup cleanup/preview
 is active in the same process, or configuration/catalog snapshots changed during
 the scan; **502** means the inventory endpoint failed or returned invalid data.
 Retry after correcting the cause. Large scans can take minutes; configure any
@@ -344,6 +344,8 @@ guarantee of offline operation. Cache files can expire or change afterwards.
 
 The `usage=1` option adds `storage_usage` to the completeness response, using the
 same inventory and observation timestamps. It does not perform a second scan.
+Catalog rows are streamed after the network inventory completes; storage ownership
+and availability maps retain only keys observed in that inventory.
 Even with no repositories configured, this option scans existing cache files and
 reports them as unattributed. The coverage-only request still skips an empty
 configuration. The existing `GET /api/stats?cache_dir=1` and `repowatch stats

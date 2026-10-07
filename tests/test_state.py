@@ -52,7 +52,7 @@ def test_find_duplicate_files_groups_by_filename_and_hash_across_repos(tmp_path)
     store.repositories.record_snapshot(RepoSnapshot(
         repo_id="fork", packages={"b-1": "pool/main/a/a.deb"}, content_hashes={"b-1": "e" * 64},
     ))
-    assert store.cache.find_duplicate_files() == [("ubuntu", "debian", "pool/main/a/a.deb")]
+    assert store.cache.find_duplicate_files() == [("ubuntu", "debian", "pool/main/a/a.deb", "pool/main/a/a.deb")]
 
 
 def test_find_duplicate_files_ignores_packages_without_a_hash(tmp_path):
@@ -70,7 +70,7 @@ def test_find_duplicate_files_canonical_choice_is_stable_across_calls(tmp_path):
         ))
     result = store.cache.find_duplicate_files()
     assert result == store.cache.find_duplicate_files()
-    assert all(canonical == "aaa" for _, canonical, _ in result)
+    assert all(canonical == "aaa" for _, canonical, _, _ in result)
 
 
 def test_record_snapshot_persists_normalized_packages_and_removes_old_rows(tmp_path):
@@ -746,7 +746,6 @@ def test_read_only_database_never_initializes_or_writes(tmp_path):
 
 
 def test_dedup_query_matches_reference_with_aliases_and_mixed_hashes(tmp_path):
-    from itertools import groupby
     store = _store(tmp_path)
     for repo_id in ('a', 'b', 'c'):
         packages = {f'pkg-{i}': f'file-{i // 2}.deb' for i in range(80)}
@@ -756,24 +755,30 @@ def test_dedup_query_matches_reference_with_aliases_and_mixed_hashes(tmp_path):
             hashes = {key: 'e' * 64 for key in hashes}
         store.repositories.record_snapshot(RepoSnapshot(repo_id, packages, content_hashes=hashes))
     with store.database.connect() as conn:
-        rows = conn.execute('SELECT filename,content_hash,repo_id FROM repo_packages '
-            'WHERE content_hash IS NOT NULL GROUP BY filename,content_hash,repo_id '
-            'ORDER BY filename,content_hash,repo_id').fetchall()
+        rows = conn.execute('SELECT repo_id,filename,content_hash FROM repo_packages').fetchall()
+    files = {}
+    for repo_id, filename, digest in rows:
+        files.setdefault((repo_id, filename), set()).add(digest)
+    groups = {}
+    for identity, hashes in files.items():
+        if len(hashes) == 1 and None not in hashes:
+            groups.setdefault(next(iter(hashes)), []).append(identity)
     expected = []
-    for _, group in groupby(rows, key=lambda row: row[:2]):
-        members = list(group)
-        expected.extend((repo_id, members[0][2], filename) for filename, _, repo_id in members[1:])
-    assert store.cache.find_duplicate_files() == expected
+    for members in groups.values():
+        canonical_repo, canonical_filename = min(members)
+        expected.extend((repo_id, canonical_repo, filename, canonical_filename)
+                        for repo_id, filename in sorted(members)[1:])
+    assert store.cache.find_duplicate_files() == sorted(expected, key=lambda row: (row[0], row[2]))
     assert len(expected) > 0
 
 
-def test_dedup_preserves_distinct_hash_groups_with_identical_output_tuples(tmp_path):
+def test_dedup_rejects_paths_with_conflicting_alias_hashes(tmp_path):
     store = _store(tmp_path)
     for repo_id in ('a', 'b'):
         store.repositories.record_snapshot(RepoSnapshot(repo_id,
             {'v1':'same.deb','v2':'same.deb','alias':'same.deb'},
             content_hashes={'v1':'a'*64,'v2':'b'*64,'alias':'a'*64}))
-    assert store.cache.find_duplicate_files() == [('b','a','same.deb'),('b','a','same.deb')]
+    assert store.cache.find_duplicate_files() == []
 
 
 def test_request_rollups_upgrade_pre_client_ip_history(tmp_path):

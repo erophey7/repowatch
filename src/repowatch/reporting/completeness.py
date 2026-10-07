@@ -10,7 +10,7 @@ import httpx
 
 from repowatch.cache import probe
 from repowatch.config.models import Config
-from repowatch.cache.dedup import dedup_keys
+from repowatch.cache.dedup import accepted_pairs, dedup_keys
 from repowatch.routing import CacheKeyBuilder, package_path
 from repowatch.runtime.context import ServiceState
 from repowatch.reporting.storage_usage import storage_usage
@@ -19,7 +19,10 @@ from repowatch.web.access import load_request_config
 
 def _dedup_keys(config: Config, store: ServiceState, builder: CacheKeyBuilder) -> dict[str, str]:
     """Load duplicate identities once and resolve the renderer's accepted rewrites."""
-    return dedup_keys(config, store.cache.find_duplicate_files(), builder) if config.nginx.enable_dedup else {}
+    if not config.nginx.enable_dedup:
+        return {}
+    rows = store.cache.find_duplicate_files()
+    return dedup_keys(config, rows, builder, pairs=accepted_pairs(config, store.cache, rows))
 
 
 def summarize(config: Config, catalogs: dict, inventory: probe.Inventory,
@@ -101,14 +104,10 @@ def completeness_payload(config_path: str | Path, store: ServiceState,
     if not config.nginx.enable_cache_probe:
         return 409, {'error': 'Enable nginx.enable_cache_probe to measure physical cache completeness.'}
     if not store.completeness_lock.acquire(blocking=False):
-        return 409, {'error': 'A cache completeness scan is already running.'}
+        return 409, {'error': 'A cache inventory or dedup cleanup is already running.'}
     try:
         started = datetime.now(timezone.utc).isoformat()
         revisions = store.repositories.get_snapshot_revisions()
-        catalogs = store.queries.completeness_catalogs(
-            [repo.id for repo in config.repos], include_warmed=include_usage)
-        builder = CacheKeyBuilder(config)
-        dedup_keys = _dedup_keys(config, store, builder)
         try:
             inventory = asyncio.run(_inventory(config.cache_base_url)) if config.repos or include_usage else probe.Inventory([])
         except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
@@ -116,15 +115,23 @@ def completeness_payload(config_path: str | Path, store: ServiceState,
         latest, error = load_request_config(config_path)
         if error is not None or latest != config or revisions != store.repositories.get_snapshot_revisions():
             return 409, {'error': 'Configuration or repository snapshots changed during the scan; run it again.'}
-        payload = dict(
-            source='cache_inventory', started_at=started,
-            finished_at=datetime.now(timezone.utc).isoformat(),
-            failed_leaves=inventory.failed_leaves,
-            unreadable_entries=sum(1 for e in inventory.entries if not e.key or e.error),
-            items=summarize(config, catalogs, inventory, builder, dedup_keys),
-        )
-        if include_usage:
-            payload['storage_usage'] = storage_usage(config, catalogs, inventory, builder, dedup_keys)
+        builder = CacheKeyBuilder(config)
+        dedup_keys = _dedup_keys(config, store, builder)
+        # Inventory HTTP finishes before opening the catalog read transaction.
+        with store.queries.catalog_snapshot(
+                [repo.id for repo in config.repos], include_warmed=include_usage) as catalogs:
+            payload = dict(
+                source='cache_inventory', started_at=started,
+                failed_leaves=inventory.failed_leaves,
+                unreadable_entries=sum(1 for e in inventory.entries if not e.key or e.error),
+                items=summarize(config, catalogs, inventory, builder, dedup_keys),
+            )
+            if include_usage:
+                payload['storage_usage'] = storage_usage(config, catalogs, inventory, builder, dedup_keys)
+        latest, error = load_request_config(config_path)
+        if error is not None or latest != config or revisions != store.repositories.get_snapshot_revisions():
+            return 409, {'error': 'Configuration or repository snapshots changed during the scan; run it again.'}
+        payload['finished_at'] = datetime.now(timezone.utc).isoformat()
         return 200, payload
     finally:
         store.completeness_lock.release()

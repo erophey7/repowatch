@@ -209,3 +209,73 @@ def test_pending_canonical_replacement_also_marks_dependants_unknown(tmp_path, m
     inventory(monkeypatch, config, [('a', 'pkg.rpm')])
     rows = completeness.completeness_payload(path, store)[1]['items']
     assert all(row['unknown_packages'] == 1 and row['percent'] is None for row in rows)
+
+
+def test_catalog_snapshot_is_repeatable_and_isolated_from_concurrent_updates(tmp_path):
+    path, config, store = setup(tmp_path)
+    snapshot(config, store, packages={'one': 'one.apk'})
+    with store.queries.catalog_snapshot(['r'], include_warmed=True) as catalogs:
+        rows = catalogs['r']['packages']
+        assert len(rows) == 1
+        assert list(rows) == [('one', 'one.apk')]
+        snapshot(config, store, packages={'two': 'two.apk', 'three': 'three.apk'})
+        assert len(rows) == 1
+        assert list(rows) == [('one', 'one.apk')]
+    with store.queries.catalog_snapshot(['r']) as catalogs:
+        assert len(catalogs['r']['packages']) == 2
+
+
+def test_inventory_precedes_catalog_transaction_and_materialization_is_unused(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    path, config, store = setup(tmp_path)
+    snapshot(config, store)
+    scanned = False
+    active = False
+    original = store.queries.catalog_snapshot
+    @contextmanager
+    def reader(*args, **kwargs):
+        nonlocal active
+        assert scanned
+        active = True
+        try:
+            with original(*args, **kwargs) as catalogs:
+                yield catalogs
+        finally:
+            active = False
+    async def scan(*args):
+        nonlocal scanned
+        assert not active
+        scanned = True
+        return Inventory([])
+    monkeypatch.setattr(completeness, '_inventory', scan)
+    monkeypatch.setattr(store.queries, 'catalog_snapshot', reader)
+    monkeypatch.setattr(store.queries, 'completeness_catalogs',
+                        lambda *a, **kw: pytest.fail('must not materialize catalog'))
+    status, result = completeness.completeness_payload(path, store, include_usage=True)
+    assert status == 200 and result['items'][0]['missing_packages'] == 2
+    assert result['storage_usage']['total_bytes'] == 0 and not active
+
+
+def test_change_during_accounting_rejects_result_and_releases_scan_lock(tmp_path, monkeypatch):
+    path, config, store = setup(tmp_path)
+    snapshot(config, store)
+    inventory(monkeypatch, config)
+    original = completeness.storage_usage
+    def changed(*args, **kwargs):
+        result = original(*args, **kwargs)
+        snapshot(config, store, packages={'new': 'new.apk'})
+        return result
+    monkeypatch.setattr(completeness, 'storage_usage', changed)
+    assert completeness.completeness_payload(path, store, include_usage=True)[0] == 409
+    assert not store.completeness_lock.locked()
+
+
+def test_completeness_and_dedup_share_admission(tmp_path):
+    from repowatch.web.dedup_cleanup import dedup_cleanup_payload
+    path, config, store = setup(tmp_path)
+    config = replace(config, nginx=replace(config.nginx, enabled=True,
+                                          enable_dedup=True, enable_purge=True))
+    with store.dedup_cleanup_lock:
+        assert completeness.completeness_payload(path, store, current=config)[0] == 409
+    with store.completeness_lock:
+        assert dedup_cleanup_payload(path, store, current=config)[0] == 409

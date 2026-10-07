@@ -15,6 +15,7 @@ def storage_usage(config: Config, catalogs: dict, inventory: Inventory,
     it. Shared direct routes use the smallest repository id as a stable owner.
     Historical warm records help attribute bytes but never prove file presence.
     """
+    present = {entry.key for entry in inventory.entries if entry.key and not entry.error}
     owners: dict[str, str] = {}
     accessible: dict[str, set[str]] = {}
     items = {}
@@ -32,21 +33,30 @@ def storage_usage(config: Config, catalogs: dict, inventory: Inventory,
             groups[repo.group]['unknown_repositories'] += 1
             continue
         key_for = builder.for_repo(repo)
-        current = {filename for _, filename in catalog['packages']}
-        if repo.type == 'nix':
-            for package, _ in catalog['packages']:
-                current.update(catalog['artifacts'].get(package, ()))
-        known = current | set(catalog.get('warmed', ()))
+        def record(filename: str, *, available: bool = False) -> None:
+            # Retain only physically observed keys, including pre-toggle copies.
+            direct = key_for(filename)
+            previous = key_for(filename, dedup=not config.nginx.enable_dedup)
+            for key in (direct, previous):
+                if key in present:
+                    owners.setdefault(key, repo.id)
+            if available:
+                key = dedup_keys.get(package_path(repo, filename).lower(), direct)
+                if key and key in present:
+                    accessible[repo.id].add(key)
+
+        for package, filename in catalog['packages']:
+            record(filename, available=True)
+            if repo.type == 'nix':
+                for artifact in catalog['artifacts'].get(package, ()):
+                    record(artifact, available=True)
+        for filename in catalog.get('warmed', ()):
+            record(filename)
+        # Orphaned/historical closure artifacts still occupy physical space,
+        # but only artifacts of current Nix roots contribute to availability.
         for artifacts in catalog['artifacts'].values():
-            known.update(artifacts)
-        for filename in known:
-            # Both current and pre-toggle copies consume physical storage.
-            owners.setdefault(key_for(filename), repo.id)
-            owners.setdefault(key_for(filename, dedup=not config.nginx.enable_dedup), repo.id)
-        for filename in current:
-            key = dedup_keys.get(package_path(repo, filename).lower(), key_for(filename))
-            if key:
-                accessible[repo.id].add(key)
+            for filename in artifacts:
+                record(filename)
 
     total_bytes = unattributed_bytes = unattributed_files = unreadable_sizes = 0
     file_sizes = {}

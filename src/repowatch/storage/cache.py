@@ -167,38 +167,41 @@ class CacheStore:
         ]
 
 
-    def find_duplicate_files(self) -> list[tuple[str, str, str]]:
-        """Byte-identical files across DIFFERENT repositories (cross-repo dedup), identified by (filename, content_hash) — not
-        by package_key, since the same file can be named differently or
-        carry a different key format between distros/formats.
+    def find_duplicate_files(self) -> list[tuple[str, str, str, str]]:
+        """Return source repo, canonical repo, source path and canonical path.
 
-        Returns (duplicate_repo_id, canonical_repo_id, filename) — one row
-        per repository that's NOT the canonical copy for a given
-        (filename, content_hash) group. "Canonical" is just the
-        alphabetically-first repo_id sharing that pair — deterministic and
-        stable as long as the same set of repos keeps carrying the file, no
-        extra bookkeeping needed. Caller (nginx/render.py) resolves repo ids to
-        actual local cache URIs — this module stays URL-agnostic.
+        Hashes identify bytes independently of their repository-relative path.
+        Ambiguous paths (including aliases with missing hashes) cannot establish
+        identity. The first (repo id, path) is the stable canonical owner.
+        URL ownership conflicts are checked by the routing layer.
         """
         with self.db.connect() as conn:
-            # Do not materialize unique files in Python. Grouping removes package
-            # aliases but keeps distinct hash groups even if their output tuples match.
             return conn.execute(
                 """
-                WITH duplicates AS (
-                    SELECT filename, content_hash, MIN(repo_id) AS canonical
-                    FROM repo_packages WHERE content_hash IS NOT NULL
-                    GROUP BY filename, content_hash
-                    HAVING COUNT(DISTINCT repo_id) > 1
+                WITH files AS (
+                    SELECT repo_id, filename, MIN(content_hash) AS hash
+                    FROM repo_packages GROUP BY repo_id, filename
+                    HAVING COUNT(content_hash) = COUNT(*)
+                       AND COUNT(DISTINCT content_hash) = 1
+                       AND MIN(content_hash) <> ''
+                ), ranked AS (
+                    SELECT repo_id, filename,
+                        FIRST_VALUE(repo_id) OVER identity AS canonical,
+                        FIRST_VALUE(filename) OVER identity AS canonical_filename
+                    FROM files WINDOW identity AS (
+                        PARTITION BY hash ORDER BY repo_id, filename)
                 )
-                SELECT p.repo_id, d.canonical, p.filename
-                FROM repo_packages p JOIN duplicates d
-                  ON p.filename = d.filename AND p.content_hash = d.content_hash
-                WHERE p.repo_id <> d.canonical
-                GROUP BY p.filename, p.content_hash, p.repo_id, d.canonical
-                ORDER BY p.filename, p.content_hash, p.repo_id
+                SELECT repo_id, canonical, filename, canonical_filename FROM ranked
+                WHERE repo_id <> canonical OR filename <> canonical_filename
+                ORDER BY repo_id, filename
                 """
             ).fetchall()
+
+    def iter_file_hashes(self):
+        """Stream every catalog owner, including unknown hashes, for route checks."""
+        with self.db.connect() as conn:
+            yield from conn.execute(
+                'SELECT repo_id, filename, content_hash FROM repo_packages')
 
 
     def ban_package(self, repo_id: str, package_name: str) -> None:

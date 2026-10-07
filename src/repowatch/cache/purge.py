@@ -57,9 +57,10 @@ async def _purge_batch(config: Config, repo: RepoConfig, items: dict[str, str], 
                 if log_failures and outcome not in ("purged", "not_cached"):
                     logger.warning("%s: purge failed (HTTP %s) for %s", repo.id, resp.status_code, filename)
             except httpx.RequestError as exc:
+                detail = f'{type(exc).__name__}: {exc}'.rstrip(': ')
                 if log_failures:
-                    logger.warning("%s: purge failed (%s) for %s", repo.id, exc, filename)
-                results[key] = f"error ({exc})"
+                    logger.warning("%s: purge failed (%s) for %s", repo.id, detail, filename)
+                results[key] = f"error ({detail})"
 
     async with httpx.AsyncClient() as client:
         await asyncio.gather(*(_run(client, key, filename) for key, filename in items.items()))

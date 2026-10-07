@@ -381,10 +381,11 @@ MD5 manifest is not used for SHA256 deduplication. apk's
 match a real cross-format duplicate, and apt-rpm's binary pkglist doesn't
 currently carry a verified whole-file digest; both are deliberately left out
 rather than guessed at, since a false match would mean serving one
-package's bytes under a different package's name. A match requires both identical `filename` (including its relative path)
-and identical SHA256; equal bytes under different filenames are not merged.
-When a match is found across two repos, the alphabetically-first `repo_id` is treated as
-canonical; every other repo serving that same file gets an internal nginx
+package's bytes under a different package's name. A match requires identical known SHA256 digests; repository-relative paths may differ
+(for example, Debian `pool/contrib/` and security `pool/updates/contrib/`).
+The alphabetically-first `(repo_id, filename)` is canonical. Unknown or conflicting
+hashes among owners of either shared URL block the redirect. Nix artifacts retain
+their separate ownership rules. Every accepted duplicate gets an internal nginx
 rewrite (`map`/`if`/`rewrite ... last`, generated in `dedup.map`, the same
 included-sub-config pattern as `purge.conf` above) to the canonical repo's
 own content location — so it reuses that repo's real cache entry, TTLs, and
@@ -394,7 +395,9 @@ query — skipped entirely when this flag is off, so leaving it off costs
 nothing on every 15s apply cycle); `nginx-render` without `--policy` always
 shows an empty map, since it deliberately never opens the database. Index
 files (`Packages.gz`, `.db.tar.gz`, `repodata/*`, etc.) never participate —
-each repository's own index must always reflect its own real state.
+each repository's own index must always reflect its own real state. APT `.deb`,
+`.udeb` and `.ddeb` payloads beneath `dists/` (including Proxmox repositories) use
+the package TTL and canonical package cache key; they are not short-lived indexes.
 
 **Removing redundant physical copies.** Redirecting future requests does not
 remove files cached before a dedup mapping existed. With `nginx.enabled`,

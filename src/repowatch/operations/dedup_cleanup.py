@@ -13,11 +13,11 @@ import time
 import httpx
 
 from repowatch.cache import probe
-from repowatch.cache.dedup import dedup_keys
+from repowatch.cache.dedup import accepted_pairs, dedup_keys
 from repowatch.config.load import load_config
 from repowatch.config.models import Config
 from repowatch.errors import ConfigError
-from repowatch.nginx.render import dedup_generation, resolve_dedup_pairs
+from repowatch.nginx.render import dedup_generation
 from repowatch.routing import CacheKeyBuilder, package_path
 from repowatch.runtime.context import ServiceState
 
@@ -108,7 +108,7 @@ def make_plan(config: Config, store: ServiceState, *, limit: int | None = None,
         raise ValueError('cleanup limit must be positive')
     revisions = store.repositories.get_snapshot_revisions()
     rows = store.cache.find_duplicate_files()
-    pairs = resolve_dedup_pairs(config, rows)
+    pairs = accepted_pairs(config, store.cache, rows)
     builder = CacheKeyBuilder(config)
     redirects = dedup_keys(config, rows, builder, pairs=pairs)
     generation = dedup_generation(config, pairs)
@@ -227,7 +227,8 @@ async def remove_copies(plan: CleanupPlan, store: ServiceState, keys: list[str],
             except CleanupChanged as exc:
                 return finish(str(exc))
             except (httpx.HTTPError, ValueError, TypeError, KeyError) as exc:
-                results[key] = f'error ({exc})'
+                detail = f'{type(exc).__name__}: {exc}'.rstrip(': ')
+                results[key] = f'error ({detail})'
     return finish()
 
 

@@ -55,7 +55,7 @@ def dedup_cleanup_payload(config_path: str | Path, store: ServiceState, *,
                 or not isinstance(body.get('generation'), str)):
             return 400, {'error': 'Expected generation and 1..256 cache keys from the preview.'}
     if not store.dedup_cleanup_lock.acquire(blocking=False):
-        return 409, {'error': 'A dedup cleanup or preview is already running.'}
+        return 409, {'error': 'A cache inventory or dedup cleanup is already running.'}
     try:
         if body is None:
             return 200, asyncio.run(_preview(config, store, config_path))

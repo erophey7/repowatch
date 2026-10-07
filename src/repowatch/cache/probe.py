@@ -247,7 +247,8 @@ async def purge_raw(client: httpx.AsyncClient, base_url: str, key: str,
             headers={"User-Agent": USER_AGENT}, timeout=30,
         )
     except httpx.RequestError as exc:
-        return f"error ({exc})"
+        detail = f'{type(exc).__name__}: {exc}'.rstrip(': ')
+        return f"error ({detail})"
     if resp.status_code == 200:
         return "purged"
     if resp.status_code == 404:

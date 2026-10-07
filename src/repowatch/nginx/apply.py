@@ -13,7 +13,8 @@ from repowatch.config.load import load_config
 from repowatch.errors import ConfigError
 from repowatch.nginx.policy import _check_policy_owner
 from repowatch.nginx.reconcile import input_digest, matches, rendered_digest
-from repowatch.nginx.render import render, render_purge, render_probe_js, render_probe_conf, resolve_dedup_pairs, render_dedup
+from repowatch.cache.dedup import accepted_pairs
+from repowatch.nginx.render import render, render_purge, render_probe_js, render_probe_conf, render_dedup
 from repowatch.storage.cache import CacheStore
 from repowatch.storage.database import Database
 
@@ -92,9 +93,10 @@ def apply(config_path: str, policy_path: str, *, force: bool = False, use_system
         # nginx.render._dedup_hash_sizes) — a real production catalog has
         # enough duplicate files that nginx's own small defaults fail to
         # build the hash table at all, not just perform poorly.
-        dedup_rows = (CacheStore(Database(config.state_db, read_only=True)).find_duplicate_files()
-                      if config.nginx.enable_dedup and config.state_db.is_file() else [])
-        dedup_pairs = resolve_dedup_pairs(config, dedup_rows)
+        dedup_pairs = []
+        if config.nginx.enable_dedup and config.state_db.is_file():
+            cache = CacheStore(Database(config.state_db, read_only=True))
+            dedup_pairs = accepted_pairs(config, cache, cache.find_duplicate_files())
         candidate = render(config, cache_dir=policy['cache_dir'], access_log=policy['access_log'],
                             purge_conf=str(purge_path), dedup_conf=str(dedup_path),
                             probe_conf=str(probe_conf_path), probe_js=str(probe_js_path),

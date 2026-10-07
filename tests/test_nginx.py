@@ -311,7 +311,7 @@ def test_real_nginx_dedup_shares_the_canonical_cache_entry(tmp_path):
     dedup_conf = tmp_path / 'dedup.map'
     text = nginx_render.render(c, cache_dir=str(tmp_path / 'cache'), access_log=str(tmp_path / 'access.log'),
                          dedup_conf=str(dedup_conf))
-    pairs = nginx_render.resolve_dedup_pairs(c, [('ubuntu', 'debian', 'pool/main/a/a.deb')])
+    pairs = nginx_render.resolve_dedup_pairs(c, [('ubuntu', 'debian', 'pool/main/a/a.deb', 'pool/main/a/a.deb')])
     dedup_conf.write_text(nginx_render.render_dedup(c, pairs))
     conf = tmp_path / 'nginx.conf'
     conf.write_text(f'pid {tmp_path}/nginx.pid; error_log {tmp_path}/error.log;\n'
@@ -698,14 +698,14 @@ def test_resolve_dedup_pairs_uses_the_same_local_path_as_warm_and_purge_urls():
         apt('debian', 'http://deb.debian.org/debian'),
         apt('ubuntu', 'http://archive.ubuntu.com/ubuntu'),
     ])
-    rows = [('ubuntu', 'debian', 'pool/main/a/a.deb')]
+    rows = [('ubuntu', 'debian', 'pool/main/a/a.deb', 'pool/main/a/a.deb')]
     pairs = nginx_render.resolve_dedup_pairs(c, rows)
     assert pairs == [('/ubuntu/pool/main/a/a.deb', '/debian/pool/main/a/a.deb')]
 
 
 def test_resolve_dedup_pairs_skips_rows_for_repos_no_longer_in_config():
     c = config([apt('debian')])
-    rows = [('removed-repo', 'debian', 'a.deb'), ('debian', 'removed-repo', 'a.deb')]
+    rows = [('removed-repo', 'debian', 'a.deb', 'a.deb'), ('debian', 'removed-repo', 'a.deb', 'a.deb')]
     assert nginx_render.resolve_dedup_pairs(c, rows) == []
 
 
@@ -719,7 +719,7 @@ def test_resolve_dedup_pairs_drops_self_mapped_rows_sharing_one_nginx_route(capl
         apt('ubuntu-noble-main', 'http://archive.ubuntu.com/ubuntu'),
         apt('ubuntu-jammy-main', 'http://archive.ubuntu.com/ubuntu'),
     ])
-    rows = [('ubuntu-noble-main', 'ubuntu-jammy-main', 'pool/main/a/a.deb')]
+    rows = [('ubuntu-noble-main', 'ubuntu-jammy-main', 'pool/main/a/a.deb', 'pool/main/a/a.deb')]
     with caplog.at_level('WARNING'):
         pairs = nginx_render.resolve_dedup_pairs(c, rows)
     # Both repos resolve to the identical /ubuntu/pool/main/a/a.deb — nothing
@@ -741,8 +741,8 @@ def test_resolve_dedup_pairs_collapses_duplicate_keys_from_the_same_shared_route
     # ("conflicting parameter" in the journal, reproduced by hand against a
     # real nginx before this fix).
     rows = [
-        ('ubuntu-noble-main', 'debian-bookworm-main', 'pool/main/liba/a.deb'),
-        ('ubuntu-resolute-main', 'debian-bookworm-main', 'pool/main/liba/a.deb'),
+        ('ubuntu-noble-main', 'debian-bookworm-main', 'pool/main/liba/a.deb', 'pool/main/liba/a.deb'),
+        ('ubuntu-resolute-main', 'debian-bookworm-main', 'pool/main/liba/a.deb', 'pool/main/liba/a.deb'),
     ]
     with caplog.at_level('WARNING'):
         pairs = nginx_render.resolve_dedup_pairs(c, rows)
@@ -765,8 +765,8 @@ def test_resolve_dedup_pairs_drops_a_key_proposed_two_different_targets(caplog):
     # /arch) — not observed on production, but not excluded by the schema;
     # must not guess.
     rows = [
-        ('ubuntu-a', 'debian-old', 'pool/main/a.deb'),
-        ('ubuntu-b', 'arch-core', 'pool/main/a.deb'),
+        ('ubuntu-a', 'debian-old', 'pool/main/a.deb', 'pool/main/a.deb'),
+        ('ubuntu-b', 'arch-core', 'pool/main/a.deb', 'pool/main/a.deb'),
     ]
     with caplog.at_level('WARNING'):
         pairs = nginx_render.resolve_dedup_pairs(c, rows)
@@ -782,7 +782,7 @@ def test_resolve_dedup_pairs_output_has_no_duplicate_keys_and_no_self_mappings_u
     c = config(repos)
     ids = [r.id for r in repos]
     filenames = [f'pool/main/p{i}.deb' for i in range(4)]
-    rows = [(rng.choice(ids), rng.choice(ids), rng.choice(filenames)) for _ in range(500)]
+    rows = [(rng.choice(ids), rng.choice(ids), rng.choice(filenames), rng.choice(filenames)) for _ in range(500)]
     pairs = nginx_render.resolve_dedup_pairs(c, rows)
     keys = [key for key, _ in pairs]
     assert len(keys) == len(set(keys))
@@ -1271,8 +1271,8 @@ def test_dedup_pairs_drop_keys_that_differ_only_in_case(tmp_path):
     """nginx lowercases map keys, so case-variant URIs are 'conflicting parameter'."""
     import shutil
     c = config([apt('a', 'http://a.test/debian'), apt('b', 'http://b.test/ubuntu'), apt('c', 'http://c.test/mint')])
-    rows = [('b', 'a', 'pool/main/x/Foo.deb'), ('b', 'a', 'pool/main/x/foo.deb'),
-            ('c', 'a', 'pool/main/x/Bar.deb')]
+    rows = [('b', 'a', 'pool/main/x/Foo.deb', 'pool/main/x/Foo.deb'), ('b', 'a', 'pool/main/x/foo.deb', 'pool/main/x/foo.deb'),
+            ('c', 'a', 'pool/main/x/Bar.deb', 'pool/main/x/Bar.deb')]
     pairs = nginx_render.resolve_dedup_pairs(c, rows)
     keys = [key for key, _ in pairs]
     assert len({key.lower() for key in keys}) == len(keys)

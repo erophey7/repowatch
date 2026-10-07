@@ -236,18 +236,14 @@ async def purge_items(config: Config, repo: RepoConfig, items: dict[str, str], s
     if config.nginx.enable_cache_probe:
         canonical_keys = {}
         if config.nginx.enable_dedup:
-            from repowatch.routing import CacheKeyBuilder
-            builder = CacheKeyBuilder(config)
-            canonical_builders = {}
-            selected = set(items.values())
-            for duplicate_id, canonical_id, filename in store.cache.find_duplicate_files():
-                if duplicate_id != repo.id or filename not in selected:
-                    continue
-                canonical = config.repo_by_id(canonical_id)
-                if canonical is not None:
-                    if canonical_id not in canonical_builders:
-                        canonical_builders[canonical_id] = builder.for_repo(canonical)
-                    canonical_keys[filename] = canonical_builders[canonical_id](filename)
+            from repowatch.routing import CacheKeyBuilder, package_path
+            from repowatch.cache.dedup import accepted_pairs, dedup_keys
+            rows = store.cache.find_duplicate_files()
+            redirects = dedup_keys(config, rows, CacheKeyBuilder(config),
+                pairs=accepted_pairs(config, store.cache, rows))
+            canonical_keys = {filename: redirects[uri] for filename in items.values()
+                              if (uri := package_path(repo, filename).lower()) in redirects
+                              and redirects[uri]}
         if canonical_keys:
             return await cache_probe.purge_selected_raw(
                 config, repo, items, canonical_keys=canonical_keys)
