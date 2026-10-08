@@ -1,8 +1,14 @@
 # Development stack: local images and checkout-mounted bootstrap files.
 # Build images with make docker-compose-build before starting.
 name: repowatch-trial
+x-logging: &container-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
 services:
   init:
+    logging: *container-logging
     image: ${DOCKER_IMAGE:-repowatch:local}
     pull_policy: never
     user: "0:0"
@@ -21,6 +27,7 @@ services:
       - ./data/cache:/var/cache/nginx/repowatch
 
   nginx:
+    logging: *container-logging
     user: "0:${REPOWATCH_GID:-10001}"
     image: ${DOCKER_NGINX_IMAGE:-repowatch-nginx:trial}
     pull_policy: never
@@ -47,6 +54,7 @@ services:
       start_period: 10s
 
   repowatch:
+    logging: *container-logging
     user: "10001:${REPOWATCH_GID:-10001}"
     image: ${DOCKER_IMAGE:-repowatch:local}
     pull_policy: never
@@ -72,4 +80,3 @@ services:
       timeout: 3s
       retries: 6
       start_period: 15s
-

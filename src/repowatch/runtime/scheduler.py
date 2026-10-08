@@ -209,7 +209,7 @@ async def run_forever(
     )
     dispatcher = RepoDispatcher(store)
     prune_task: asyncio.Task[None] | None = None
-    last_prune = 0.0
+    last_prune: float | None = None
     try:
         while stop is None or not stop.is_set():
             try:
@@ -224,7 +224,10 @@ async def run_forever(
             dispatcher.reconcile(config)
 
             prune_task = _reap_prune(prune_task)
-            if prune_task is None and time.monotonic() - last_prune >= _PRUNE_INTERVAL_SECONDS:
+            if prune_task is None and (
+                last_prune is None
+                or time.monotonic() - last_prune >= _PRUNE_INTERVAL_SECONDS
+            ):
                 prune_task = asyncio.create_task(_run_retention(config, store, config_path))
                 last_prune = time.monotonic()
 

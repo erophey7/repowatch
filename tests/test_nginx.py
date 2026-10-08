@@ -186,7 +186,7 @@ def test_example_renders_and_cli_without_database(tmp_path, capsys):
     assert 'proxy_pass' not in nginx_render.render(c)
 
 
-def test_real_nginx_proxy_routes_and_cache(tmp_path):
+def test_real_nginx_proxy_routes_and_cache(tmp_path, nginx_http_paths):
     import http.server
     import shutil
     import socket
@@ -228,11 +228,12 @@ def test_real_nginx_proxy_routes_and_cache(tmp_path):
     text = nginx_render.render(c, cache_dir=str(tmp_path / 'cache'), access_log=str(tmp_path / 'access.log'))
     conf = tmp_path / 'nginx.conf'
     conf.write_text(f'pid {tmp_path}/nginx.pid; error_log {tmp_path}/error.log;\n'
-                    'events {}\nhttp {\n' + text + '\n}\n')
+                    'events {}\nhttp {\n' + nginx_http_paths + text + '\n}\n')
     command = [binary, '-p', str(tmp_path), '-c', str(conf)]
     process = None
     try:
-        subprocess.run(command + ['-t'], check=True, capture_output=True)
+        result = subprocess.run(command + ['-t'], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
         process = subprocess.Popen(command + ['-g', 'daemon off;'], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         for _ in range(100):
             try:
@@ -264,7 +265,7 @@ def test_real_nginx_proxy_routes_and_cache(tmp_path):
         backend.server_close()
 
 
-def test_real_nginx_dedup_shares_the_canonical_cache_entry(tmp_path):
+def test_real_nginx_dedup_shares_the_canonical_cache_entry(tmp_path, nginx_http_paths):
     """Cross-repo dedup, end-to-end: a request for the duplicate
     repo's copy of a byte-identical file must HIT the CANONICAL repo's own
     cache entry (same bytes, same key) instead of creating a second one —
@@ -315,11 +316,12 @@ def test_real_nginx_dedup_shares_the_canonical_cache_entry(tmp_path):
     dedup_conf.write_text(nginx_render.render_dedup(c, pairs))
     conf = tmp_path / 'nginx.conf'
     conf.write_text(f'pid {tmp_path}/nginx.pid; error_log {tmp_path}/error.log;\n'
-                    'events {}\nhttp {\n' + text + '\n}\n')
+                    'events {}\nhttp {\n' + nginx_http_paths + text + '\n}\n')
     command = [binary, '-p', str(tmp_path), '-c', str(conf)]
     process = None
     try:
-        subprocess.run(command + ['-t'], check=True, capture_output=True)
+        result = subprocess.run(command + ['-t'], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
         process = subprocess.Popen(command + ['-g', 'daemon off;'], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         for _ in range(100):
             try:
@@ -649,7 +651,7 @@ def test_dedup_hash_sizes_are_powers_of_two_with_a_sane_floor():
         assert size & (size - 1) == 0  # a power of two
 
 
-def test_real_nginx_accepts_a_large_dedup_map_alongside_the_prefetch_map(tmp_path):
+def test_real_nginx_accepts_a_large_dedup_map_alongside_the_prefetch_map(tmp_path, nginx_http_paths):
     """The actual production failure (2026-09-22): with syslog_listener.enabled
     (the default) AND enable_dedup, there are TWO map{} blocks in one http
     context. nginx builds one shared hash table per context for every map{}
@@ -673,7 +675,7 @@ def test_real_nginx_accepts_a_large_dedup_map_alongside_the_prefetch_map(tmp_pat
     conf = tmp_path / 'nginx.conf'
     conf.write_text(
         f"worker_processes 1;\npid {tmp_path / 'n.pid'};\nerror_log {tmp_path / 'e.log'};\n"
-        f"events {{}}\nhttp {{\n{text}\n}}\n"
+        f"events {{}}\nhttp {{\n{nginx_http_paths}{text}\n}}\n"
     )
     result = subprocess.run([binary, '-t', '-c', str(conf)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
@@ -1267,7 +1269,7 @@ def test_prepared_cache_keys_keep_route_snapshot_and_alternate_basis(dedup, monk
     assert key('x').startswith('v2:')
 
 
-def test_dedup_pairs_drop_keys_that_differ_only_in_case(tmp_path):
+def test_dedup_pairs_drop_keys_that_differ_only_in_case(tmp_path, nginx_http_paths):
     """nginx lowercases map keys, so case-variant URIs are 'conflicting parameter'."""
     import shutil
     c = config([apt('a', 'http://a.test/debian'), apt('b', 'http://b.test/ubuntu'), apt('c', 'http://c.test/mint')])
@@ -1283,6 +1285,6 @@ def test_dedup_pairs_drop_keys_that_differ_only_in_case(tmp_path):
         (tmp_path / 'dedup.map').write_text(nginx_render.render_dedup(c, pairs))
         conf = tmp_path / 'nginx.conf'
         conf.write_text(f'pid {tmp_path}/n.pid; error_log {tmp_path}/e.log;\nevents {{}}\n'
-                        f'http {{ map $uri $v {{ include {tmp_path}/dedup.map; }} }}\n')
+                        f'http {{ {nginx_http_paths}map $uri $v {{ include {tmp_path}/dedup.map; }} }}\n')
         subprocess.run([binary, '-p', str(tmp_path), '-c', str(conf), '-t'],
                        check=True, capture_output=True)

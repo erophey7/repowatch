@@ -1,8 +1,9 @@
 # Generated Docker builds (experimental packaging)
 
 The generator builds the application image and a companion nginx image.
-The development Compose file is included; actual image builds, container integration
-and multi-architecture validation remain pending.
+The development Compose file is included. Linux amd64 image builds and development
+Compose cache operations have been validated; cross-version upgrades and
+multi-architecture validation remain pending.
 Build commands do not start services; starting either Compose stack is explicit.
 
 ## Commands
@@ -119,9 +120,10 @@ expression as repowatch. Nix source expressions may consume substantial disk/RAM
 select attributes explicitly as described in [Nix repositories](nix.md).
 
 The local tests exercise native Nix with an isolated temporary local store.
-They do not substitute for building and running this image: neither Docker nor
-Podman is available in the implementation workspace, and no image build or
-multi-architecture success is claimed for this revision.
+The optional image also builds and runs successfully on Linux amd64: expression
+evaluation and store writes work as the application user, and the mounted store
+persists across joint Compose recreation. Multi-architecture acceptance remains
+pending.
 
 References: [Docker build context and ignore precedence](https://docs.docker.com/build/concepts/context/),
 [official Python images](https://hub.docker.com/_/python/),
@@ -133,9 +135,9 @@ References: [Docker build context and ignore precedence](https://docs.docker.com
 
 `docker-compose.dev.yml` is the development stack: it uses locally built images
 and bind-mounts bootstrap files from the checkout. For published images without
-a checkout, use the separate release file described below.
+a checkout, a separate release Compose file is planned.
 
-From the repository root, with Docker Engine and Compose v2 installed:
+From the repository root, with Docker Engine and the Docker Compose plugin installed:
 
 ```sh
 # Use your non-root host group for shared config/state access.
@@ -220,6 +222,9 @@ The nginx service owns the network namespace; repowatch joins it with
 `network_mode: service:nginx`. Existing loopback-only purge, cache probes and
 syslog therefore work within that namespace. nginx publishes both ports and
 starts before repowatch, after its first successful configuration application.
+All three services use the `json-file` logging driver with rotation at 10 MB and
+three retained files per container. Read logs with `docker compose logs`; adjust
+the shared `x-logging` block if you need a longer local history.
 If nginx is replaced, recreate both services together:
 
 ```sh
@@ -231,6 +236,13 @@ engine restarts are not a general dependency recovery mechanism. The fixed
 internal ports (8080 cache, 8085 status, 8081 private nginx health), state path,
 cache path and loopback cache URL are part of this trial topology. Keep them when
 editing the configuration. The nginx health endpoint is not published.
+
+The seed sets `nginx.resolvers: ['127.0.0.11']` for Docker's embedded DNS on the
+Compose network. The host-oriented `127.0.0.53` resolver is not available inside
+these containers and causes upstream hostname requests to fail with HTTP 502.
+For an existing Compose installation, update this field in `config/config.yaml`;
+init preserves existing YAML and will not apply seed changes to it.
+See [Docker DNS services](https://docs.docker.com/engine/network/#dns-services).
 
 The companion image inherits the selected application image so the helper and
 application use identical code. It adds Debian nginx, njs and cache-purge modules
@@ -265,10 +277,11 @@ variant does not require a second Compose file. Nix repositories still need thei
 normal configuration. The companion inherits the selected feature backends too.
 
 The Compose files have automated initialization, topology, configuration snapshot
-and build-wrapper tests. Docker/Podman is unavailable in the implementation workspace;
-image builds, `docker compose -f docker-compose.dev.yml config`, container startup and live cache operations
-have not been run there. Run the commands above before treating it as validated
-for deployment. Multi-architecture testing remains a separate backlog item.
+and build-wrapper tests. Linux amd64 runtime checks cover startup, host-group
+permissions, administrator edits, upstream DNS, cached package bytes, private
+purge/probe boundaries, UDP syslog, invalid configuration recovery and persistence
+across application restart and joint stack recreation. Cross-version upgrade and
+rollback and multi-architecture acceptance remain open.
 
 Topology references: [Compose service configuration](https://docs.docker.com/reference/compose-file/services/)
 and [Compose startup order](https://docs.docker.com/compose/how-tos/startup-order/).
@@ -301,6 +314,19 @@ docker push "$DOCKER_IMAGE"
 docker push "$DOCKER_NGINX_IMAGE"
 ```
 
+If you already tested a local pair, you can reuse those exact images instead of
+rebuilding. After exporting the destination image variables above, tag both:
+
+```sh
+docker tag repowatch:local "$DOCKER_IMAGE"
+docker tag repowatch-nginx:trial "$DOCKER_NGINX_IMAGE"
+```
+
+Replace the source tags with the names of the pair you actually tested. Login,
+tagging and pushing should use the same Docker context and user. If your engine
+requires `sudo`, use it consistently for those Docker commands; do not run the
+Make generator as root just to access the engine.
+
 Docker documents this [tag-and-push workflow](https://docs.docker.com/docker-hub/repos/manage/hub-images/push/)
 and [interactive login](https://docs.docker.com/reference/cli/docker/login/).
 Check both tags in Docker Hub after pushing. Publish a new version tag for each
@@ -311,7 +337,17 @@ For Nix, select `DOCKER_EXPERIMENTAL=nix` when building and use a distinct commo
 tag such as `0.1.0-nix` for both images. Recompute/export both image variables
 with that tag before running Make.
 
+```sh
+export REPOWATCH_VERSION=0.1.0-nix
+export DOCKER_IMAGE="${DOCKERHUB_NAMESPACE}/repowatch:${REPOWATCH_VERSION}"
+export DOCKER_NGINX_IMAGE="${DOCKERHUB_NAMESPACE}/repowatch-nginx:${REPOWATCH_VERSION}"
+make docker-compose-build DOCKER_EXPERIMENTAL=nix
+docker push "$DOCKER_IMAGE"
+docker push "$DOCKER_NGINX_IMAGE"
+```
+
 These commands build for the local builder's architecture. They do not create a
 multi-architecture manifest; that remains unimplemented/unverified. No automatic
-push target, credentials, CI publication or actual Docker Hub upload is included
-in this change. Image builds and container startup still need testing on Docker.
+push target, credentials, publication workflow or actual Docker Hub upload is included.
+Linux amd64 base/Nix builds and development Compose runtime checks have passed;
+multi-architecture publication remains pending.

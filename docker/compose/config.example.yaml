@@ -17,6 +17,8 @@ admin_password_hash: null
 nginx:
   enabled: true
   listen: '8080'
+  # Compose uses Docker's embedded DNS, including forwarded upstream lookups.
+  resolvers: ['127.0.0.11']
   cache_dir: /var/cache/nginx/repowatch
   cache_max_size: 2g
   enable_purge: true

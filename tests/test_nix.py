@@ -316,7 +316,7 @@ async def test_watcher_retries_missing_binary_without_catalog_change(tmp_path, m
     assert len(store.repositories.get_history(c.repos[0].id))==1
 
 
-def test_real_nix_client_through_generated_nginx(tmp_path):
+def test_real_nix_client_through_generated_nginx(tmp_path, nginx_http_paths):
     """Evaluate, warm, then consume a signed cache with its upstream offline."""
     if not all(shutil.which(tool) for tool in ('nix', 'nix-env', 'nginx')):
         pytest.skip('optional Nix CLI and nginx are required')
@@ -360,11 +360,12 @@ def test_real_nix_client_through_generated_nginx(tmp_path):
     c=replace(config(tmp_path,r,purge=False),cache_base_url=f'http://127.0.0.1:{port}')
     c=replace(c,nginx=replace(c.nginx,listen=f'127.0.0.1:{port}'),syslog_listener=replace(c.syslog_listener,enabled=False))
     text=nginx_render.render(c,cache_dir=str(tmp_path/'cache'),access_log=str(tmp_path/'access.log'))
-    conf=tmp_path/'nginx.conf';conf.write_text(f'pid {tmp_path}/nginx.pid; error_log {tmp_path}/error.log;\nevents {{}}\nhttp {{\n{text}\n}}')
+    conf=tmp_path/'nginx.conf';conf.write_text(f'pid {tmp_path}/nginx.pid; error_log {tmp_path}/error.log;\nevents {{}}\nhttp {{\n{nginx_http_paths}{text}\n}}')
     process=None
     try:
         command=['nginx','-p',str(tmp_path),'-c',str(conf)]
-        subprocess.run(command+['-t'],check=True,capture_output=True)
+        result = subprocess.run(command + ['-t'], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
         process=subprocess.Popen(command+['-g','daemon off;'],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
         for attempt in range(100):
             try:

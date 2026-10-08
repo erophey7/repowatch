@@ -32,6 +32,7 @@ def test_trial_network_and_storage_boundaries():
     assert seed['repos'] == []
     assert seed['status_server']['guest_read_only'] is False
     assert seed['status_server']['allow_insecure_http'] is True
+    assert seed['nginx']['resolvers'] == ['127.0.0.11']
     assert services['init']['network_mode'] == 'none'
     assert services['repowatch']['network_mode'] == 'service:nginx'
     assert services['repowatch']['depends_on']['nginx']['condition'] == 'service_healthy'

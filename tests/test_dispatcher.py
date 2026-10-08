@@ -3,6 +3,7 @@
 import asyncio
 import sqlite3
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -229,13 +230,16 @@ def test_dispatcher_raises_sqlite_failure_but_isolates_others(tmp_path, monkeypa
     asyncio.run(run())
 
 
-def test_prune_runs_while_repository_work_is_stuck(tmp_path, monkeypatch):
+@pytest.mark.parametrize("clock_origin", [0.0, 10.0, 4000.0])
+def test_prune_runs_while_repository_work_is_stuck(tmp_path, monkeypatch, clock_origin):
     store = ServiceState(tmp_path / "state.sqlite3")
     path = tmp_path / "config.yaml"
     path.write_text(f"state_db: {tmp_path / 's.db'}\ncache_base_url: http://127.0.0.1:8080\n"
                     "repos:\n  - id: r\n    type: apk\n    upstream: https://example.org\n"
                     "    arch: x86_64\n")
     pruned = []
+    # Patch only the scheduler clock; asyncio keeps its real timeout clock.
+    monkeypatch.setattr(scheduler, "time", SimpleNamespace(monotonic=lambda: clock_origin))
 
     async def run():
         stop = asyncio.Event()
@@ -548,5 +552,42 @@ def test_retention_does_not_overlap_and_failure_drains_repository(tmp_path, monk
             await asyncio.wait_for(scheduler.run_forever(str(tmp_path / 'config.yaml'), store), 1)
         assert cancelled.is_set()
         assert calls == [1]
+
+    asyncio.run(run())
+
+
+def test_retention_runs_at_startup_then_waits_a_full_interval(tmp_path, monkeypatch):
+    store = ServiceState(tmp_path / 'state.sqlite3')
+    config = _config([])
+    clock = [0.0]
+    calls = []
+    monkeypatch.setattr(scheduler, 'load_config', lambda _: config)
+    monkeypatch.setattr(scheduler, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(scheduler, '_SCHEDULER_TICK_SECONDS', 0.001)
+
+    async def retention(*args):
+        calls.append(clock[0])
+
+    monkeypatch.setattr(scheduler, '_run_retention', retention)
+
+    async def run():
+        stop = asyncio.Event()
+        task = asyncio.create_task(scheduler.run_forever('unused', store, stop=stop))
+
+        async def wait_for_calls(count):
+            while len(calls) < count:
+                await asyncio.sleep(0.001)
+
+        try:
+            await asyncio.wait_for(wait_for_calls(1), 1)
+            clock[0] = 3599.0
+            await asyncio.sleep(0.02)
+            assert calls == [0.0]
+            clock[0] = 3600.0
+            await asyncio.wait_for(wait_for_calls(2), 1)
+            assert calls == [0.0, 3600.0]
+        finally:
+            stop.set()
+            await asyncio.wait_for(task, 1)
 
     asyncio.run(run())
